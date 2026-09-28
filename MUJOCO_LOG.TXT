@@ -1,0 +1,6 @@
+Wed Sep 23 15:45:41 2026
+ERROR: could not create window
+
+Thu Sep 24 21:01:43 2026
+ERROR: mjv_cameraInModel: mjvScene frustum_near too small
+

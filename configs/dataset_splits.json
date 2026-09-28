@@ -1,0 +1,47 @@
+{
+  "version": "1.0",
+  "place": {
+    "held_out_combinations": [
+      [
+        "red",
+        "yellow"
+      ],
+      [
+        "blue",
+        "green"
+      ],
+      [
+        "green",
+        "blue"
+      ],
+      [
+        "yellow",
+        "red"
+      ]
+    ]
+  },
+  "stack": {
+    "held_out_orders": [
+      [
+        "red",
+        "yellow",
+        "blue"
+      ],
+      [
+        "blue",
+        "green",
+        "red"
+      ],
+      [
+        "green",
+        "red",
+        "yellow"
+      ],
+      [
+        "yellow",
+        "blue",
+        "green"
+      ]
+    ]
+  }
+}
