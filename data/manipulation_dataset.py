@@ -1,6 +1,7 @@
 """PyTorch datasets for one-step BC and action-chunking policies."""
 
 import json
+import math
 from collections import OrderedDict
 from pathlib import Path
 
@@ -242,6 +243,113 @@ class EpisodeBatchSampler(Sampler):
         )
 
 
+class TaskBalancedBatchSampler(Sampler):
+    """Sample an equal number of episode-local batches for every task."""
+
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        drop_last=False,
+        seed=0,
+        batches_per_task=None,
+        task_block_batches=8,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if batches_per_task is not None and batches_per_task <= 0:
+            raise ValueError("batches_per_task must be positive")
+        if task_block_batches <= 0:
+            raise ValueError("task_block_batches must be positive")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.task_block_batches = int(task_block_batches)
+        self.epoch = 0
+
+        self.task_episode_indices = {}
+        for episode_index, entry in enumerate(dataset.episodes):
+            self.task_episode_indices.setdefault(entry["task"], []).append(
+                episode_index
+            )
+        if not self.task_episode_indices:
+            raise ValueError("Dataset contains no tasks")
+
+        natural_batches = sum(
+            self._episode_batch_count(len(indices))
+            for indices in dataset.episode_sample_ranges
+        )
+        self.batches_per_task = (
+            int(batches_per_task)
+            if batches_per_task is not None
+            else math.ceil(natural_batches / len(self.task_episode_indices))
+        )
+
+    def _episode_batch_count(self, sample_count):
+        if self.drop_last:
+            return sample_count // self.batch_size
+        return math.ceil(sample_count / self.batch_size)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _task_batches(self, task, generator):
+        batches = []
+        episode_indices = self.task_episode_indices[task]
+        episode_order = torch.randperm(
+            len(episode_indices), generator=generator
+        ).tolist()
+        for order_index in episode_order:
+            episode_index = episode_indices[order_index]
+            indices = list(self.dataset.episode_sample_ranges[episode_index])
+            permutation = torch.randperm(
+                len(indices), generator=generator
+            ).tolist()
+            indices = [indices[index] for index in permutation]
+            for start in range(0, len(indices), self.batch_size):
+                batch = indices[start : start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+        return batches
+
+    def _select_balanced_batches(self, batches, generator):
+        if not batches:
+            raise ValueError("A task has no batches after applying drop_last")
+        selected = []
+        while len(selected) < self.batches_per_task:
+            remaining = self.batches_per_task - len(selected)
+            selected.extend(batches[:remaining])
+            if remaining > len(batches):
+                order = torch.randperm(len(batches), generator=generator).tolist()
+                batches = [batches[index] for index in order]
+        return selected
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        tasks = sorted(self.task_episode_indices)
+        selected = {
+            task: self._select_balanced_batches(
+                self._task_batches(task, generator), generator
+            )
+            for task in tasks
+        }
+        positions = {task: 0 for task in tasks}
+        while any(position < self.batches_per_task for position in positions.values()):
+            task_order = torch.randperm(len(tasks), generator=generator).tolist()
+            for task_index in task_order:
+                task = tasks[task_index]
+                start = positions[task]
+                end = min(start + self.task_block_batches, self.batches_per_task)
+                yield from selected[task][start:end]
+                positions[task] = end
+
+    def __len__(self):
+        return self.batches_per_task * len(self.task_episode_indices)
+
+
 def create_dataloader(
     dataset,
     batch_size,
@@ -250,6 +358,9 @@ def create_dataloader(
     pin_memory=None,
     drop_last=False,
     seed=0,
+    task_balanced=False,
+    batches_per_task=None,
+    task_block_batches=8,
 ):
     """Create a DataLoader with conservative defaults for compressed NPZ data."""
 
@@ -259,13 +370,25 @@ def create_dataloader(
         shuffle = "train" in dataset.split_manifest.stem
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
-    batch_sampler = EpisodeBatchSampler(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=drop_last,
-        seed=seed,
-    )
+    if task_balanced:
+        if not shuffle:
+            raise ValueError("task_balanced sampling requires shuffle=True")
+        batch_sampler = TaskBalancedBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            drop_last=drop_last,
+            seed=seed,
+            batches_per_task=batches_per_task,
+            task_block_batches=task_block_batches,
+        )
+    else:
+        batch_sampler = EpisodeBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            seed=seed,
+        )
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,

@@ -450,6 +450,60 @@ train_act = ManipulationDataset(
 act_loader = create_dataloader(train_act, batch_size=32, seed=42)
 ```
 
+For multi-task training, enable equal task weighting:
+
+```python
+train_loader = create_dataloader(
+    train_act,
+    batch_size=32,
+    task_balanced=True,
+    seed=42,
+)
+```
+
+The balanced sampler assigns the same number of batches to Pick, Place, and
+Stack, and switches tasks in short blocks to retain efficient episode caching.
+Validation and test loaders should use `task_balanced=False` so metrics cover
+every recorded timestep exactly once.
+
+Compute normalization statistics only from the training split:
+
+```bash
+python -m scripts.compute_normalization \
+  --dataset data/demos/pilot_v01 \
+  --split data/splits/pilot_v01_semantic/train.jsonl \
+  --output data/splits/pilot_v01_semantic/normalization.json
+```
+
+The output stores raw timestep-weighted statistics, per-task statistics, and
+equal-task statistics. Multi-task models use `task_balanced_proprio` and
+`task_balanced_action` so normalization matches the balanced training
+distribution. It also records the split hash and legacy image-flip requirement.
+
+Load the equal-task statistics for training and inference:
+
+```python
+from data.normalization import PolicyNormalizer
+
+normalizer = PolicyNormalizer.from_json(
+    "data/splits/pilot_v01_semantic/normalization.json"
+).to(device)
+normalizer.validate_split(
+    "data/splits/pilot_v01_semantic/train.jsonl"
+)
+
+normalized_proprio = normalizer.normalize_proprio(batch["proprio"].to(device))
+normalized_target = normalizer.normalize_action(batch["action"].to(device))
+
+# Convert a normalized policy prediction back to the environment action scale.
+environment_action = normalizer.denormalize_action(predicted_action)
+```
+
+The normalizer stores statistics as non-trainable PyTorch buffers, so they move
+between CPU and GPU and are included in a model checkpoint. It accepts both
+single actions shaped `[7]` and action chunks shaped `[..., 7]`. Run its smoke
+test with `python -m scripts.test_normalization`.
+
 BC samples contain `image`, `proprio`, and `action`. ACT samples contain
 `image`, `proprio`, `actions`, and `action_padding_mask`, where `True` marks
 padded chunk positions. Both modes also return instruction, task, episode
