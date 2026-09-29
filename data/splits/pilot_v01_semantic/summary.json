@@ -1,0 +1,63 @@
+{
+  "dataset_root": "/home/fauzan/Robot/sim-mt-act/data/demos/pilot_v01",
+  "fallback_iid_tasks": [
+    "pick"
+  ],
+  "protocol": "semantic",
+  "ratios": {
+    "test": 0.1,
+    "train": 0.8,
+    "val": 0.1
+  },
+  "seed": 42,
+  "splits": {
+    "test": {
+      "episodes": 50,
+      "instruction_splits": {
+        "train": 50
+      },
+      "semantic_splits": {
+        "compositional_test": 40,
+        "train": 10
+      },
+      "steps": 19332,
+      "tasks": {
+        "pick": 10,
+        "place": 25,
+        "stack": 15
+      }
+    },
+    "train": {
+      "episodes": 221,
+      "instruction_splits": {
+        "train": 221
+      },
+      "semantic_splits": {
+        "train": 221
+      },
+      "steps": 84513,
+      "tasks": {
+        "pick": 80,
+        "place": 66,
+        "stack": 75
+      }
+    },
+    "val": {
+      "episodes": 29,
+      "instruction_splits": {
+        "train": 29
+      },
+      "semantic_splits": {
+        "train": 29
+      },
+      "steps": 11195,
+      "tasks": {
+        "pick": 10,
+        "place": 9,
+        "stack": 10
+      }
+    }
+  },
+  "total_episodes": 300,
+  "version": "1.0"
+}

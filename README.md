@@ -408,6 +408,56 @@ use the `obs__<key>` prefix, while `metadata_json` contains the instruction and
 privileged target IDs. Privileged object poses may be retained for analysis,
 but policy loaders must expose only RGB, proprioception, and language.
 
+## Dataset Splits and Loaders
+
+Build the semantic-aware pilot split after the dataset passes audit:
+
+```bash
+python -m scripts.create_dataset_splits \
+  --dataset data/demos/pilot_v01 \
+  --output data/splits/pilot_v01_semantic \
+  --protocol semantic
+```
+
+Place and Stack episodes marked `compositional_test` are assigned only to the
+test split. Tasks without held-out semantic episodes, currently Pick, use an
+IID 80/10/10 fallback. The builder writes `train.jsonl`, `val.jsonl`,
+`test.jsonl`, and `summary.json`. Existing outputs require `--overwrite` to be
+replaced.
+
+The PyTorch dataset supports one-step BC and padded ACT action chunks. The
+legacy `pilot_v01` RGB observations use the OpenGL image convention, so enable
+`vertical_flip=True` specifically for this dataset:
+
+```python
+from data.manipulation_dataset import ManipulationDataset, create_dataloader
+
+train_bc = ManipulationDataset(
+    dataset_root="data/demos/pilot_v01",
+    split_manifest="data/splits/pilot_v01_semantic/train.jsonl",
+    mode="bc",
+    vertical_flip=True,
+)
+train_loader = create_dataloader(train_bc, batch_size=32, seed=42)
+
+train_act = ManipulationDataset(
+    dataset_root="data/demos/pilot_v01",
+    split_manifest="data/splits/pilot_v01_semantic/train.jsonl",
+    mode="act",
+    chunk_size=32,
+    vertical_flip=True,
+)
+act_loader = create_dataloader(train_act, batch_size=32, seed=42)
+```
+
+BC samples contain `image`, `proprio`, and `action`. ACT samples contain
+`image`, `proprio`, `actions`, and `action_padding_mask`, where `True` marks
+padded chunk positions. Both modes also return instruction, task, episode
+path, and timestep. The image tensor is float RGB in `CHW` layout and `[0, 1]`;
+proprioception concatenates joint position, joint velocity, and gripper qpos.
+The episode-aware batch sampler keeps compressed NPZ access practical while
+still shuffling episodes and timesteps each epoch.
+
 ---
 
 ## Dataset Variations

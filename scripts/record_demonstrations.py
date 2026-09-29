@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import robosuite.macros as macros
 from robosuite import load_composite_controller_config
 from robosuite.utils import RandomizationError
 
@@ -14,6 +15,8 @@ from environments.stack_env import StackEnv
 from experts.pick_expert import PickExpert
 from experts.place_expert import PlaceExpert
 from experts.stack_expert import StackExpert
+
+macros.IMAGE_CONVENTION = "opencv"
 
 
 def parse_args():
@@ -148,7 +151,8 @@ def main():
     existing_attempts = 0
     if attempts_path.exists():
         existing_attempts = sum(
-            1 for line in attempts_path.read_text(encoding="utf-8").splitlines()
+            1
+            for line in attempts_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         )
 
@@ -174,15 +178,10 @@ def main():
                         "saved_episode": None,
                         "error_type": type(error).__name__,
                         "error_message": str(error),
-                        "sampling_stats": getattr(
-                            env, "last_sampling_stats", None
-                        ),
+                        "sampling_stats": getattr(env, "last_sampling_stats", None),
                     },
                 )
-                print(
-                    f"Attempt {attempts}: rejected "
-                    "(scene_sampling_failure)"
-                )
+                print(f"Attempt {attempts}: rejected " "(scene_sampling_failure)")
                 continue
 
             metadata = env.get_task_metadata()
@@ -223,15 +222,11 @@ def main():
                         "steps": len(recorder.actions),
                         "metadata": metadata,
                         "initial_scene": initial_scene,
-                        "sampling_stats": getattr(
-                            env, "last_sampling_stats", None
-                        ),
+                        "sampling_stats": getattr(env, "last_sampling_stats", None),
                         "result": info,
                     },
                 )
-                print(
-                    f"Attempt {attempts}: rejected ({reason})"
-                )
+                print(f"Attempt {attempts}: rejected ({reason})")
                 continue
 
             episode_index = start_index + saved
@@ -259,9 +254,7 @@ def main():
                     "steps": summary["steps"],
                     "metadata": metadata,
                     "initial_scene": initial_scene,
-                    "sampling_stats": getattr(
-                        env, "last_sampling_stats", None
-                    ),
+                    "sampling_stats": getattr(env, "last_sampling_stats", None),
                     "result": info,
                 },
             )

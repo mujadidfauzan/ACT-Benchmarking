@@ -1,5 +1,8 @@
 import cv2
 import robosuite as suite
+import robosuite.macros as macros
+
+macros.IMAGE_CONVENTION = "opencv"
 
 
 def main():
