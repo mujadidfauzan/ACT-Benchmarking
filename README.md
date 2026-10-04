@@ -504,6 +504,72 @@ between CPU and GPU and are included in a model checkpoint. It accepts both
 single actions shaped `[7]` and action chunks shaped `[..., 7]`. Run its smoke
 test with `python -m scripts.test_normalization`.
 
+## Frozen Language Embeddings
+
+Language-BC and Language-ACT use the pooled 384-dimensional output from frozen
+`sentence-transformers/all-MiniLM-L6-v2`. Install the local CPU dependencies:
+
+```bash
+pip install -r requirements-ml-cpu.txt
+```
+
+Build one embedding per unique instruction and audit semantic separation:
+
+```bash
+HF_HUB_DISABLE_XET=1 python -m scripts.prepare_language_embeddings
+```
+
+This writes:
+
+```text
+data/splits/pilot_v01_semantic/language_embeddings.npz
+results/language_audit/pilot_v01_minilm/audit_report.{json,md}
+```
+
+The cache covers instructions in train, validation, and test without fitting
+on them: MiniLM is pretrained and frozen. The artifact records the exact model
+revision and contains unit-normalized vectors. Validate it with:
+
+```bash
+python -m scripts.test_language_encoder --verify-live-encoder
+```
+
+The pilot audit raises a warning for Stack: some instructions with different
+or reversed orders have very high pooled-embedding cosine similarity. Pooled
+MiniLM remains the lightweight language baseline, while the main MT-ACT model
+will use token-level language features to preserve object order and relations.
+
+The token-aware language baseline keeps MiniLM frozen but caches every token
+embedding before sentence pooling:
+
+```bash
+HF_HUB_DISABLE_XET=1 python -m scripts.prepare_language_token_embeddings
+```
+
+This creates:
+
+```text
+data/splits/pilot_v01_semantic/language_token_embeddings.npz
+results/language_audit/pilot_v01_minilm_tokens/audit_report.{json,md}
+```
+
+The cache contains padded token embeddings, input IDs, token strings, and
+attention masks. A trainable attention pooler projects each 384D token to a
+128D feature space, assigns masked attention weights, and produces one language
+feature. MiniLM remains frozen; only the projection and attention scorer are
+optimized with the manipulation policy.
+
+After building the cache, validate masking, gradients, and checkpoint loading:
+
+```bash
+python -m scripts.test_token_language
+```
+
+The token audit verifies that canonical Stack orders from episode metadata map
+to distinct token sequences and color-token positions. It does not by itself
+prove learned order understanding. That is tested later by overfitting two
+instructions containing the same colors in reversed bottom-to-top order.
+
 BC samples contain `image`, `proprio`, and `action`. ACT samples contain
 `image`, `proprio`, `actions`, and `action_padding_mask`, where `True` marks
 padded chunk positions. Both modes also return instruction, task, episode
