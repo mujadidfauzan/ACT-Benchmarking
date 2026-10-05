@@ -1,0 +1,63 @@
+{
+  "dataset_root": "/root/ACT-Benchmarking/data/demos/pilot_v02",
+  "fallback_iid_tasks": [
+    "pick"
+  ],
+  "protocol": "semantic",
+  "ratios": {
+    "test": 0.1,
+    "train": 0.8,
+    "val": 0.1
+  },
+  "seed": 42,
+  "splits": {
+    "test": {
+      "episodes": 49,
+      "instruction_splits": {
+        "train": 49
+      },
+      "semantic_splits": {
+        "compositional_test": 39,
+        "train": 10
+      },
+      "steps": 18088,
+      "tasks": {
+        "pick": 10,
+        "place": 26,
+        "stack": 13
+      }
+    },
+    "train": {
+      "episodes": 222,
+      "instruction_splits": {
+        "train": 222
+      },
+      "semantic_splits": {
+        "train": 222
+      },
+      "steps": 85847,
+      "tasks": {
+        "pick": 80,
+        "place": 65,
+        "stack": 77
+      }
+    },
+    "val": {
+      "episodes": 29,
+      "instruction_splits": {
+        "train": 29
+      },
+      "semantic_splits": {
+        "train": 29
+      },
+      "steps": 11301,
+      "tasks": {
+        "pick": 10,
+        "place": 9,
+        "stack": 10
+      }
+    }
+  },
+  "total_episodes": 300,
+  "version": "1.0"
+}

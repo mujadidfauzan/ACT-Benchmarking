@@ -4,6 +4,11 @@
 
 SimMT-ACT is a simulation-based robot learning project focused on **language-conditioned multi-task manipulation** using imitation learning and action chunking.
 
+For a complete clean-instance workflow covering Vast.ai setup, dataset
+production, multi-task training, per-task training, artifact download, and
+closed-loop evaluation, see
+[Vast.ai Dataset and Training Runbook](docs/VAST_AI_TRAINING_RUNBOOK.md).
+
 The project adapts ideas from **Action Chunking Transformer (ACT)** and **MT-ACT / RoboAgent** into a custom MuJoCo and robosuite simulation environment with a Franka Panda robot.
 
 The main objective is to build a complete robot learning pipeline:
