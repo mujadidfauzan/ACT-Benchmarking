@@ -37,6 +37,12 @@ def parse_args():
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        choices=("agentview", "robot0_eye_in_hand"),
+        default=["agentview"],
+    )
+    parser.add_argument(
         "--pretrained-visual",
         action="store_true",
         help="Load ImageNet weights; may download them on first use",
@@ -89,9 +95,11 @@ def require_gradient_boundaries(model):
             require(torch.isfinite(parameter.grad).all().item(), f"Non-finite gradient: {name}")
 
 
-def make_model(mode, args):
+def make_model(mode, args, proprio_dim):
     return LanguageBCPolicy(
         language_mode=mode,
+        proprio_dim=proprio_dim,
+        camera_names=args.camera_names,
         pretrained_visual=args.pretrained_visual,
         freeze_visual_backbone=True,
         dropout=0.0,
@@ -108,7 +116,9 @@ def language_inputs(mode, instructions, pooled_cache, token_cache):
     }
 
 
-def require_output_contract(output, mode, batch_size, token_length=None):
+def require_output_contract(
+    output, mode, batch_size, token_length=None, dual_camera=False
+):
     expected = {
         "action": (batch_size, 7),
         "visual_feature": (batch_size, 256),
@@ -131,6 +141,52 @@ def require_output_contract(output, mode, batch_size, token_length=None):
             torch.allclose(weights.sum(dim=1), torch.ones(batch_size), atol=1e-6),
             "Attention weights do not sum to one",
         )
+    spatial_weights = output["spatial_attention_weights"]
+    require(spatial_weights.ndim == 3, "Spatial attention must be [B, H, W]")
+    require(spatial_weights.shape[0] == batch_size, "Spatial batch mismatch")
+    require(
+        torch.allclose(
+            spatial_weights.flatten(1).sum(dim=1),
+            torch.ones(batch_size),
+            atol=1e-6,
+        ),
+        "Spatial attention weights do not sum to one",
+    )
+    coordinates = output["spatial_attention_coordinates"]
+    require(
+        tuple(coordinates.shape) == (batch_size, 2),
+        f"Unexpected spatial coordinates: {coordinates.shape}",
+    )
+    require(
+        torch.all((coordinates >= -1.0) & (coordinates <= 1.0)).item(),
+        "Spatial attention coordinates are out of range",
+    )
+    if dual_camera:
+        require(
+            tuple(output["eye_in_hand_visual_feature"].shape)
+            == (batch_size, 256),
+            "Unexpected eye-in-hand visual feature",
+        )
+        eye_weights = output["eye_in_hand_attention_weights"]
+        require(eye_weights.ndim == 3, "Eye-in-hand attention must be [B, H, W]")
+        require(
+            torch.allclose(
+                eye_weights.flatten(1).sum(dim=1),
+                torch.ones(batch_size),
+                atol=1e-6,
+            ),
+            "Eye-in-hand attention weights do not sum to one",
+        )
+        eye_coordinates = output["eye_in_hand_attention_coordinates"]
+        require(
+            tuple(eye_coordinates.shape) == (batch_size, 2),
+            "Unexpected eye-in-hand attention coordinates",
+        )
+    else:
+        require(
+            output["eye_in_hand_visual_feature"] is None,
+            "Single-camera model returned eye-in-hand features",
+        )
 
 
 def checkpoint_round_trip(model, model_inputs, expected):
@@ -139,6 +195,9 @@ def checkpoint_round_trip(model, model_inputs, expected):
     buffer.seek(0)
     restored = LanguageBCPolicy(
         language_mode=model.language_mode,
+        visual_fusion=model.visual_fusion,
+        camera_names=model.camera_names,
+        proprio_dim=model.proprio_encoder.input_dim,
         pretrained_visual=False,
         freeze_visual_backbone=True,
         dropout=0.0,
@@ -152,7 +211,7 @@ def checkpoint_round_trip(model, model_inputs, expected):
 
 def test_mode(mode, args, pooled_cache, token_cache, normalizer):
     torch.manual_seed(args.seed)
-    model = make_model(mode, args)
+    model = make_model(mode, args, normalizer.proprio_dim)
     model.train()
     require(not model.visual_encoder.backbone.training, "Frozen backbone entered train mode")
     require(model.visual_encoder.projection.training, "Visual projection is not trainable")
@@ -167,11 +226,19 @@ def test_mode(mode, args, pooled_cache, token_cache, normalizer):
     target = normalizer.normalize_action(raw_action)
     lang = language_inputs(mode, instructions, pooled_cache, token_cache)
     model_inputs = {"image": image, "proprio": proprio, **lang}
+    if "robot0_eye_in_hand" in args.camera_names:
+        model_inputs["eye_in_hand_image"] = torch.rand_like(image)
 
     batch_norm_before = batch_norm_state(model.visual_encoder.backbone)
     output = model(**model_inputs)
     token_length = lang.get("attention_mask", torch.empty(0, 0)).shape[-1]
-    require_output_contract(output, mode, args.batch_size, token_length)
+    require_output_contract(
+        output,
+        mode,
+        args.batch_size,
+        token_length,
+        dual_camera="robot0_eye_in_hand" in args.camera_names,
+    )
     if mode == "token_attention":
         padding_weights = output["attention_weights"].masked_select(
             ~lang["attention_mask"]

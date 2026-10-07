@@ -1,4 +1,4 @@
-"""Visual feature encoder for manipulation policies."""
+"""Visual encoders for manipulation policies."""
 
 import torch
 from torch import nn
@@ -89,10 +89,25 @@ class ResNet18VisualEncoder(nn.Module):
         return self
 
     def forward(self, image):
+        spatial = self.forward_spatial(image)
+        backbone_feature = torch.flatten(
+            self.backbone.avgpool(spatial), start_dim=1
+        )
+        return self.projection(backbone_feature)
+
+    def forward_spatial(self, image):
+        """Return the final ResNet feature map before global pooling."""
+
         if image.ndim != 4 or image.shape[1] != 3:
             raise ValueError("image must have shape [B, 3, H, W]")
         if not image.is_floating_point():
             raise TypeError("image must use a floating-point dtype")
         normalized = (image - self.image_mean) / self.image_std
-        backbone_feature = self.backbone(normalized)
-        return self.projection(backbone_feature)
+        feature = self.backbone.conv1(normalized)
+        feature = self.backbone.bn1(feature)
+        feature = self.backbone.relu(feature)
+        feature = self.backbone.maxpool(feature)
+        feature = self.backbone.layer1(feature)
+        feature = self.backbone.layer2(feature)
+        feature = self.backbone.layer3(feature)
+        return self.backbone.layer4(feature)

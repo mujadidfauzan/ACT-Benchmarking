@@ -10,13 +10,6 @@ import torch
 from data.normalization import PolicyNormalizer
 
 
-PROPRIO_KEYS = (
-    "obs__robot0_joint_pos",
-    "obs__robot0_joint_vel",
-    "obs__robot0_gripper_qpos",
-)
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Smoke-test normalization")
     parser.add_argument(
@@ -45,13 +38,13 @@ def first_split_entry(path):
     raise ValueError(f"Split contains no entries: {path}")
 
 
-def load_real_sample(dataset_root, entry):
+def load_real_sample(dataset_root, entry, proprio_keys):
     path = dataset_root / entry["path"]
     with np.load(path, allow_pickle=False) as archive:
         proprio = np.concatenate(
             [
                 np.asarray(archive[key][0], dtype=np.float32).reshape(-1)
-                for key in PROPRIO_KEYS
+                for key in proprio_keys
             ]
         )
         action = np.asarray(archive["actions"][0], dtype=np.float32)
@@ -66,13 +59,15 @@ def main():
 
     if any(parameter.requires_grad for parameter in normalizer.parameters()):
         raise AssertionError("Normalizer must not contain trainable parameters")
-    if normalizer.proprio_dim != 16:
-        raise AssertionError(f"Expected proprio dim 16, got {normalizer.proprio_dim}")
+    if not normalizer.proprio_keys:
+        raise AssertionError("Normalization statistics do not declare proprio keys")
     if normalizer.action_dim != 7:
         raise AssertionError(f"Expected action dim 7, got {normalizer.action_dim}")
 
     entry = first_split_entry(args.split)
-    proprio, action = load_real_sample(args.dataset, entry)
+    proprio, action = load_real_sample(
+        args.dataset, entry, normalizer.proprio_keys
+    )
     normalized_proprio = normalizer.normalize_proprio(proprio)
     normalized_action = normalizer.normalize_action(action)
     recovered_action = normalizer.denormalize_action(normalized_action)

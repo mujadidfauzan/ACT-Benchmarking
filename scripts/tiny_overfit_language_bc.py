@@ -12,10 +12,17 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import default_collate
 
-from data.manipulation_dataset import ManipulationDataset
+from data.manipulation_dataset import (
+    CAMERA_OBSERVATION_KEYS,
+    ManipulationDataset,
+)
 from data.normalization import PolicyNormalizer
 from language.frozen_minilm import CachedLanguageEmbeddings, CachedTokenEmbeddings
-from models.language_bc import LANGUAGE_MODES, LanguageBCPolicy
+from models.language_bc import (
+    LANGUAGE_MODES,
+    VISUAL_FUSION_MODES,
+    LanguageBCPolicy,
+)
 
 
 def parse_args():
@@ -58,6 +65,18 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--image-size", type=int, default=96)
+    parser.add_argument(
+        "--visual-fusion",
+        choices=VISUAL_FUSION_MODES,
+        default="spatial_attention",
+    )
+    parser.add_argument("--no-vertical-flip", action="store_true")
+    parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        choices=tuple(CAMERA_OBSERVATION_KEYS),
+        default=["agentview"],
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--required-reduction", type=float, default=0.95)
@@ -86,8 +105,12 @@ def load_fixed_batch(args):
         dataset_root=args.dataset,
         split_manifest=args.split,
         mode="bc",
-        vertical_flip=True,
+        vertical_flip=not args.no_vertical_flip,
         cache_size=1,
+        proprio_keys=args.proprio_keys,
+        camera_keys=tuple(
+            CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
+        ),
     )
     first_episode = dataset.episode_sample_ranges[0]
     if len(first_episode) < args.batch_size:
@@ -122,7 +145,7 @@ def prepare_common_batch(batch, args, normalizer):
         )
     proprio = normalizer.normalize_proprio(batch["proprio"])
     target = normalizer.normalize_action(batch["action"])
-    return {
+    common = {
         "image": image,
         "proprio": proprio,
         "target": target,
@@ -131,6 +154,18 @@ def prepare_common_batch(batch, args, normalizer):
         "episode_path": list(batch["episode_path"]),
         "timestep": batch["timestep"].tolist(),
     }
+    if "eye_in_hand_image" in batch:
+        eye_image = batch["eye_in_hand_image"]
+        if eye_image.shape[-2:] != (args.image_size, args.image_size):
+            eye_image = F.interpolate(
+                eye_image,
+                size=(args.image_size, args.image_size),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+        common["eye_in_hand_image"] = eye_image
+    return common
 
 
 def language_inputs(mode, instructions, pooled_cache, token_cache):
@@ -159,6 +194,9 @@ def checkpoint_round_trip(model, model_inputs, expected):
     state = copy.deepcopy(model.state_dict())
     restored = LanguageBCPolicy(
         language_mode=model.language_mode,
+        visual_fusion=model.visual_fusion,
+        camera_names=model.camera_names,
+        proprio_dim=model.proprio_encoder.input_dim,
         pretrained_visual=False,
         freeze_visual_backbone=True,
         dropout=0.0,
@@ -176,6 +214,9 @@ def overfit_mode(mode, common, args, pooled_cache, token_cache):
     set_seed(args.seed)
     model = LanguageBCPolicy(
         language_mode=mode,
+        visual_fusion=args.visual_fusion,
+        camera_names=args.camera_names,
+        proprio_dim=common["proprio"].shape[-1],
         pretrained_visual=args.pretrained_visual,
         freeze_visual_backbone=True,
         dropout=0.0,
@@ -189,6 +230,8 @@ def overfit_mode(mode, common, args, pooled_cache, token_cache):
         "proprio": common["proprio"],
         **language,
     }
+    if "eye_in_hand_image" in common:
+        model_inputs["eye_in_hand_image"] = common["eye_in_hand_image"]
     target = common["target"]
     parameters = trainable_parameters(model)
     optimizer = torch.optim.AdamW(
@@ -240,6 +283,8 @@ def overfit_mode(mode, common, args, pooled_cache, token_cache):
         "image_size": args.image_size,
         "learning_rate": args.learning_rate,
         "pretrained_visual": args.pretrained_visual,
+        "visual_fusion": args.visual_fusion,
+        "camera_names": list(args.camera_names),
         "initial_loss": initial_loss,
         "final_loss": final_loss,
         "loss_reduction": reduction,
@@ -273,9 +318,18 @@ def main():
 
     set_seed(args.seed)
     normalizer = PolicyNormalizer.from_json(args.normalization)
+    args.proprio_keys = normalizer.proprio_keys
     normalizer.validate_split(args.split)
-    pooled_cache = CachedLanguageEmbeddings(args.pooled_cache)
-    token_cache = CachedTokenEmbeddings(args.token_cache)
+    pooled_cache = (
+        CachedLanguageEmbeddings(args.pooled_cache)
+        if args.language_mode in {"pooled", "both"}
+        else None
+    )
+    token_cache = (
+        CachedTokenEmbeddings(args.token_cache)
+        if args.language_mode in {"token_attention", "both"}
+        else None
+    )
     raw_batch = load_fixed_batch(args)
     common = prepare_common_batch(raw_batch, args, normalizer)
     modes = LANGUAGE_MODES if args.language_mode == "both" else (args.language_mode,)

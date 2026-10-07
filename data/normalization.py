@@ -18,6 +18,7 @@ class PolicyNormalizer(nn.Module):
         action_mean,
         action_std,
         *,
+        proprio_keys=None,
         source_path=None,
         split_sha256=None,
         epsilon=1e-6,
@@ -44,6 +45,9 @@ class PolicyNormalizer(nn.Module):
         self.register_buffer("action_mean", action_mean)
         self.register_buffer("action_std", action_std.clamp_min(epsilon))
         self.source_path = str(source_path) if source_path is not None else None
+        self.proprio_keys = tuple(proprio_keys or ())
+        if self.proprio_keys and len(self.proprio_keys) > self.proprio_dim:
+            raise ValueError("More proprio keys than scalar proprio dimensions")
         self.split_sha256 = split_sha256
         self.epsilon = float(epsilon)
 
@@ -68,6 +72,7 @@ class PolicyNormalizer(nn.Module):
             proprio_std = proprio["std"]
             action_mean = action["mean"]
             action_std = action["std"]
+            proprio_keys = proprio["keys"]
         except KeyError as error:
             raise ValueError(
                 f"{path} does not contain task-balanced normalization statistics"
@@ -77,6 +82,7 @@ class PolicyNormalizer(nn.Module):
             proprio_std=proprio_std,
             action_mean=action_mean,
             action_std=action_std,
+            proprio_keys=proprio_keys,
             source_path=path.resolve(),
             split_sha256=statistics.get("split_sha256"),
             epsilon=epsilon,

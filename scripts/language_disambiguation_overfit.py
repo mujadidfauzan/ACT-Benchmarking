@@ -15,13 +15,6 @@ from language.frozen_minilm import CachedLanguageEmbeddings, CachedTokenEmbeddin
 from models.language_bc import LANGUAGE_MODES, LanguageBCPolicy
 
 
-PROPRIO_KEYS = (
-    "obs__robot0_joint_pos",
-    "obs__robot0_joint_vel",
-    "obs__robot0_gripper_qpos",
-)
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Overfit reversed Stack instructions with identical observations"
@@ -148,7 +141,7 @@ def load_episode_policy_data(path, normalizer):
                     np.asarray(archive[key][:-1], dtype=np.float32).reshape(
                         len(actions), -1
                     )
-                    for key in PROPRIO_KEYS
+                    for key in normalizer.proprio_keys
                 ],
                 axis=1,
             )
@@ -245,6 +238,7 @@ def overfit_mode(mode, controlled, args, pooled_cache, token_cache):
     set_seed(args.seed)
     model = LanguageBCPolicy(
         language_mode=mode,
+        proprio_dim=controlled["proprio"].shape[-1],
         pretrained_visual=args.pretrained_visual,
         freeze_visual_backbone=True,
         dropout=0.0,

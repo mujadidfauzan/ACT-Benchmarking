@@ -28,6 +28,13 @@ def parse_args():
     parser.add_argument("--num-cubes", type=int, choices=(3, 4), default=3)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--camera-obs", action="store_true")
+    parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        choices=("agentview", "robot0_eye_in_hand"),
+        default=["agentview"],
+        help="RGB cameras to record; agentview should remain first",
+    )
     parser.add_argument("--max-attempts", type=int, default=None)
     parser.add_argument(
         "--instruction-split",
@@ -38,6 +45,10 @@ def parse_args():
 
 
 def build_task(args):
+    if args.camera_names[0] != "agentview":
+        raise ValueError("--camera-names must start with agentview")
+    if len(set(args.camera_names)) != len(args.camera_names):
+        raise ValueError("--camera-names cannot contain duplicates")
     config = load_composite_controller_config(controller="BASIC")
     common = {
         "robots": "Panda",
@@ -47,9 +58,9 @@ def build_task(args):
         "has_offscreen_renderer": args.camera_obs,
         "use_camera_obs": args.camera_obs,
         "use_object_obs": True,
-        "camera_names": "agentview",
-        "camera_heights": 256,
-        "camera_widths": 256,
+        "camera_names": list(args.camera_names),
+        "camera_heights": [256] * len(args.camera_names),
+        "camera_widths": [256] * len(args.camera_names),
         "control_freq": 20,
         "hard_reset": False,
         "seed": args.seed,
@@ -137,6 +148,8 @@ def main():
     args = parse_args()
     if args.episodes <= 0:
         raise ValueError("episodes must be positive")
+    if not args.camera_obs and args.camera_names != ["agentview"]:
+        raise ValueError("--camera-names requires --camera-obs")
     max_attempts = args.max_attempts or args.episodes * 3
     task_dir = args.output / args.task
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -243,6 +256,7 @@ def main():
                 "phase_counts": summary["phase_counts"],
                 "path": episode_path.name,
                 "metadata": metadata,
+                "camera_names": list(args.camera_names) if args.camera_obs else [],
             }
             append_jsonl(manifest_path, manifest_entry)
             append_jsonl(
@@ -257,6 +271,7 @@ def main():
                     "saved_episode": episode_index,
                     "steps": summary["steps"],
                     "metadata": metadata,
+                    "camera_names": list(args.camera_names) if args.camera_obs else [],
                     "initial_scene": initial_scene,
                     "sampling_stats": getattr(env, "last_sampling_stats", None),
                     "result": info,

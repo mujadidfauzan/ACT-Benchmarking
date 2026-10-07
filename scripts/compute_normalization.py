@@ -7,12 +7,9 @@ from pathlib import Path
 
 import numpy as np
 
+from data.manipulation_dataset import DEFAULT_POLICY_PROPRIO_KEYS
 
-PROPRIO_KEYS = (
-    "obs__robot0_joint_pos",
-    "obs__robot0_joint_vel",
-    "obs__robot0_gripper_qpos",
-)
+PROPRIO_KEYS = DEFAULT_POLICY_PROPRIO_KEYS
 
 
 def parse_args():
@@ -187,7 +184,7 @@ def main():
         print(f"[{index:3d}/{len(entries)}] {entry['path']} ({steps} steps)")
 
     output = {
-        "version": "1.0",
+        "version": "2.0",
         "dataset_root": str(args.dataset.resolve()),
         "split_manifest": str(args.split.resolve()),
         "split_sha256": split_digest(args.split),

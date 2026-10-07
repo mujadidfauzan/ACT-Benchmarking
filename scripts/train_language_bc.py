@@ -12,12 +12,17 @@ import torch
 from torch.nn import functional as F
 
 from data.manipulation_dataset import (
+    CAMERA_OBSERVATION_KEYS,
     ManipulationDataset,
     create_dataloader,
 )
 from data.normalization import PolicyNormalizer
 from language.frozen_minilm import CachedLanguageEmbeddings, CachedTokenEmbeddings
-from models.language_bc import LANGUAGE_MODES, LanguageBCPolicy
+from models.language_bc import (
+    LANGUAGE_MODES,
+    VISUAL_FUSION_MODES,
+    LanguageBCPolicy,
+)
 
 
 def parse_args():
@@ -51,6 +56,17 @@ def parse_args():
         ),
     )
     parser.add_argument("--language-mode", choices=LANGUAGE_MODES, default="pooled")
+    parser.add_argument(
+        "--visual-fusion",
+        choices=VISUAL_FUSION_MODES,
+        default="spatial_attention",
+    )
+    parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        choices=tuple(CAMERA_OBSERVATION_KEYS),
+        default=["agentview"],
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -62,6 +78,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--batches-per-task", type=int)
+    parser.add_argument(
+        "--phase-balanced",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Balance optimizer batches across expert phases",
+    )
+    parser.add_argument("--batches-per-phase", type=int)
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-val-batches", type=int)
     parser.add_argument("--log-every", type=int, default=25)
@@ -107,12 +130,25 @@ def validate_args(args):
     for name in ("num_workers", "cache_size"):
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} cannot be negative")
-    for name in ("batches_per_task", "max_train_batches", "max_val_batches"):
+    for name in (
+        "batches_per_task",
+        "batches_per_phase",
+        "max_train_batches",
+        "max_val_batches",
+    ):
         value = getattr(args, name)
         if value is not None and value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.unfreeze_layer4_epoch is not None and args.unfreeze_layer4_epoch <= 0:
         raise ValueError("--unfreeze-layer4-epoch must be positive")
+    if args.phase_balanced and args.batches_per_task is not None:
+        raise ValueError(
+            "--batches-per-task cannot be combined with --phase-balanced"
+        )
+    if args.camera_names[0] != "agentview":
+        raise ValueError("--camera-names must start with agentview")
+    if len(set(args.camera_names)) != len(args.camera_names):
+        raise ValueError("--camera-names cannot contain duplicates")
 
 
 def set_seed(seed):
@@ -175,8 +211,10 @@ class LossMeter:
         self.total_elements = 0
         self.task_squared_error = defaultdict(float)
         self.task_elements = defaultdict(int)
+        self.phase_squared_error = defaultdict(float)
+        self.phase_elements = defaultdict(int)
 
-    def update(self, prediction, target, tasks):
+    def update(self, prediction, target, tasks, phases):
         squared_error = (prediction.detach() - target.detach()).square()
         self.total_squared_error += float(squared_error.sum().cpu())
         self.total_elements += squared_error.numel()
@@ -185,6 +223,11 @@ class LossMeter:
             task_error = squared_error[indices]
             self.task_squared_error[task] += float(task_error.sum().cpu())
             self.task_elements[task] += task_error.numel()
+        for phase in sorted(set(phases)):
+            indices = [index for index, value in enumerate(phases) if value == phase]
+            phase_error = squared_error[indices]
+            self.phase_squared_error[phase] += float(phase_error.sum().cpu())
+            self.phase_elements[phase] += phase_error.numel()
 
     def result(self):
         if self.total_elements == 0:
@@ -194,6 +237,10 @@ class LossMeter:
             "loss_per_task": {
                 task: self.task_squared_error[task] / self.task_elements[task]
                 for task in sorted(self.task_elements)
+            },
+            "loss_per_phase": {
+                phase: self.phase_squared_error[phase] / self.phase_elements[phase]
+                for phase in sorted(self.phase_elements)
             },
         }
 
@@ -215,14 +262,29 @@ def prepare_batch(batch, normalizer, language, device, image_size):
         batch["action"].to(device, non_blocking=True)
     )
     instructions = list(batch["instruction"])
+    model_inputs = {
+        "image": image,
+        "proprio": proprio,
+        **language.inputs(instructions, device),
+    }
+    if "eye_in_hand_image" in batch:
+        eye_in_hand_image = batch["eye_in_hand_image"].to(
+            device, non_blocking=True
+        )
+        if eye_in_hand_image.shape[-2:] != (image_size, image_size):
+            eye_in_hand_image = F.interpolate(
+                eye_in_hand_image,
+                size=(image_size, image_size),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+        model_inputs["eye_in_hand_image"] = eye_in_hand_image
     return (
-        {
-            "image": image,
-            "proprio": proprio,
-            **language.inputs(instructions, device),
-        },
+        model_inputs,
         action,
         list(batch["task"]),
+        list(batch["phase"]),
     )
 
 
@@ -249,7 +311,7 @@ def run_epoch(
         for batch_index, batch in enumerate(loader, start=1):
             if max_batches is not None and batch_index > max_batches:
                 break
-            model_inputs, target, tasks = prepare_batch(
+            model_inputs, target, tasks, phases = prepare_batch(
                 batch, normalizer, language, device, image_size
             )
             if training:
@@ -266,7 +328,7 @@ def run_epoch(
                         gradient_clip,
                     )
                 optimizer.step()
-            meter.update(prediction, target, tasks)
+            meter.update(prediction, target, tasks, phases)
             processed_batches += 1
             if training and batch_index % log_every == 0:
                 print(f"  batch {batch_index}: loss={float(loss.detach()):.6f}")
@@ -277,12 +339,16 @@ def run_epoch(
     return result
 
 
-def build_loaders(args):
+def build_loaders(args, proprio_keys):
     common = {
         "dataset_root": args.dataset,
         "mode": "bc",
         "vertical_flip": not args.no_vertical_flip,
         "cache_size": args.cache_size,
+        "proprio_keys": proprio_keys,
+        "camera_keys": tuple(
+            CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
+        ),
     }
     train_dataset = ManipulationDataset(
         split_manifest=args.train_split,
@@ -297,10 +363,12 @@ def build_loaders(args):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        drop_last=True,
+        drop_last=not args.phase_balanced,
         seed=args.seed,
-        task_balanced=True,
+        task_balanced=not args.phase_balanced,
         batches_per_task=args.batches_per_task,
+        phase_balanced=args.phase_balanced,
+        batches_per_phase=args.batches_per_phase,
     )
     val_loader = create_dataloader(
         val_dataset,
@@ -326,6 +394,11 @@ def checkpoint_payload(
         "optimizer_state": optimizer.state_dict(),
         "model_config": {
             "language_mode": args.language_mode,
+            "visual_fusion": args.visual_fusion,
+            "camera_names": list(model.camera_names),
+            "proprio_dim": model.proprio_encoder.input_dim,
+            "action_dim": model.action_dim,
+            "language_input_dim": model.language_head.input_dim,
             "pretrained_visual": args.pretrained_visual,
             "freeze_visual_backbone": True,
         },
@@ -356,7 +429,10 @@ def load_checkpoint(path, device, expected_mode):
         raise ValueError(
             f"Checkpoint language mode {mode!r} does not match {expected_mode!r}"
         )
-    return checkpoint
+    visual_fusion = checkpoint.get("model_config", {}).get(
+        "visual_fusion", "global"
+    )
+    return checkpoint, visual_fusion
 
 
 def restore_checkpoint(checkpoint, model, optimizer):
@@ -377,9 +453,14 @@ def format_metrics(name, metrics):
         f"{task}={loss:.6f}"
         for task, loss in metrics["loss_per_task"].items()
     )
+    phases = ", ".join(
+        f"{phase}={loss:.6f}"
+        for phase, loss in metrics["loss_per_phase"].items()
+    )
     return (
         f"{name}: loss={metrics['loss']:.6f} ({tasks}), "
-        f"batches={metrics['batches']}, time={metrics['seconds']:.1f}s"
+        f"batches={metrics['batches']}, time={metrics['seconds']:.1f}s\n"
+        f"    phases: {phases}"
     )
 
 
@@ -419,7 +500,9 @@ def main():
     language = LanguageLookup(
         args.language_mode, args.pooled_cache, args.token_cache
     )
-    train_dataset, val_dataset, train_loader, val_loader = build_loaders(args)
+    train_dataset, val_dataset, train_loader, val_loader = build_loaders(
+        args, normalizer.proprio_keys
+    )
     if train_dataset.proprio_dim != normalizer.proprio_dim:
         raise ValueError("Dataset and normalizer proprio dimensions do not match")
     if train_dataset.action_dim != normalizer.action_dim:
@@ -427,6 +510,8 @@ def main():
 
     model = LanguageBCPolicy(
         language_mode=args.language_mode,
+        visual_fusion=args.visual_fusion,
+        camera_names=args.camera_names,
         action_dim=normalizer.action_dim,
         proprio_dim=normalizer.proprio_dim,
         language_input_dim=language.embedding_dim,
@@ -436,9 +521,24 @@ def main():
 
     resume_checkpoint = None
     if args.resume is not None:
-        resume_checkpoint = load_checkpoint(
+        resume_checkpoint, resumed_visual_fusion = load_checkpoint(
             args.resume, device, args.language_mode
         )
+        if resumed_visual_fusion != args.visual_fusion:
+            raise ValueError(
+                "Checkpoint visual fusion does not match command: "
+                f"{resumed_visual_fusion!r} != {args.visual_fusion!r}"
+            )
+        resumed_cameras = tuple(
+            resume_checkpoint.get("model_config", {}).get(
+                "camera_names", ["agentview"]
+            )
+        )
+        if resumed_cameras != tuple(args.camera_names):
+            raise ValueError(
+                "Checkpoint cameras do not match command: "
+                f"{resumed_cameras!r} != {tuple(args.camera_names)!r}"
+            )
         resumed_epoch = int(resume_checkpoint["epoch"])
         if (
             args.unfreeze_layer4_epoch is not None
@@ -467,6 +567,10 @@ def main():
 
     print(f"Device: {device}")
     print(f"Language mode: {args.language_mode}")
+    print(f"Visual fusion: {args.visual_fusion}")
+    print(f"Cameras: {', '.join(args.camera_names)}")
+    print(f"Proprio dimension: {normalizer.proprio_dim}")
+    print(f"Phase-balanced sampling: {args.phase_balanced}")
     print(
         f"Samples: train={len(train_dataset)}, val={len(val_dataset)}; "
         f"loader batches: train={len(train_loader)}, val={len(val_loader)}"

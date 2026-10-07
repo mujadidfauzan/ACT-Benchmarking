@@ -7,7 +7,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from data.manipulation_dataset import ManipulationDataset, create_dataloader
+from data.manipulation_dataset import (
+    CAMERA_OBSERVATION_KEYS,
+    ManipulationDataset,
+    create_dataloader,
+)
 
 
 def parse_args():
@@ -25,6 +29,12 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        choices=tuple(CAMERA_OBSERVATION_KEYS),
+        default=["agentview"],
+    )
     parser.add_argument(
         "--vertical-flip",
         action=argparse.BooleanOptionalAction,
@@ -56,6 +66,19 @@ def verify_common_sample(sample, proprio_dim, image_size=(256, 256)):
     require(isinstance(sample["task"], str), "task must be a string")
     assert_finite("image", image)
     assert_finite("proprio", proprio)
+    if "eye_in_hand_image" in sample:
+        eye_image = sample["eye_in_hand_image"]
+        require(
+            eye_image.shape == (3, *image_size),
+            f"unexpected eye-in-hand shape: {eye_image.shape}",
+        )
+        require(
+            eye_image.dtype == torch.float32,
+            f"unexpected eye-in-hand dtype: {eye_image.dtype}",
+        )
+        require(0.0 <= eye_image.min().item(), "eye image contains values below zero")
+        require(eye_image.max().item() <= 1.0, "eye image contains values above one")
+        assert_finite("eye-in-hand image", eye_image)
 
 
 def verify_vertical_flip(dataset):
@@ -75,6 +98,9 @@ def verify_bc(args):
         split_manifest=args.split,
         mode="bc",
         vertical_flip=args.vertical_flip,
+        camera_keys=tuple(
+            CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
+        ),
     )
     sample = dataset[0]
     verify_common_sample(sample, dataset.proprio_dim)
@@ -100,6 +126,12 @@ def verify_bc(args):
         batch["action"].shape == (batch_size, dataset.action_dim),
         "invalid BC action batch",
     )
+    if "robot0_eye_in_hand" in args.camera_names:
+        require(
+            batch["eye_in_hand_image"].shape
+            == (batch_size, 3, 256, 256),
+            "invalid BC eye-in-hand image batch",
+        )
     return dataset, batch
 
 
@@ -110,6 +142,9 @@ def verify_act(args):
         mode="act",
         chunk_size=args.chunk_size,
         vertical_flip=args.vertical_flip,
+        camera_keys=tuple(
+            CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
+        ),
     )
     sample = dataset[0]
     verify_common_sample(sample, dataset.proprio_dim)
@@ -162,6 +197,12 @@ def verify_act(args):
         batch["action_padding_mask"].shape == (batch_size, args.chunk_size),
         "invalid ACT mask batch",
     )
+    if "robot0_eye_in_hand" in args.camera_names:
+        require(
+            batch["eye_in_hand_image"].shape
+            == (batch_size, 3, 256, 256),
+            "invalid ACT eye-in-hand image batch",
+        )
     return dataset, batch
 
 
@@ -171,6 +212,12 @@ def print_batch(name, dataset, batch):
     print("Dataset samples:", len(dataset))
     print("Episodes:", len(dataset.episodes))
     print("Image:", tuple(batch["image"].shape), batch["image"].dtype)
+    if "eye_in_hand_image" in batch:
+        print(
+            "Eye-in-hand image:",
+            tuple(batch["eye_in_hand_image"].shape),
+            batch["eye_in_hand_image"].dtype,
+        )
     print("Proprio:", tuple(batch["proprio"].shape), batch["proprio"].dtype)
     if "action" in batch:
         print("Action:", tuple(batch["action"].shape), batch["action"].dtype)
@@ -220,6 +267,7 @@ def main():
     print("Dataset:", args.dataset)
     print("Split:", args.split)
     print("Vertical flip:", args.vertical_flip)
+    print("Cameras:", args.camera_names)
     bc_dataset, bc_batch = verify_bc(args)
     print_batch("BC LOADER", bc_dataset, bc_batch)
     act_dataset, act_batch = verify_act(args)

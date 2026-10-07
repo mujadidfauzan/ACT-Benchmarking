@@ -17,12 +17,18 @@ except ImportError as error:
     ) from error
 
 
-POLICY_OBSERVATION_KEYS = (
-    "obs__agentview_image",
+DEFAULT_POLICY_PROPRIO_KEYS = (
     "obs__robot0_joint_pos",
     "obs__robot0_joint_vel",
     "obs__robot0_gripper_qpos",
+    "obs__robot0_eef_pos",
+    "obs__robot0_eef_quat",
 )
+CAMERA_OBSERVATION_KEYS = {
+    "agentview": "obs__agentview_image",
+    "robot0_eye_in_hand": "obs__robot0_eye_in_hand_image",
+}
+DEFAULT_POLICY_CAMERA_KEYS = (CAMERA_OBSERVATION_KEYS["agentview"],)
 
 
 def read_split_manifest(path):
@@ -46,9 +52,10 @@ def read_split_manifest(path):
 class ManipulationDataset(Dataset):
     """Expose each trajectory timestep as a BC or ACT training sample.
 
-    The policy receives one RGB frame and proprioception composed of joint
-    position, joint velocity, and gripper position. Object poses and all other
-    privileged observations remain inaccessible here.
+    The policy receives one RGB frame and robot proprioception. The current
+    default includes joint state, gripper state, and EEF pose; normalization
+    metadata can select an older compatible key set. Object poses and other
+    privileged observations remain inaccessible.
     """
 
     def __init__(
@@ -59,6 +66,8 @@ class ManipulationDataset(Dataset):
         chunk_size=32,
         vertical_flip=False,
         cache_size=1,
+        proprio_keys=DEFAULT_POLICY_PROPRIO_KEYS,
+        camera_keys=DEFAULT_POLICY_CAMERA_KEYS,
     ):
         if mode not in {"bc", "act"}:
             raise ValueError("mode must be 'bc' or 'act'")
@@ -73,6 +82,20 @@ class ManipulationDataset(Dataset):
         self.chunk_size = int(chunk_size)
         self.vertical_flip = bool(vertical_flip)
         self.cache_size = int(cache_size)
+        self.proprio_keys = tuple(proprio_keys)
+        self.camera_keys = tuple(camera_keys)
+        if not self.proprio_keys:
+            raise ValueError("proprio_keys cannot be empty")
+        if any(not key.startswith("obs__") for key in self.proprio_keys):
+            raise ValueError("proprio_keys must use stored obs__ names")
+        if not self.camera_keys:
+            raise ValueError("camera_keys cannot be empty")
+        unknown_cameras = set(self.camera_keys) - set(CAMERA_OBSERVATION_KEYS.values())
+        if unknown_cameras:
+            raise ValueError(f"Unsupported camera keys: {sorted(unknown_cameras)}")
+        if CAMERA_OBSERVATION_KEYS["agentview"] not in self.camera_keys:
+            raise ValueError("agentview must remain a policy camera")
+        self.policy_observation_keys = (*self.camera_keys, *self.proprio_keys)
         self.episodes = read_split_manifest(self.split_manifest)
         self._cache = OrderedDict()
         self._sample_index = []
@@ -98,7 +121,7 @@ class ManipulationDataset(Dataset):
     def proprio_dim(self):
         episode = self._load_episode(0)
         return int(
-            sum(episode[key].shape[-1] for key in POLICY_OBSERVATION_KEYS[1:])
+            sum(episode[key].shape[-1] for key in self.proprio_keys)
         )
 
     @property
@@ -109,21 +132,27 @@ class ManipulationDataset(Dataset):
         entry = self.episodes[episode_index]
         path = self.dataset_root / entry["path"]
         with np.load(path, allow_pickle=False) as archive:
-            missing = [key for key in ("actions", *POLICY_OBSERVATION_KEYS) if key not in archive]
+            missing = [
+                key
+                for key in ("actions", *self.policy_observation_keys)
+                if key not in archive
+            ]
             if missing:
                 raise KeyError(f"{path} is missing policy keys: {missing}")
             episode = {
                 "actions": np.asarray(archive["actions"], dtype=np.float32),
             }
-            for key in POLICY_OBSERVATION_KEYS:
+            for key in self.policy_observation_keys:
                 episode[key] = np.asarray(archive[key])
+            if "phases" in archive:
+                episode["phases"] = np.asarray(archive["phases"]).astype(str)
 
         steps = len(episode["actions"])
         if steps != int(entry["steps"]):
             raise ValueError(
                 f"Step count mismatch for {path}: split={entry['steps']}, npz={steps}"
             )
-        for key in POLICY_OBSERVATION_KEYS:
+        for key in self.policy_observation_keys:
             if len(episode[key]) != steps + 1:
                 raise ValueError(
                     f"Observation alignment mismatch for {path}, key {key}"
@@ -151,13 +180,33 @@ class ManipulationDataset(Dataset):
         image = np.ascontiguousarray(image.transpose(2, 0, 1))
         return torch.from_numpy(image).float().div_(255.0)
 
-    @staticmethod
-    def _proprio_tensor(episode, timestep):
+    def _proprio_tensor(self, episode, timestep):
         parts = [
             np.asarray(episode[key][timestep], dtype=np.float32).reshape(-1)
-            for key in POLICY_OBSERVATION_KEYS[1:]
+            for key in self.proprio_keys
         ]
         return torch.from_numpy(np.concatenate(parts, axis=0))
+
+    def phase_groups(self):
+        """Return sample indices grouped by task and expert phase."""
+
+        groups = {}
+        for episode_index, entry in enumerate(self.episodes):
+            episode = self._load_episode(episode_index)
+            if "phases" not in episode:
+                raise ValueError(
+                    f"Phase-balanced sampling requires phases: {entry['path']}"
+                )
+            phases = episode["phases"]
+            if len(phases) != int(entry["steps"]):
+                raise ValueError(f"Phase alignment mismatch: {entry['path']}")
+            start = self.episode_sample_ranges[episode_index].start
+            for timestep, phase in enumerate(phases):
+                key = (entry["task"], str(phase))
+                groups.setdefault(key, {}).setdefault(episode_index, []).append(
+                    start + timestep
+                )
+        return groups
 
     def _bc_target(self, actions, timestep):
         return torch.from_numpy(actions[timestep].copy())
@@ -176,14 +225,24 @@ class ManipulationDataset(Dataset):
         episode = self._load_episode(episode_index)
         sample = {
             "image": self._image_tensor(
-                episode["obs__agentview_image"][timestep]
+                episode[CAMERA_OBSERVATION_KEYS["agentview"]][timestep]
             ),
             "proprio": self._proprio_tensor(episode, timestep),
             "instruction": entry["instruction"],
             "task": entry["task"],
             "episode_path": entry["path"],
             "timestep": torch.tensor(timestep, dtype=torch.long),
+            "phase": (
+                str(episode["phases"][timestep])
+                if "phases" in episode
+                else "unlabeled"
+            ),
         }
+        eye_key = CAMERA_OBSERVATION_KEYS["robot0_eye_in_hand"]
+        if eye_key in self.camera_keys:
+            sample["eye_in_hand_image"] = self._image_tensor(
+                episode[eye_key][timestep]
+            )
         if self.mode == "bc":
             sample["action"] = self._bc_target(episode["actions"], timestep)
         else:
@@ -350,6 +409,99 @@ class TaskBalancedBatchSampler(Sampler):
         return self.batches_per_task * len(self.task_episode_indices)
 
 
+class PhaseBalancedBatchSampler(Sampler):
+    """Balance optimizer steps across task-phase pairs.
+
+    Batches stay within one episode and one phase, preserving the compressed
+    trajectory cache behavior while preventing long phases from dominating.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        seed=0,
+        batches_per_phase=None,
+        phase_block_batches=4,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if batches_per_phase is not None and batches_per_phase <= 0:
+            raise ValueError("batches_per_phase must be positive")
+        if phase_block_batches <= 0:
+            raise ValueError("phase_block_batches must be positive")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.phase_block_batches = int(phase_block_batches)
+        self.epoch = 0
+        self.groups = dataset.phase_groups()
+        if not self.groups:
+            raise ValueError("Dataset contains no phase labels")
+
+        natural_batches = sum(
+            math.ceil(len(indices) / self.batch_size)
+            for episodes in self.groups.values()
+            for indices in episodes.values()
+        )
+        self.batches_per_phase = (
+            int(batches_per_phase)
+            if batches_per_phase is not None
+            else math.ceil(natural_batches / len(self.groups))
+        )
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _group_batches(self, group, generator):
+        batches = []
+        episode_indices = list(group)
+        episode_order = torch.randperm(
+            len(episode_indices), generator=generator
+        ).tolist()
+        for order_index in episode_order:
+            indices = list(group[episode_indices[order_index]])
+            order = torch.randperm(len(indices), generator=generator).tolist()
+            indices = [indices[index] for index in order]
+            for start in range(0, len(indices), self.batch_size):
+                batches.append(indices[start : start + self.batch_size])
+        return batches
+
+    def _select(self, batches, generator):
+        if not batches:
+            raise ValueError("A task-phase group contains no batches")
+        selected = []
+        while len(selected) < self.batches_per_phase:
+            remaining = self.batches_per_phase - len(selected)
+            selected.extend(batches[:remaining])
+            if remaining > len(batches):
+                order = torch.randperm(len(batches), generator=generator).tolist()
+                batches = [batches[index] for index in order]
+        return selected
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        keys = sorted(self.groups)
+        selected = {
+            key: self._select(self._group_batches(self.groups[key], generator), generator)
+            for key in keys
+        }
+        positions = {key: 0 for key in keys}
+        while any(value < self.batches_per_phase for value in positions.values()):
+            order = torch.randperm(len(keys), generator=generator).tolist()
+            for key_index in order:
+                key = keys[key_index]
+                start = positions[key]
+                end = min(start + self.phase_block_batches, self.batches_per_phase)
+                yield from selected[key][start:end]
+                positions[key] = end
+
+    def __len__(self):
+        return self.batches_per_phase * len(self.groups)
+
+
 def create_dataloader(
     dataset,
     batch_size,
@@ -361,6 +513,9 @@ def create_dataloader(
     task_balanced=False,
     batches_per_task=None,
     task_block_batches=8,
+    phase_balanced=False,
+    batches_per_phase=None,
+    phase_block_batches=4,
 ):
     """Create a DataLoader with conservative defaults for compressed NPZ data."""
 
@@ -370,7 +525,21 @@ def create_dataloader(
         shuffle = "train" in dataset.split_manifest.stem
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
-    if task_balanced:
+    if task_balanced and phase_balanced:
+        raise ValueError("Choose task_balanced or phase_balanced, not both")
+    if phase_balanced:
+        if not shuffle:
+            raise ValueError("phase_balanced sampling requires shuffle=True")
+        if drop_last:
+            raise ValueError("phase_balanced sampling requires drop_last=False")
+        batch_sampler = PhaseBalancedBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            seed=seed,
+            batches_per_phase=batches_per_phase,
+            phase_block_batches=phase_block_batches,
+        )
+    elif task_balanced:
         if not shuffle:
             raise ValueError("task_balanced sampling requires shuffle=True")
         batch_sampler = TaskBalancedBatchSampler(

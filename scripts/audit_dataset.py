@@ -17,7 +17,13 @@ REQUIRED_POLICY_KEYS = (
     "obs__robot0_joint_pos",
     "obs__robot0_joint_vel",
     "obs__robot0_gripper_qpos",
+    "obs__robot0_eef_pos",
+    "obs__robot0_eef_quat",
 )
+CAMERA_KEYS = {
+    "agentview": "obs__agentview_image",
+    "robot0_eye_in_hand": "obs__robot0_eye_in_hand_image",
+}
 
 
 def parse_args():
@@ -32,6 +38,13 @@ def parse_args():
     )
     parser.add_argument(
         "--tasks", nargs="+", choices=TASKS, default=list(TASKS)
+    )
+    parser.add_argument(
+        "--camera-names",
+        nargs="+",
+        choices=tuple(CAMERA_KEYS),
+        default=["agentview"],
+        help="Camera streams required and audited in every episode",
     )
     parser.add_argument(
         "--mode",
@@ -248,11 +261,26 @@ def audit_episode(path, task, manifest_entry, args):
     try:
         with np.load(path, allow_pickle=False) as episode:
             keys = set(episode.files)
-            required = {"actions", "metadata_json", "result_json", *REQUIRED_POLICY_KEYS}
+            required_camera_keys = {
+                CAMERA_KEYS[name] for name in args.camera_names
+            }
+            required = {
+                "actions",
+                "metadata_json",
+                "result_json",
+                *REQUIRED_POLICY_KEYS,
+                *required_camera_keys,
+            }
             missing = sorted(required - keys)
             if missing:
                 errors.append(f"missing keys: {', '.join(missing)}")
                 return errors, details, None
+            manifest_cameras = manifest_entry.get("camera_names")
+            if manifest_cameras is not None and manifest_cameras != args.camera_names:
+                errors.append(
+                    "manifest cameras do not match audit cameras: "
+                    f"{manifest_cameras!r} != {args.camera_names!r}"
+                )
 
             actions = episode["actions"]
             metadata = scalar_json(episode["metadata_json"], "metadata_json")
@@ -314,10 +342,16 @@ def audit_episode(path, task, manifest_entry, args):
                 elif not np.isfinite(value).all():
                     errors.append(f"{key} contains NaN or Inf")
 
-            rgb_errors, rgb_stats = inspect_rgb(
-                episode["obs__agentview_image"], args.mode, args.rgb_samples
-            )
-            errors.extend(rgb_errors)
+            rgb_stats = {}
+            for camera_name in args.camera_names:
+                camera_key = CAMERA_KEYS[camera_name]
+                camera_errors, camera_stats = inspect_rgb(
+                    episode[camera_key], args.mode, args.rgb_samples
+                )
+                errors.extend(
+                    f"{camera_name}: {error}" for error in camera_errors
+                )
+                rgb_stats[camera_name] = camera_stats
 
             if metadata.get("task") != task:
                 errors.append(f"metadata task is {metadata.get('task')!r}, expected {task!r}")
@@ -524,6 +558,10 @@ def markdown_report(report):
 
 def main():
     args = parse_args()
+    if args.camera_names[0] != "agentview":
+        raise ValueError("--camera-names must start with agentview")
+    if len(set(args.camera_names)) != len(args.camera_names):
+        raise ValueError("--camera-names cannot contain duplicates")
     if args.limit_per_task is not None and args.limit_per_task <= 0:
         raise ValueError("--limit-per-task must be positive")
     if args.rgb_samples <= 0:

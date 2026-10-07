@@ -607,3 +607,71 @@ Pick-only also fails
 
 Keep dataset version, split hash, normalization file, seed, image convention,
 checkpoint epoch, and language mode in every experiment report.
+
+## 14. Dual-Camera Pick (`pilot_v04`)
+
+Use this branch to combine the global `agentview` with Panda's wrist-mounted
+`robot0_eye_in_hand` camera. The policy uses a shared ResNet18 backbone and a
+separate language-conditioned spatial-attention head for each view.
+
+Record a 20-episode debug set first:
+
+```bash
+MUJOCO_GL=egl python -m scripts.record_demonstrations \
+  --task pick \
+  --episodes 20 \
+  --output data/demos/pilot_v04_debug \
+  --camera-obs \
+  --camera-names agentview robot0_eye_in_hand \
+  --seed 4007 \
+  --max-attempts 80
+```
+
+Audit both streams:
+
+```bash
+python -m scripts.audit_dataset \
+  --dataset data/demos/pilot_v04_debug \
+  --tasks pick \
+  --mode full \
+  --camera-names agentview robot0_eye_in_hand \
+  --output results/dataset_audit/pilot_v04_debug
+```
+
+After the debug set passes, record 100 successful Pick episodes as
+`pilot_v04`, then create the IID split and language cache in the same way as
+the single-task branch. Recompute normalization because the policy now uses
+23D proprioception, including EEF position and quaternion.
+
+Train with both cameras explicitly enabled:
+
+```bash
+python -m scripts.train_language_bc \
+  --dataset data/demos/pilot_v04 \
+  --train-split data/splits/pilot_v04_pick_iid/train.jsonl \
+  --val-split data/splits/pilot_v04_pick_iid/val.jsonl \
+  --normalization data/splits/pilot_v04_pick_iid/normalization_23d.json \
+  --pooled-cache data/splits/pilot_v04_pick_iid/language_embeddings.npz \
+  --language-mode pooled \
+  --visual-fusion spatial_attention \
+  --camera-names agentview robot0_eye_in_hand \
+  --phase-balanced \
+  --output-dir results/language_bc/pilot_v04_pick_dual_pooled_seed42 \
+  --epochs 30 \
+  --batch-size 64 \
+  --image-size 224 \
+  --learning-rate 1e-4 \
+  --weight-decay 1e-4 \
+  --gradient-clip 1.0 \
+  --num-workers 4 \
+  --cache-size 8 \
+  --seed 42 \
+  --pretrained-visual \
+  --unfreeze-layer4-epoch 8 \
+  --no-vertical-flip \
+  --device cuda
+```
+
+The evaluator reads `camera_names` from the checkpoint and automatically
+creates both simulator cameras. Recorded evaluation videos place both views
+side by side.

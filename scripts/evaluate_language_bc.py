@@ -33,13 +33,6 @@ macros.IMAGE_CONVENTION = "opencv"
 TASKS = ("pick", "place", "stack")
 DEFAULT_MAX_STEPS = {"pick": 400, "place": 800, "stack": 1600}
 DEFAULT_SEEDS = {"pick": 11000, "place": 12000, "stack": 13000}
-PROPRIO_KEYS = (
-    "robot0_joint_pos",
-    "robot0_joint_vel",
-    "robot0_gripper_qpos",
-)
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Evaluate Language-BC with closed-loop simulator rollouts"
@@ -214,7 +207,9 @@ class EvaluationVideoRecorder:
         self.close()
 
 
-def build_environment(task, seed, instruction_split, num_cubes, render):
+def build_environment(
+    task, seed, instruction_split, num_cubes, render, camera_names
+):
     controller_config = load_composite_controller_config(controller="BASIC")
     common = {
         "robots": "Panda",
@@ -224,9 +219,9 @@ def build_environment(task, seed, instruction_split, num_cubes, render):
         "has_offscreen_renderer": True,
         "use_camera_obs": True,
         "use_object_obs": True,
-        "camera_names": "agentview",
-        "camera_heights": 256,
-        "camera_widths": 256,
+        "camera_names": list(camera_names),
+        "camera_heights": [256] * len(camera_names),
+        "camera_widths": [256] * len(camera_names),
         "control_freq": 20,
         "hard_reset": False,
         "seed": seed,
@@ -315,8 +310,20 @@ def load_policy(args, device):
         args.strict_language_cache,
         device,
     )
+    visual_fusion = model_config.get("visual_fusion", "global")
+    camera_names = tuple(model_config.get("camera_names", ["agentview"]))
+    checkpoint_proprio_dim = int(
+        model_config.get("proprio_dim", normalizer.proprio_dim)
+    )
+    if checkpoint_proprio_dim != normalizer.proprio_dim:
+        raise ValueError(
+            "Checkpoint and normalizer proprio dimensions do not match: "
+            f"{checkpoint_proprio_dim} != {normalizer.proprio_dim}"
+        )
     model = LanguageBCPolicy(
         language_mode=language_mode,
+        visual_fusion=visual_fusion,
+        camera_names=camera_names,
         action_dim=normalizer.action_dim,
         proprio_dim=normalizer.proprio_dim,
         language_input_dim=language.embedding_dim,
@@ -330,8 +337,8 @@ def load_policy(args, device):
     return model, normalizer, language, checkpoint, image_size
 
 
-def policy_observation(observation, image_size, device):
-    image = np.asarray(observation["agentview_image"])
+def image_tensor(image, image_size, device):
+    image = np.asarray(image)
     if image.ndim != 3 or image.shape[-1] != 3:
         raise ValueError(f"Unexpected agentview image shape: {image.shape}")
     image = np.ascontiguousarray(image.transpose(2, 0, 1))
@@ -344,12 +351,52 @@ def policy_observation(observation, image_size, device):
             align_corners=False,
             antialias=True,
         )
+    return image
+
+
+def policy_observation(
+    observation, image_size, device, proprio_keys, camera_names
+):
+    camera_inputs = {
+        "image": image_tensor(
+            observation["agentview_image"], image_size, device
+        )
+    }
+    if "robot0_eye_in_hand" in camera_names:
+        camera_inputs["eye_in_hand_image"] = image_tensor(
+            observation["robot0_eye_in_hand_image"], image_size, device
+        )
     proprio_parts = [
-        np.asarray(observation[key], dtype=np.float32).reshape(-1)
-        for key in PROPRIO_KEYS
+        np.asarray(
+            observation[
+                key.removeprefix("obs__")
+                if key.startswith("obs__")
+                else key
+            ],
+            dtype=np.float32,
+        ).reshape(-1)
+        for key in proprio_keys
     ]
     proprio = torch.from_numpy(np.concatenate(proprio_parts))
-    return image, proprio.unsqueeze(0).to(device)
+    return camera_inputs, proprio.unsqueeze(0).to(device)
+
+
+def compose_camera_frame(observation, camera_names):
+    frames = []
+    for camera_name in camera_names:
+        frame = np.asarray(observation[f"{camera_name}_image"]).copy()
+        cv2.putText(
+            frame,
+            camera_name,
+            (8, frame.shape[0] - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        frames.append(frame)
+    return np.concatenate(frames, axis=1)
 
 
 def entity_positions(env, task):
@@ -479,15 +526,18 @@ def evaluate_episode(
     language_inputs, language_source = language.inputs(instruction)
     video = None
     if video_path is not None:
+        camera_frame = compose_camera_frame(
+            observation, model.camera_names
+        )
         video = EvaluationVideoRecorder(
             video_path,
-            observation["agentview_image"],
+            camera_frame,
             instruction,
             task,
             episode_index,
             video_fps,
         )
-        video.write(observation["agentview_image"], step=0)
+        video.write(camera_frame, step=0)
     initial_positions = entity_positions(env, task)
     maximum_lift = 0.0
     success_streak = 0
@@ -499,12 +549,18 @@ def evaluate_episode(
     started = time.monotonic()
 
     for step in range(1, max_steps + 1):
-        image, proprio = policy_observation(observation, image_size, device)
+        camera_inputs, proprio = policy_observation(
+            observation,
+            image_size,
+            device,
+            normalizer.proprio_keys,
+            model.camera_names,
+        )
         normalized_proprio = normalizer.normalize_proprio(proprio)
         with torch.inference_mode():
             normalized_action = model(
-                image=image,
                 proprio=normalized_proprio,
+                **camera_inputs,
                 **language_inputs,
             )["action"]
             action_tensor = normalizer.denormalize_action(normalized_action)
@@ -514,7 +570,10 @@ def evaluate_episode(
         action_values += action.size
         observation, _, done, _ = env.step(action)
         if video is not None:
-            video.write(observation["agentview_image"], step=step)
+            video.write(
+                compose_camera_frame(observation, model.camera_names),
+                step=step,
+            )
         if render:
             env.render()
 
@@ -579,7 +638,12 @@ def evaluate_task(
     clip_fractions = []
     seed = DEFAULT_SEEDS[task] + args.seed_offset
     env = build_environment(
-        task, seed, args.instruction_split, args.num_cubes, args.render
+        task,
+        seed,
+        args.instruction_split,
+        args.num_cubes,
+        args.render,
+        model.camera_names,
     )
     try:
         for episode_index in range(args.episodes):
@@ -686,6 +750,9 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Checkpoint epoch: {checkpoint['epoch']}")
     print(f"Language mode: {model.language_mode}")
+    print(f"Visual fusion: {model.visual_fusion}")
+    print(f"Cameras: {', '.join(model.camera_names)}")
+    print(f"Proprio dimension: {normalizer.proprio_dim}")
     print(f"Device: {device}")
     print(f"Image size: {image_size}")
     summaries = []
@@ -713,6 +780,9 @@ def main():
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "checkpoint_best_val_loss": float(checkpoint["best_val_loss"]),
         "language_mode": model.language_mode,
+        "visual_fusion": model.visual_fusion,
+        "camera_names": list(model.camera_names),
+        "proprio_dim": normalizer.proprio_dim,
         "device": str(device),
         "image_convention": "opencv",
         "vertical_flip": False,
