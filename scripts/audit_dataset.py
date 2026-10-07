@@ -258,6 +258,7 @@ def audit_episode(path, task, manifest_entry, args):
             metadata = scalar_json(episode["metadata_json"], "metadata_json")
             result = scalar_json(episode["result_json"], "result_json")
             observation_keys = sorted(key for key in keys if key.startswith("obs__"))
+            phase_counts = {}
 
             if actions.ndim != 2:
                 errors.append(f"actions must be rank 2, got {actions.shape}")
@@ -267,6 +268,36 @@ def audit_episode(path, task, manifest_entry, args):
                 errors.append(f"actions must be floating point, got {actions.dtype}")
             if not np.isfinite(actions).all():
                 errors.append("actions contain NaN or Inf")
+
+            if "phases" in keys:
+                phases = episode["phases"]
+                if phases.ndim != 1:
+                    errors.append(f"phases must be rank 1, got {phases.shape}")
+                elif len(phases) != len(actions):
+                    errors.append(
+                        f"phases has {len(phases)} labels; expected {len(actions)}"
+                    )
+                elif phases.dtype.kind not in {"U", "S"}:
+                    errors.append(f"phases must contain strings, got {phases.dtype}")
+                else:
+                    phase_values = [str(value) for value in phases.tolist()]
+                    phase_counts = dict(sorted(Counter(phase_values).items()))
+                    invalid_phases = sorted(
+                        phase
+                        for phase in phase_counts
+                        if not phase or phase in {"unassigned", "unlabeled"}
+                    )
+                    if invalid_phases:
+                        errors.append(
+                            "invalid phase labels: " + ", ".join(invalid_phases)
+                        )
+            elif "phase_counts" in manifest_entry:
+                errors.append("manifest declares phase counts but NPZ has no phases")
+
+            if "phase_counts" in manifest_entry:
+                expected_phase_counts = manifest_entry["phase_counts"]
+                if phase_counts != expected_phase_counts:
+                    errors.append("manifest phase counts do not match NPZ phases")
 
             expected_observations = len(actions) + 1
             for key in observation_keys:
@@ -322,6 +353,7 @@ def audit_episode(path, task, manifest_entry, args):
                 "action_shape": list(actions.shape),
                 "action_min": action_min,
                 "action_max": action_max,
+                "phase_counts": phase_counts,
                 "metadata": metadata,
                 "rgb": rgb_stats,
             }
@@ -353,6 +385,7 @@ def audit_task(dataset_root, task, args, digest_paths):
     lengths = []
     action_min = None
     action_max = None
+    phase_counts = Counter()
     audited_paths = set()
 
     manifest_paths = [entry.get("path") for entry in all_entries]
@@ -379,6 +412,7 @@ def audit_task(dataset_root, task, args, digest_paths):
         )
         if details:
             lengths.append(details["steps"])
+            phase_counts.update(details["phase_counts"])
             if details["action_min"] is not None:
                 current_min = np.asarray(details["action_min"], dtype=np.float64)
                 current_max = np.asarray(details["action_max"], dtype=np.float64)
@@ -426,6 +460,7 @@ def audit_task(dataset_root, task, args, digest_paths):
         "trajectory_steps": trajectory,
         "action_min": action_min.tolist() if action_min is not None else None,
         "action_max": action_max.tolist() if action_max is not None else None,
+        "phase_counts": dict(sorted(phase_counts.items())),
         "semantics": serializable_semantics(semantics),
         "orphan_files": orphan_files,
     }
@@ -462,6 +497,15 @@ def markdown_report(report):
             values = ", ".join(f"{key}: {value}" for key, value in distribution.items())
             lines.append(f"- `{name}`: {values or '-'}")
         lines.append("")
+
+    lines += ["## Phase Distributions", ""]
+    for task, result in report["tasks"].items():
+        values = ", ".join(
+            f"{phase}: {count}"
+            for phase, count in result["phase_counts"].items()
+        )
+        lines.append(f"- **{task.title()}**: {values or '-'}")
+    lines.append("")
 
     lines += ["## Errors", ""]
     any_errors = False

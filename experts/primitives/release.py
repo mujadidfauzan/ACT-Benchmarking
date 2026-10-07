@@ -13,6 +13,7 @@ def release_object(
 
     print("Opening gripper...")
 
+    controller.set_phase("release")
     obs = controller.open_gripper(
         obs,
         steps=open_steps,
@@ -23,6 +24,7 @@ def release_object(
     retreat_target[2] += retreat_height
     print("Retreat target:", retreat_target)
 
+    controller.set_phase("retreat")
     obs, success = controller.move_to_pose(
         obs,
         target_position=retreat_target,

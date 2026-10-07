@@ -186,7 +186,10 @@ def main():
 
             metadata = env.get_task_metadata()
             initial_scene = snapshot_scene(observation)
-            recorder = TrajectoryRecorder(env)
+            recorder = TrajectoryRecorder(
+                env,
+                phase_provider=expert.controller.get_phase,
+            )
             recorder.start(observation)
             try:
                 try:
@@ -237,6 +240,7 @@ def main():
                 "task": args.task,
                 "instruction": metadata["instruction"],
                 "steps": summary["steps"],
+                "phase_counts": summary["phase_counts"],
                 "path": episode_path.name,
                 "metadata": metadata,
             }

@@ -19,8 +19,10 @@ def grasp_object(
     pre_grasp_height=0.05,
     grasp_offset=0.0,
     lift_height=0.20,
-    open_steps=20,
-    close_steps=40,
+    close_min_steps=12,
+    close_max_steps=40,
+    close_stable_steps=3,
+    close_qpos_tolerance=1e-4,
     render=False,
 ):
     """Approach, grasp, and lift an object."""
@@ -28,15 +30,10 @@ def grasp_object(
     object_position = np.asarray(object_position, dtype=np.float32).copy()
     target_orientation = np.asarray(target_orientation, dtype=np.float32)
 
-    obs = controller.open_gripper(
-        obs,
-        steps=open_steps,
-        render=render,
-    )
-
     approach_target = _target_with_height(object_position, approach_height)
     print("Approach target:", approach_target)
 
+    controller.set_phase("approach")
     obs, success = controller.move_to_pose(
         obs,
         target_position=approach_target,
@@ -52,6 +49,7 @@ def grasp_object(
     pre_grasp_target = _target_with_height(object_position, pre_grasp_height)
     print("Pre-grasp target:", pre_grasp_target)
 
+    controller.set_phase("pre_grasp")
     obs, success = controller.move_to_pose(
         obs,
         target_position=pre_grasp_target,
@@ -67,6 +65,7 @@ def grasp_object(
     grasp_target = _target_with_height(object_position, grasp_offset)
     print("Grasp target:", grasp_target)
 
+    controller.set_phase("descend")
     obs, success = controller.move_to_pose(
         obs,
         target_position=grasp_target,
@@ -79,9 +78,13 @@ def grasp_object(
     if not success:
         return PrimitiveResult(obs=obs, success=False, stage="grasp_pose")
 
-    obs = controller.close_gripper(
+    controller.set_phase("close")
+    obs = controller.close_gripper_adaptive(
         obs,
-        steps=close_steps,
+        min_steps=close_min_steps,
+        max_steps=close_max_steps,
+        stable_steps=close_stable_steps,
+        qpos_tolerance=close_qpos_tolerance,
         render=render,
     )
 
@@ -92,6 +95,7 @@ def grasp_object(
     lift_target = _target_with_height(current_object_position, lift_height)
     print("Lift target:", lift_target)
 
+    controller.set_phase("lift")
     obs, success = controller.move_to_pose(
         obs,
         target_position=lift_target,

@@ -201,19 +201,7 @@ Inspect the result:
 cat data/splits/pilot_v02_semantic/summary.json
 ```
 
-## 7. Multi-Task Normalization
-
-Statistics must come from the training split only:
-
-```bash
-python -m scripts.compute_normalization \
-  --dataset data/demos/pilot_v02 \
-  --split data/splits/pilot_v02_semantic/train.jsonl \
-  --output data/splits/pilot_v02_semantic/normalization.json \
-  --image-convention opencv
-```
-
-## 8. Frozen MiniLM Caches
+## 7. Frozen MiniLM Caches
 
 Pooled sentence embeddings:
 
@@ -248,9 +236,52 @@ python -m scripts.test_token_language \
   --cache data/splits/pilot_v02_semantic/language_token_embeddings.npz
 ```
 
-## 9. Multi-Task Language-BC
+## 8. Choose a Training Branch
 
-### 9.1 Pooled MiniLM
+Everything through Section 7 is shared. Choose exactly one branch for each
+experiment:
+
+```text
+Shared dataset pipeline (Sections 1-7)
+                |
+                +--> Branch A: Multi-Task
+                |      one model learns Pick + Place + Stack
+                |      multi-task normalization
+                |      Sections 9.1-9.4
+                |
+                +--> Branch B: Single-Task
+                       one model learns only Pick, Place, or Stack
+                       filtered manifests + task-specific normalization
+                       pooled or token-attention language mode
+                       Sections 10.1-10.5
+
+Both branches produce checkpoints
+                |
+                +--> Download and evaluate (Sections 11-13)
+```
+
+Do not run Branch A normalization for a Branch B model. Do not use a
+single-task normalization file for a multi-task model. Language caches are
+shared by both branches because MiniLM is frozen and the cache contains only
+instruction features.
+
+## 9. Branch A: Multi-Task Training
+
+Use this branch when one policy should learn Pick, Place, and Stack together.
+
+### 9.1 Multi-Task Normalization
+
+Statistics must come from the complete multi-task training split:
+
+```bash
+python -m scripts.compute_normalization \
+  --dataset data/demos/pilot_v02 \
+  --split data/splits/pilot_v02_semantic/train.jsonl \
+  --output data/splits/pilot_v02_semantic/normalization.json \
+  --image-convention opencv
+```
+
+### 9.2 Train Pooled MiniLM
 
 ```bash
 python -m scripts.train_language_bc \
@@ -277,7 +308,7 @@ python -m scripts.train_language_bc \
   --device cuda
 ```
 
-### 9.2 Token-Attention MiniLM
+### 9.3 Train Token-Attention MiniLM
 
 Run the same configuration with a separate output directory:
 
@@ -310,7 +341,7 @@ The two jobs may run concurrently if CPU, storage bandwidth, and VRAM are
 sufficient. Timing from concurrent runs must not be treated as a clean speed
 benchmark.
 
-### 9.3 Resume Training
+### 9.4 Resume Multi-Task Training
 
 Repeat the original command and append:
 
@@ -321,7 +352,13 @@ Repeat the original command and append:
 Keep all architecture, split, normalization, image, and optimizer arguments
 unchanged. Use `best.pt` for evaluation and `latest.pt` only for resuming.
 
-## 10. Build Per-Task Splits
+## 10. Branch B: Single-Task Training
+
+Use this branch when a separate policy should learn only one task. Start with
+Pick. Train Place or Stack separately only after interpreting Pick-only
+rollouts.
+
+### 10.1 Build a Per-Task Split
 
 Per-task training diagnoses whether failure comes from multi-task interference
 or from one-step BC itself. Start with Pick. Continue to Place and Stack only
@@ -374,7 +411,7 @@ PY
 For Pick, the expected split is 80 train, 10 validation, and 10 test episodes.
 Place and Stack counts follow the semantic held-out split and may differ.
 
-## 11. Per-Task Normalization
+### 10.2 Per-Task Normalization
 
 Set the task first:
 
@@ -394,7 +431,7 @@ python -m scripts.compute_normalization \
 
 Do not reuse the multi-task normalization for a per-task experiment.
 
-## 12. Per-Task Language-BC Training
+### 10.3 Train a Per-Task Pooled Language-BC Model
 
 Start with pooled Pick-only:
 
@@ -429,7 +466,55 @@ After Pick, replace `TASK=pick` with `TASK=place` or `TASK=stack` only when the
 experiment is justified. Do not compare per-task and multi-task validation MSE
 directly because they use different normalization statistics.
 
-## 13. Download Artifacts Before Stopping Vast.ai
+### 10.4 Train a Per-Task Token-Attention Model
+
+Single-task training also supports token attention. Use the same task-specific
+split and normalization, but change the language mode and output directory:
+
+```bash
+TASK=pick
+
+python -m scripts.train_language_bc \
+  --dataset data/demos/pilot_v02 \
+  --train-split "data/splits/pilot_v02_${TASK}/train.jsonl" \
+  --val-split "data/splits/pilot_v02_${TASK}/val.jsonl" \
+  --normalization "data/splits/pilot_v02_${TASK}/normalization.json" \
+  --pooled-cache data/splits/pilot_v02_semantic/language_embeddings.npz \
+  --token-cache data/splits/pilot_v02_semantic/language_token_embeddings.npz \
+  --language-mode token_attention \
+  --output-dir "results/language_bc/pilot_v02_${TASK}_token_seed42" \
+  --epochs 30 \
+  --batch-size 64 \
+  --image-size 128 \
+  --learning-rate 1e-4 \
+  --weight-decay 1e-4 \
+  --gradient-clip 1.0 \
+  --num-workers 4 \
+  --cache-size 2 \
+  --seed 42 \
+  --pretrained-visual \
+  --unfreeze-layer4-epoch 8 \
+  --no-vertical-flip \
+  --device cuda
+```
+
+For the first Pick-only diagnosis, pooled mode is sufficient. Train both modes
+when making a controlled pooled-versus-token comparison. Token attention is
+especially relevant to Stack because word order encodes the bottom-to-top
+object relation.
+
+### 10.5 Resume Single-Task Training
+
+Repeat the matching pooled or token command and append:
+
+```bash
+--resume results/language_bc/<SINGLE_TASK_RUN_NAME>/latest.pt
+```
+
+The resumed command must use the same task split, task-specific normalization,
+language mode, and model configuration as the checkpoint.
+
+## 11. Download Artifacts from Either Branch
 
 Run these commands from the laptop, not from Vast.ai:
 
@@ -456,7 +541,12 @@ Required evaluation artifacts are:
 The demonstration `.npz` files are not required for simulator rollout on the
 laptop.
 
-## 14. Closed-Loop Evaluation
+## 12. Closed-Loop Evaluation
+
+Use the command that matches the branch used for training. In particular, the
+checkpoint and normalization file must come from the same branch.
+
+### 12.1 Evaluate a Branch A Multi-Task Model
 
 Multi-task token model example:
 
@@ -472,6 +562,8 @@ MUJOCO_GL=egl python -m scripts.evaluate_language_bc \
   --output-dir results/language_bc_evaluation/token_20 \
   --device cpu
 ```
+
+### 12.2 Evaluate a Branch B Single-Task Model
 
 Pick-only example:
 
@@ -500,7 +592,7 @@ Use a fresh output directory for every evaluation. Compare success rate,
 failure reasons, and `mean_action_clip_fraction`; validation MSE alone is not a
 closed-loop task metric.
 
-## 15. Experiment Decision Rule
+## 13. Experiment Decision Rule
 
 Interpret Pick-only first:
 

@@ -52,6 +52,7 @@ class StackExpert:
         )
 
     def _settle(self, obs, render):
+        self.controller.set_phase("settle")
         action = self.controller.create_action(
             gripper=self.controller.GRIPPER_OPEN,
         )

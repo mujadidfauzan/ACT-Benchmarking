@@ -14,6 +14,10 @@ class PickExpert:
         lift_height=0.20,
         grasp_offset=0.0,
         target_orientation=None,
+        close_min_steps=12,
+        close_max_steps=40,
+        close_stable_steps=3,
+        close_qpos_tolerance=1e-4,
     ):
         self.controller = controller
 
@@ -24,6 +28,10 @@ class PickExpert:
         self.grasp_offset = grasp_offset
 
         self.target_orientation = target_orientation
+        self.close_min_steps = close_min_steps
+        self.close_max_steps = close_max_steps
+        self.close_stable_steps = close_stable_steps
+        self.close_qpos_tolerance = close_qpos_tolerance
 
     # ============================================================
     # HELPER FUNCTIONS
@@ -187,6 +195,10 @@ class PickExpert:
             pre_grasp_height=self.pre_grasp_height,
             grasp_offset=self.grasp_offset,
             lift_height=self.lift_height,
+            close_min_steps=self.close_min_steps,
+            close_max_steps=self.close_max_steps,
+            close_stable_steps=self.close_stable_steps,
+            close_qpos_tolerance=self.close_qpos_tolerance,
             render=render,
         )
 

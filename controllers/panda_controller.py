@@ -26,6 +26,16 @@ class PandaController:
 
         self.eef_pos_key = "robot0_eef_pos"
         self.eef_quat_key = "robot0_eef_quat"
+        self.gripper_qpos_key = "robot0_gripper_qpos"
+        self.current_phase = "unassigned"
+
+    def set_phase(self, phase):
+        if not isinstance(phase, str) or not phase:
+            raise ValueError("phase must be a non-empty string")
+        self.current_phase = phase
+
+    def get_phase(self):
+        return self.current_phase
 
     # ============================================================
     # STATE GETTERS
@@ -396,3 +406,64 @@ class PandaController:
             steps=steps,
             render=render,
         )
+
+    def close_gripper_adaptive(
+        self,
+        obs,
+        min_steps=12,
+        max_steps=40,
+        stable_steps=3,
+        qpos_tolerance=1e-4,
+        render=False,
+    ):
+        """Close until finger motion settles, bounded by safe step limits."""
+
+        if min_steps <= 0:
+            raise ValueError("min_steps must be positive")
+        if max_steps < min_steps:
+            raise ValueError("max_steps must be greater than or equal to min_steps")
+        if stable_steps <= 0:
+            raise ValueError("stable_steps must be positive")
+        if qpos_tolerance <= 0:
+            raise ValueError("qpos_tolerance must be positive")
+        if self.gripper_qpos_key not in obs:
+            raise KeyError(
+                f"Missing gripper state {self.gripper_qpos_key!r}; "
+                f"available keys: {list(obs.keys())}"
+            )
+
+        previous_qpos = np.asarray(
+            obs[self.gripper_qpos_key], dtype=np.float32
+        ).copy()
+        consecutive_stable_steps = 0
+        steps_taken = 0
+
+        for steps_taken in range(1, max_steps + 1):
+            action = self.create_action(
+                delta_position=np.zeros(3),
+                delta_orientation=np.zeros(3),
+                gripper=self.GRIPPER_CLOSE,
+            )
+            obs, reward, done, info = self.env.step(action)
+
+            if render:
+                self.env.render()
+
+            current_qpos = np.asarray(
+                obs[self.gripper_qpos_key], dtype=np.float32
+            )
+            qpos_change = float(np.max(np.abs(current_qpos - previous_qpos)))
+            if qpos_change <= qpos_tolerance:
+                consecutive_stable_steps += 1
+            else:
+                consecutive_stable_steps = 0
+
+            previous_qpos = current_qpos.copy()
+            if (
+                steps_taken >= min_steps
+                and consecutive_stable_steps >= stable_steps
+            ):
+                break
+
+        print(f"Adaptive gripper close: {steps_taken} steps")
+        return obs

@@ -30,6 +30,7 @@ def transport_object(
     approach_target = _target_with_height(destination_position, approach_height)
     print("Approach target:", approach_target)
 
+    controller.set_phase("transport_approach")
     obs, success = controller.move_to_pose(
         obs,
         target_position=approach_target,
@@ -45,6 +46,7 @@ def transport_object(
     pre_place_target = _target_with_height(destination_position, pre_place_height)
     print("Pre-place target:", pre_place_target)
 
+    controller.set_phase("pre_place")
     obs, success = controller.move_to_pose(
         obs,
         target_position=pre_place_target,
@@ -60,6 +62,7 @@ def transport_object(
     place_target = _target_with_height(destination_position, place_offset)
     print("Place target:", place_target)
 
+    controller.set_phase("place")
     obs, success = controller.move_to_pose(
         obs,
         target_position=place_target,
