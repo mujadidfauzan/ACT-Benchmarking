@@ -68,6 +68,7 @@ class ManipulationDataset(Dataset):
         cache_size=1,
         proprio_keys=DEFAULT_POLICY_PROPRIO_KEYS,
         camera_keys=DEFAULT_POLICY_CAMERA_KEYS,
+        history_size=1,
     ):
         if mode not in {"bc", "act"}:
             raise ValueError("mode must be 'bc' or 'act'")
@@ -75,6 +76,8 @@ class ManipulationDataset(Dataset):
             raise ValueError("chunk_size must be positive")
         if cache_size < 0:
             raise ValueError("cache_size cannot be negative")
+        if history_size <= 0:
+            raise ValueError("history_size must be positive")
 
         self.dataset_root = Path(dataset_root)
         self.split_manifest = Path(split_manifest)
@@ -84,6 +87,7 @@ class ManipulationDataset(Dataset):
         self.cache_size = int(cache_size)
         self.proprio_keys = tuple(proprio_keys)
         self.camera_keys = tuple(camera_keys)
+        self.history_size = int(history_size)
         if not self.proprio_keys:
             raise ValueError("proprio_keys cannot be empty")
         if any(not key.startswith("obs__") for key in self.proprio_keys):
@@ -187,6 +191,40 @@ class ManipulationDataset(Dataset):
         ]
         return torch.from_numpy(np.concatenate(parts, axis=0))
 
+    def _history_tensors(self, episode, timestep):
+        history_size = self.history_size
+        proprio_dim = self.proprio_dim
+        action_dim = episode["actions"].shape[-1]
+        proprio_history = np.zeros(
+            (history_size, proprio_dim), dtype=np.float32
+        )
+        proprio_mask = np.zeros(history_size, dtype=np.bool_)
+        start = max(0, timestep - history_size + 1)
+        valid_timesteps = list(range(start, timestep + 1))
+        offset = history_size - len(valid_timesteps)
+        for destination, source in enumerate(valid_timesteps, start=offset):
+            proprio_history[destination] = self._proprio_tensor(
+                episode, source
+            ).numpy()
+            proprio_mask[destination] = True
+
+        action_history = np.zeros(
+            (history_size - 1, action_dim), dtype=np.float32
+        )
+        action_mask = np.zeros(history_size - 1, dtype=np.bool_)
+        if history_size > 1:
+            action_start = max(0, timestep - history_size + 1)
+            previous_actions = episode["actions"][action_start:timestep]
+            action_offset = history_size - 1 - len(previous_actions)
+            action_history[action_offset:] = previous_actions
+            action_mask[action_offset:] = True
+        return (
+            torch.from_numpy(proprio_history),
+            torch.from_numpy(action_history),
+            torch.from_numpy(proprio_mask),
+            torch.from_numpy(action_mask),
+        )
+
     def phase_groups(self):
         """Return sample indices grouped by task and expert phase."""
 
@@ -245,6 +283,13 @@ class ManipulationDataset(Dataset):
             )
         if self.mode == "bc":
             sample["action"] = self._bc_target(episode["actions"], timestep)
+            if self.history_size > 1:
+                (
+                    sample["proprio_history"],
+                    sample["action_history"],
+                    sample["proprio_history_mask"],
+                    sample["action_history_mask"],
+                ) = self._history_tensors(episode, timestep)
         else:
             actions, padding_mask = self._act_target(episode["actions"], timestep)
             sample["actions"] = actions

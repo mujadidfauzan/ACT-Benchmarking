@@ -13,7 +13,11 @@ from torch.utils.data import default_collate
 
 from data.manipulation_dataset import CAMERA_OBSERVATION_KEYS, ManipulationDataset
 from data.normalization import PolicyNormalizer
-from models.visual_bc import VISUAL_BC_FUSION_MODES, VisualBCPolicy
+from models.visual_bc import (
+    VISUAL_BC_FUSION_MODES,
+    HistoryVisualBCPolicy,
+    VisualBCPolicy,
+)
 
 
 def parse_args():
@@ -25,6 +29,12 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--image-size", type=int, default=128)
+    parser.add_argument(
+        "--history-size",
+        type=int,
+        default=1,
+        help="Use History-Visual-BC when greater than one",
+    )
     parser.add_argument(
         "--visual-fusion",
         choices=VISUAL_BC_FUSION_MODES,
@@ -78,6 +88,8 @@ def main():
         raise ValueError("Batch size, steps, and log interval must be positive")
     if args.learning_rate <= 0 or args.image_size < 32:
         raise ValueError("Invalid learning rate or image size")
+    if args.history_size <= 0:
+        raise ValueError("--history-size must be positive")
     if args.camera_names[0] != "agentview":
         raise ValueError("--camera-names must start with agentview")
     set_seed(args.seed)
@@ -94,6 +106,7 @@ def main():
         camera_keys=tuple(
             CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
         ),
+        history_size=args.history_size,
     )
     episode = dataset.episode_sample_ranges[0]
     indices = np.linspace(
@@ -103,25 +116,45 @@ def main():
         dtype=int,
     )
     batch = default_collate([dataset[int(index)] for index in indices])
-    inputs = {
-        "image": resize(batch["image"], args.image_size),
-        "proprio": normalizer.normalize_proprio(batch["proprio"]),
-    }
+    inputs = {"image": resize(batch["image"], args.image_size)}
+    if args.history_size > 1:
+        proprio_mask = batch["proprio_history_mask"]
+        action_mask = batch["action_history_mask"]
+        inputs.update(
+            {
+                "proprio_history": normalizer.normalize_proprio(
+                    batch["proprio_history"]
+                )
+                * proprio_mask.unsqueeze(-1),
+                "action_history": normalizer.normalize_action(
+                    batch["action_history"]
+                )
+                * action_mask.unsqueeze(-1),
+                "proprio_history_mask": proprio_mask,
+                "action_history_mask": action_mask,
+            }
+        )
+    else:
+        inputs["proprio"] = normalizer.normalize_proprio(batch["proprio"])
     if "eye_in_hand_image" in batch:
         inputs["eye_in_hand_image"] = resize(
             batch["eye_in_hand_image"], args.image_size
         )
     target = normalizer.normalize_action(batch["action"])
 
-    model = VisualBCPolicy(
-        visual_fusion=args.visual_fusion,
-        camera_names=args.camera_names,
-        action_dim=normalizer.action_dim,
-        proprio_dim=normalizer.proprio_dim,
-        pretrained_visual=args.pretrained_visual,
-        freeze_visual_backbone=True,
-        dropout=0.0,
-    )
+    model_class = HistoryVisualBCPolicy if args.history_size > 1 else VisualBCPolicy
+    model_kwargs = {
+        "visual_fusion": args.visual_fusion,
+        "camera_names": args.camera_names,
+        "action_dim": normalizer.action_dim,
+        "proprio_dim": normalizer.proprio_dim,
+        "pretrained_visual": args.pretrained_visual,
+        "freeze_visual_backbone": True,
+        "dropout": 0.0,
+    }
+    if args.history_size > 1:
+        model_kwargs["history_size"] = args.history_size
+    model = model_class(**model_kwargs)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, weight_decay=0.0)
     losses = []
@@ -149,15 +182,8 @@ def main():
     model.eval()
     with torch.no_grad():
         expected = model(**inputs)["action"]
-    restored = VisualBCPolicy(
-        visual_fusion=args.visual_fusion,
-        camera_names=args.camera_names,
-        action_dim=normalizer.action_dim,
-        proprio_dim=normalizer.proprio_dim,
-        pretrained_visual=False,
-        freeze_visual_backbone=True,
-        dropout=0.0,
-    )
+    model_kwargs["pretrained_visual"] = False
+    restored = model_class(**model_kwargs)
     restored.load_state_dict(copy.deepcopy(model.state_dict()))
     restored.eval()
     with torch.no_grad():
@@ -174,6 +200,7 @@ def main():
         "split": str(args.split),
         "camera_names": list(args.camera_names),
         "visual_fusion": args.visual_fusion,
+        "history_size": args.history_size,
         "batch_size": args.batch_size,
         "timesteps": batch["timestep"].tolist(),
         "initial_loss": initial,

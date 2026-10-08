@@ -8,6 +8,7 @@ from models.visual_encoder import ResNet18VisualEncoder
 from models.visual_bc import (
     VISUAL_BC_FUSION_MODES,
     LearnedSpatialAttention,
+    HistoryVisualBCPolicy,
     VisualBCPolicy,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "ResNet18VisualEncoder",
     "VISUAL_BC_FUSION_MODES",
     "LearnedSpatialAttention",
+    "HistoryVisualBCPolicy",
     "VisualBCPolicy",
 ]

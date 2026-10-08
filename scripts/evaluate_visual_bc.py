@@ -4,7 +4,7 @@ import argparse
 import json
 import random
 import time
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +15,7 @@ from robosuite.utils import RandomizationError
 
 from data.normalization import PolicyNormalizer
 from environments.pick_env import PickEnv
-from models.visual_bc import VisualBCPolicy
+from models.visual_bc import HistoryVisualBCPolicy, VisualBCPolicy
 from scripts.evaluate_language_bc import (
     EvaluationVideoRecorder,
     compose_camera_frame,
@@ -44,6 +44,16 @@ def parse_args():
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--video-dir", type=Path)
     parser.add_argument("--video-fps", type=float, default=20.0)
+    parser.add_argument(
+        "--log-rollout",
+        action="store_true",
+        help="Write per-timestep policy, EEF, and target diagnostics as JSONL",
+    )
+    parser.add_argument(
+        "--rollout-dir",
+        type=Path,
+        help="Directory for rollout JSONL files; defaults to <output-dir>/rollouts",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -63,21 +73,36 @@ def append_jsonl(path, value):
         handle.write(json.dumps(value, default=json_default, sort_keys=True) + "\n")
 
 
+def write_jsonl(handle, value):
+    handle.write(json.dumps(value, default=json_default, sort_keys=True) + "\n")
+
+
 def load_policy(args, device):
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = checkpoint.get("model_config", {})
-    if checkpoint.get("policy_type", config.get("policy_type")) != "visual_bc":
-        raise ValueError("Checkpoint is not a Visual-BC checkpoint")
+    policy_type = checkpoint.get("policy_type", config.get("policy_type"))
+    if policy_type not in {"visual_bc", "history_visual_bc"}:
+        raise ValueError("Checkpoint is not a supported Visual-BC checkpoint")
     normalizer = PolicyNormalizer.from_json(args.normalization).to(device)
     if int(config.get("proprio_dim", -1)) != normalizer.proprio_dim:
         raise ValueError("Checkpoint and normalizer proprio dimensions do not match")
-    model = VisualBCPolicy(
-        visual_fusion=config["visual_fusion"],
-        camera_names=tuple(config["camera_names"]),
-        action_dim=normalizer.action_dim,
-        proprio_dim=normalizer.proprio_dim,
-        pretrained_visual=False,
-        freeze_visual_backbone=True,
+    model_class = (
+        HistoryVisualBCPolicy
+        if policy_type == "history_visual_bc"
+        else VisualBCPolicy
+    )
+    model_kwargs = {
+        "visual_fusion": config["visual_fusion"],
+        "camera_names": tuple(config["camera_names"]),
+        "action_dim": normalizer.action_dim,
+        "proprio_dim": normalizer.proprio_dim,
+        "pretrained_visual": False,
+        "freeze_visual_backbone": True,
+    }
+    if policy_type == "history_visual_bc":
+        model_kwargs["history_size"] = int(config["history_size"])
+    model = model_class(
+        **model_kwargs
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -126,6 +151,7 @@ def evaluate_episode(
     video_path,
     video_fps,
     target_color,
+    rollout_path=None,
 ):
     observation = env.reset()
     metadata = env.get_task_metadata()
@@ -141,6 +167,21 @@ def evaluate_episode(
         )
         video.write(frame, 0)
 
+    rollout_handle = None
+    if rollout_path is not None:
+        rollout_path.parent.mkdir(parents=True, exist_ok=True)
+        rollout_handle = rollout_path.open("w", encoding="utf-8")
+        write_jsonl(
+            rollout_handle,
+            {
+                "event": "episode_start",
+                "episode": episode_index,
+                "target_id": target_id,
+                "target_color": target_color,
+                "metadata": metadata,
+            },
+        )
+
     initial_positions = entity_positions(env, "pick")
     maximum_lifts = {object_id: 0.0 for object_id in env.object_ids}
     success_streak = 0
@@ -150,8 +191,19 @@ def evaluate_episode(
         np.asarray(value, dtype=np.float32) for value in env.action_spec
     )
     started = time.monotonic()
+    uses_history = isinstance(model, HistoryVisualBCPolicy)
+    proprio_queue = deque(maxlen=model.history_size if uses_history else 1)
+    action_queue = deque(maxlen=model.history_size - 1 if uses_history else 1)
     try:
         for step in range(1, max_steps + 1):
+            eef_before = np.asarray(
+                observation["robot0_eef_pos"], dtype=np.float32
+            ).copy()
+            gripper_before = np.asarray(
+                observation.get("robot0_gripper_qpos", []), dtype=np.float32
+            ).copy()
+            target_before = env.get_object_position(target_id).copy()
+            target_delta_before = target_before - eef_before
             camera_inputs, proprio = policy_observation(
                 observation,
                 image_size,
@@ -159,15 +211,69 @@ def evaluate_episode(
                 normalizer.proprio_keys,
                 model.camera_names,
             )
+            if uses_history:
+                proprio_queue.append(proprio[0].detach().clone())
+                proprio_history = torch.zeros(
+                    (1, model.history_size, normalizer.proprio_dim),
+                    dtype=proprio.dtype,
+                    device=device,
+                )
+                proprio_mask = torch.zeros(
+                    (1, model.history_size), dtype=torch.bool, device=device
+                )
+                proprio_count = len(proprio_queue)
+                proprio_history[0, -proprio_count:] = torch.stack(
+                    tuple(proprio_queue)
+                )
+                proprio_mask[0, -proprio_count:] = True
+                action_history = torch.zeros(
+                    (1, model.history_size - 1, normalizer.action_dim),
+                    dtype=proprio.dtype,
+                    device=device,
+                )
+                action_mask = torch.zeros(
+                    (1, model.history_size - 1),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                action_count = len(action_queue)
+                if action_count:
+                    action_history[0, -action_count:] = torch.stack(
+                        tuple(action_queue)
+                    )
+                    action_mask[0, -action_count:] = True
+                policy_inputs = {
+                    "proprio_history": normalizer.normalize_proprio(
+                        proprio_history
+                    )
+                    * proprio_mask.unsqueeze(-1),
+                    "action_history": normalizer.normalize_action(
+                        action_history
+                    )
+                    * action_mask.unsqueeze(-1),
+                    "proprio_history_mask": proprio_mask,
+                    "action_history_mask": action_mask,
+                }
+            else:
+                proprio_count = 1
+                action_count = 0
+                policy_inputs = {
+                    "proprio": normalizer.normalize_proprio(proprio)
+                }
             with torch.inference_mode():
                 prediction = model(
-                    proprio=normalizer.normalize_proprio(proprio),
                     **camera_inputs,
+                    **policy_inputs,
                 )["action"]
                 raw_action = normalizer.denormalize_action(prediction)[0]
             raw_action = raw_action.cpu().numpy().astype(np.float32)
             action = np.clip(raw_action, action_low, action_high)
-            clipped_values += int(np.count_nonzero(action != raw_action))
+            if uses_history:
+                action_queue.append(
+                    torch.from_numpy(action.copy()).to(device=device)
+                )
+            clipped_mask = action != raw_action
+            clipped_values += int(np.count_nonzero(clipped_mask))
             action_values += action.size
             observation, _, done, _ = env.step(action)
             if video is not None:
@@ -181,6 +287,53 @@ def evaluate_episode(
                     - initial_positions["objects"][object_id][2]
                 )
                 maximum_lifts[object_id] = max(maximum_lifts[object_id], lift)
+            if rollout_handle is not None:
+                eef_after = np.asarray(
+                    observation["robot0_eef_pos"], dtype=np.float32
+                ).copy()
+                target_after = env.get_object_position(target_id).copy()
+                target_delta_after = target_after - eef_after
+                write_jsonl(
+                    rollout_handle,
+                    {
+                        "event": "step",
+                        "step": step,
+                        "eef_position_before": eef_before,
+                        "target_position_before": target_before,
+                        "eef_target_delta_before": target_delta_before,
+                        "eef_target_xy_distance_before": float(
+                            np.linalg.norm(target_delta_before[:2])
+                        ),
+                        "target_minus_eef_z_before": float(target_delta_before[2]),
+                        "eef_target_distance_before": float(
+                            np.linalg.norm(target_delta_before)
+                        ),
+                        "gripper_qpos_before": gripper_before,
+                        "normalized_action": prediction[0].detach().cpu().numpy(),
+                        "raw_action": raw_action,
+                        "executed_action": action,
+                        "action_clipped": clipped_mask,
+                        "translation_action": action[:3],
+                        "rotation_action": action[3:6],
+                        "gripper_action": float(action[6]),
+                        "proprio_history_valid": proprio_count,
+                        "action_history_valid": action_count,
+                        "eef_position_after": eef_after,
+                        "target_position_after": target_after,
+                        "eef_target_xy_distance_after": float(
+                            np.linalg.norm(target_delta_after[:2])
+                        ),
+                        "target_minus_eef_z_after": float(target_delta_after[2]),
+                        "eef_target_distance_after": float(
+                            np.linalg.norm(target_delta_after)
+                        ),
+                        "target_lift": float(
+                            target_after[2]
+                            - initial_positions["objects"][target_id][2]
+                        ),
+                        "done": bool(done),
+                    },
+                )
             if env._check_success():
                 success_streak += 1
                 if success_streak >= success_hold_steps:
@@ -196,6 +349,7 @@ def evaluate_episode(
                         "final_positions": entity_positions(env, "pick"),
                         "elapsed_seconds": time.monotonic() - started,
                         "video_path": str(video_path) if video_path else None,
+                        "rollout_path": str(rollout_path) if rollout_path else None,
                     }
             else:
                 success_streak = 0
@@ -204,6 +358,8 @@ def evaluate_episode(
     finally:
         if video is not None:
             video.close()
+        if rollout_handle is not None:
+            rollout_handle.close()
 
     wrong_lifts = [
         lift
@@ -228,6 +384,7 @@ def evaluate_episode(
         "final_positions": entity_positions(env, "pick"),
         "elapsed_seconds": time.monotonic() - started,
         "video_path": str(video_path) if video_path else None,
+        "rollout_path": str(rollout_path) if rollout_path else None,
     }
 
 
@@ -265,6 +422,10 @@ def main():
             if args.record_video:
                 video_root = args.video_dir or (args.output_dir / "videos")
                 video_path = video_root / f"pick_episode_{episode:03d}.mp4"
+            rollout_path = None
+            if args.log_rollout:
+                rollout_root = args.rollout_dir or (args.output_dir / "rollouts")
+                rollout_path = rollout_root / f"pick_episode_{episode:03d}.jsonl"
             try:
                 result = evaluate_episode(
                     env,
@@ -279,6 +440,7 @@ def main():
                     video_path,
                     args.video_fps,
                     target_color,
+                    rollout_path,
                 )
             except RandomizationError as error:
                 result = {
@@ -316,7 +478,9 @@ def main():
         "attempts_log": attempts_path.name,
     }
     summary = {
-        "policy_type": "visual_bc",
+        "policy_type": checkpoint.get(
+            "policy_type", checkpoint.get("model_config", {}).get("policy_type")
+        ),
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "checkpoint_best_val_loss": float(checkpoint["best_val_loss"]),
@@ -324,9 +488,16 @@ def main():
         "camera_names": list(model.camera_names),
         "visual_fusion": model.visual_fusion,
         "proprio_dim": normalizer.proprio_dim,
+        "history_size": getattr(model, "history_size", 1),
         "image_size": image_size,
         "device": str(device),
         "record_video": args.record_video,
+        "log_rollout": args.log_rollout,
+        "rollout_dir": (
+            str(args.rollout_dir or (args.output_dir / "rollouts"))
+            if args.log_rollout
+            else None
+        ),
         "tasks": [task_summary],
     }
     (args.output_dir / "summary.json").write_text(

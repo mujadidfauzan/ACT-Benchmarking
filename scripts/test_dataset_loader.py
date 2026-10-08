@@ -28,6 +28,12 @@ def parse_args():
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--chunk-size", type=int, default=32)
+    parser.add_argument(
+        "--history-size",
+        type=int,
+        default=1,
+        help="Emit BC proprio/action history when greater than one",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
         "--camera-names",
@@ -101,6 +107,7 @@ def verify_bc(args):
         camera_keys=tuple(
             CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
         ),
+        history_size=args.history_size,
     )
     sample = dataset[0]
     verify_common_sample(sample, dataset.proprio_dim)
@@ -131,6 +138,27 @@ def verify_bc(args):
             batch["eye_in_hand_image"].shape
             == (batch_size, 3, 256, 256),
             "invalid BC eye-in-hand image batch",
+        )
+    if args.history_size > 1:
+        require(
+            batch["proprio_history"].shape
+            == (batch_size, args.history_size, dataset.proprio_dim),
+            "invalid BC proprio history batch",
+        )
+        require(
+            batch["action_history"].shape
+            == (batch_size, args.history_size - 1, dataset.action_dim),
+            "invalid BC action history batch",
+        )
+        require(
+            batch["proprio_history_mask"].shape
+            == (batch_size, args.history_size),
+            "invalid BC proprio history mask",
+        )
+        require(
+            batch["action_history_mask"].shape
+            == (batch_size, args.history_size - 1),
+            "invalid BC action history mask",
         )
     return dataset, batch
 
@@ -219,6 +247,11 @@ def print_batch(name, dataset, batch):
             batch["eye_in_hand_image"].dtype,
         )
     print("Proprio:", tuple(batch["proprio"].shape), batch["proprio"].dtype)
+    if "proprio_history" in batch:
+        print("Proprio history:", tuple(batch["proprio_history"].shape))
+        print("Action history:", tuple(batch["action_history"].shape))
+        print("Proprio history mask:", tuple(batch["proprio_history_mask"].shape))
+        print("Action history mask:", tuple(batch["action_history_mask"].shape))
     if "action" in batch:
         print("Action:", tuple(batch["action"].shape), batch["action"].dtype)
     else:
@@ -261,6 +294,8 @@ def main():
         raise ValueError("--batch-size must be positive")
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be positive")
+    if args.history_size <= 0:
+        raise ValueError("--history-size must be positive")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative")
 

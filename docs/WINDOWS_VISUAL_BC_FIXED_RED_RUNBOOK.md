@@ -193,8 +193,13 @@ python -m scripts.evaluate_visual_bc ^
   --episodes 20 ^
   --device cuda ^
   --record-video ^
+  --log-rollout ^
   --output-dir results/visual_bc_evaluation/pick_fixed_red_v01_20
 ```
+
+Each `rollouts/pick_episode_XXX.jsonl` stores per-step EEF-to-target distance,
+target lift, normalized/raw/executed actions, clipping state, and gripper
+command. Use a new output directory for every evaluation run.
 
 ## 10. Resume an Interrupted Run
 
@@ -205,3 +210,83 @@ Repeat the exact training command and append:
 ```
 
 Do not resume from a Language-BC checkpoint.
+
+## 11. History-Visual-BC Experiment
+
+This branch reuses the same demonstrations, split, and normalization. It adds
+the current and seven previous proprio states plus the seven previously
+executed actions. Current RGB remains the only visual history.
+
+Test history-window alignment:
+
+```bat
+python -m scripts.test_dataset_loader ^
+  --dataset data/demos/pick_fixed_red_v01 ^
+  --split data/splits/pick_fixed_red_v01_iid/train.jsonl ^
+  --batch-size 4 ^
+  --history-size 8 ^
+  --num-workers 0 ^
+  --camera-names agentview robot0_eye_in_hand ^
+  --no-vertical-flip
+```
+
+Run the history tiny-overfit gate:
+
+```bat
+python -m scripts.tiny_overfit_visual_bc ^
+  --dataset data/demos/pick_fixed_red_v01 ^
+  --split data/splits/pick_fixed_red_v01_iid/train.jsonl ^
+  --normalization data/splits/pick_fixed_red_v01_iid/normalization_23d.json ^
+  --history-size 8 ^
+  --visual-fusion spatial_attention ^
+  --camera-names agentview robot0_eye_in_hand ^
+  --no-vertical-flip ^
+  --steps 300 ^
+  --batch-size 4 ^
+  --image-size 128 ^
+  --output-dir results/tiny_overfit/pick_fixed_red_history_visual_bc
+```
+
+Train with the frozen ResNet18 backbone:
+
+```bat
+python -m scripts.train_history_visual_bc ^
+  --dataset data/demos/pick_fixed_red_v01 ^
+  --train-split data/splits/pick_fixed_red_v01_iid/train.jsonl ^
+  --val-split data/splits/pick_fixed_red_v01_iid/val.jsonl ^
+  --normalization data/splits/pick_fixed_red_v01_iid/normalization_23d.json ^
+  --fixed-target-color red ^
+  --history-size 8 ^
+  --visual-fusion spatial_attention ^
+  --camera-names agentview robot0_eye_in_hand ^
+  --phase-balanced ^
+  --output-dir results/history_visual_bc/pick_fixed_red_h8_seed42 ^
+  --epochs 80 ^
+  --batch-size 64 ^
+  --image-size 224 ^
+  --learning-rate 1e-4 ^
+  --weight-decay 1e-4 ^
+  --gradient-clip 1.0 ^
+  --num-workers 4 ^
+  --cache-size 8 ^
+  --seed 42 ^
+  --pretrained-visual ^
+  --no-vertical-flip ^
+  --device cuda
+```
+
+Evaluate five logged rollouts first:
+
+```bat
+python -m scripts.evaluate_visual_bc ^
+  --checkpoint results/history_visual_bc/pick_fixed_red_h8_seed42/best.pt ^
+  --normalization data/splits/pick_fixed_red_v01_iid/normalization_23d.json ^
+  --episodes 5 ^
+  --device cuda ^
+  --record-video ^
+  --log-rollout ^
+  --output-dir results/history_visual_bc_evaluation/pick_fixed_red_h8_smoke5
+```
+
+The evaluator obtains history size from the checkpoint. At rollout time it uses
+the actions actually sent to the environment, matching deployment conditions.

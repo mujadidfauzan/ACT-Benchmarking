@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn
 
-from models.policy_components import ProprioEncoder
+from models.policy_components import ProprioEncoder, TemporalHistoryEncoder
 from models.visual_encoder import ResNet18VisualEncoder
 
 
@@ -177,6 +177,100 @@ class VisualBCPolicy(nn.Module):
             "action": self.action_head(fusion_feature),
             "visual_feature": visual_feature,
             "proprio_feature": proprio_feature,
+            "fusion_feature": fusion_feature,
+            "spatial_attention_weights": attention,
+            "spatial_attention_coordinates": coordinates,
+            "eye_in_hand_visual_feature": eye_feature,
+            "eye_in_hand_attention_weights": eye_attention,
+            "eye_in_hand_attention_coordinates": eye_coordinates,
+        }
+
+
+class HistoryVisualBCPolicy(VisualBCPolicy):
+    """Visual-BC with a fixed proprioception and executed-action history."""
+
+    def __init__(
+        self,
+        history_size=8,
+        temporal_feature_dim=128,
+        *args,
+        **kwargs,
+    ):
+        if history_size <= 1:
+            raise ValueError("history_size must be greater than one")
+        action_dim = int(kwargs.get("action_dim", 7))
+        proprio_dim = int(kwargs.get("proprio_dim", 23))
+        proprio_feature_dim = int(kwargs.get("proprio_feature_dim", 64))
+        super().__init__(*args, **kwargs)
+        self.history_size = int(history_size)
+        self.temporal_encoder = TemporalHistoryEncoder(
+            history_size=history_size,
+            proprio_dim=proprio_dim,
+            action_dim=action_dim,
+            output_dim=temporal_feature_dim,
+            dropout=float(kwargs.get("dropout", 0.1)),
+        )
+        self.proprio_encoder = None
+
+        visual_dim = self.visual_encoder.output_dim
+        visual_feature_count = 2 if self.use_eye_in_hand else 1
+        fusion_hidden_dims = kwargs.get("fusion_hidden_dims", (256, 128))
+        hidden_1, hidden_2 = fusion_hidden_dims
+        self.fusion = nn.Sequential(
+            nn.Linear(
+                visual_dim * visual_feature_count + temporal_feature_dim,
+                hidden_1,
+            ),
+            nn.LayerNorm(hidden_1),
+            nn.GELU(),
+            nn.Dropout(float(kwargs.get("dropout", 0.1))),
+            nn.Linear(hidden_1, hidden_2),
+            nn.LayerNorm(hidden_2),
+            nn.GELU(),
+            nn.Dropout(float(kwargs.get("dropout", 0.1))),
+        )
+
+    def forward(
+        self,
+        image,
+        proprio_history,
+        action_history,
+        proprio_history_mask,
+        action_history_mask,
+        *,
+        eye_in_hand_image=None,
+    ):
+        if self.use_eye_in_hand and eye_in_hand_image is None:
+            raise ValueError("Dual-camera policy requires eye_in_hand_image")
+        if not self.use_eye_in_hand and eye_in_hand_image is not None:
+            raise ValueError("Single-camera policy does not accept eye_in_hand_image")
+
+        visual_feature, attention, coordinates = self._encode_view(
+            image, self.spatial_attention
+        )
+        if self.use_eye_in_hand:
+            eye_feature, eye_attention, eye_coordinates = self._encode_view(
+                eye_in_hand_image, self.eye_in_hand_spatial_attention
+            )
+        else:
+            eye_feature = eye_attention = eye_coordinates = None
+        temporal_feature = self.temporal_encoder(
+            proprio_history,
+            action_history,
+            proprio_history_mask,
+            action_history_mask,
+        )
+        features = [visual_feature]
+        if eye_feature is not None:
+            features.append(eye_feature)
+        features.append(temporal_feature)
+        if len({feature.shape[0] for feature in features}) != 1:
+            raise ValueError("Vision and temporal history batch sizes must match")
+        fusion_feature = self.fusion(torch.cat(features, dim=-1))
+        return {
+            "action": self.action_head(fusion_feature),
+            "visual_feature": visual_feature,
+            "temporal_feature": temporal_feature,
             "fusion_feature": fusion_feature,
             "spatial_attention_weights": attention,
             "spatial_attention_coordinates": coordinates,

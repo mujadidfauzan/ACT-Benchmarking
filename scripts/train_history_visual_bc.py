@@ -1,18 +1,17 @@
-"""Train fixed-target Visual-BC from RGB and proprioception."""
+"""Train fixed-target Visual-BC with proprioception and action history."""
 
 import argparse
-import random
 from pathlib import Path
 
-import numpy as np
 import torch
-from torch.nn import functional as F
 
 from data.manipulation_dataset import CAMERA_OBSERVATION_KEYS
 from data.normalization import PolicyNormalizer
-from models.visual_bc import VISUAL_BC_FUSION_MODES, VisualBCPolicy
+from models.visual_bc import (
+    VISUAL_BC_FUSION_MODES,
+    HistoryVisualBCPolicy,
+)
 from scripts.train_language_bc import (
-    LossMeter,
     build_loaders,
     format_metrics,
     json_value,
@@ -20,15 +19,17 @@ from scripts.train_language_bc import (
     save_checkpoint,
     save_json,
 )
+from scripts.train_visual_bc import run_epoch, set_seed, validate_args
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train fixed-target Visual-BC")
+    parser = argparse.ArgumentParser(description="Train fixed-target History-Visual-BC")
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--train-split", type=Path, required=True)
     parser.add_argument("--val-split", type=Path, required=True)
     parser.add_argument("--normalization", type=Path, required=True)
     parser.add_argument("--fixed-target-color", default="red")
+    parser.add_argument("--history-size", type=int, default=8)
     parser.add_argument(
         "--visual-fusion",
         choices=VISUAL_BC_FUSION_MODES,
@@ -41,7 +42,7 @@ def parse_args():
         default=["agentview"],
     )
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -67,161 +68,22 @@ def parse_args():
     return parser.parse_args()
 
 
-def validate_args(args):
-    for name in ("epochs", "batch_size", "image_size", "log_every"):
-        if getattr(args, name) <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.image_size < 32:
-        raise ValueError("--image-size must be at least 32")
-    if args.learning_rate <= 0 or args.weight_decay < 0 or args.gradient_clip < 0:
-        raise ValueError("Invalid optimizer configuration")
-    for name in (
-        "num_workers",
-        "cache_size",
-        "batches_per_phase",
-        "batches_per_task",
-        "max_train_batches",
-        "max_val_batches",
-    ):
-        value = getattr(args, name)
-        if value is not None and value < (1 if name.startswith("batches") or name.startswith("max") else 0):
-            raise ValueError(f"Invalid --{name.replace('_', '-')}")
-    if args.phase_balanced and args.batches_per_task is not None:
-        raise ValueError("--batches-per-task cannot be combined with --phase-balanced")
-    if args.camera_names[0] != "agentview":
-        raise ValueError("--camera-names must start with agentview")
-    if len(set(args.camera_names)) != len(args.camera_names):
-        raise ValueError("--camera-names cannot contain duplicates")
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def prepare_batch(batch, normalizer, device, image_size):
-    image = batch["image"].to(device, non_blocking=True)
-    if image.shape[-2:] != (image_size, image_size):
-        image = F.interpolate(
-            image,
-            size=(image_size, image_size),
-            mode="bilinear",
-            align_corners=False,
-            antialias=True,
-        )
-    inputs = {"image": image}
-    if "proprio_history" in batch:
-        proprio_mask = batch["proprio_history_mask"].to(
-            device, non_blocking=True
-        )
-        action_mask = batch["action_history_mask"].to(
-            device, non_blocking=True
-        )
-        proprio_history = normalizer.normalize_proprio(
-            batch["proprio_history"].to(device, non_blocking=True)
-        )
-        action_history = normalizer.normalize_action(
-            batch["action_history"].to(device, non_blocking=True)
-        )
-        inputs.update(
-            {
-                "proprio_history": proprio_history
-                * proprio_mask.unsqueeze(-1),
-                "action_history": action_history
-                * action_mask.unsqueeze(-1),
-                "proprio_history_mask": proprio_mask,
-                "action_history_mask": action_mask,
-            }
-        )
-    else:
-        inputs["proprio"] = normalizer.normalize_proprio(
-            batch["proprio"].to(device, non_blocking=True)
-        )
-    if "eye_in_hand_image" in batch:
-        eye = batch["eye_in_hand_image"].to(device, non_blocking=True)
-        if eye.shape[-2:] != (image_size, image_size):
-            eye = F.interpolate(
-                eye,
-                size=(image_size, image_size),
-                mode="bilinear",
-                align_corners=False,
-                antialias=True,
-            )
-        inputs["eye_in_hand_image"] = eye
-    target = normalizer.normalize_action(
-        batch["action"].to(device, non_blocking=True)
-    )
-    return inputs, target, list(batch["task"]), list(batch["phase"])
-
-
-def run_epoch(
-    model,
-    loader,
-    normalizer,
-    device,
-    image_size,
-    optimizer=None,
-    gradient_clip=0.0,
-    max_batches=None,
-    log_every=25,
-):
-    import time
-
-    training = optimizer is not None
-    model.train(training)
-    meter = LossMeter()
-    started = time.monotonic()
-    batches = 0
-    context = torch.enable_grad() if training else torch.inference_mode()
-    with context:
-        for batch_index, batch in enumerate(loader, start=1):
-            if max_batches is not None and batch_index > max_batches:
-                break
-            inputs, target, tasks, phases = prepare_batch(
-                batch, normalizer, device, image_size
-            )
-            if training:
-                optimizer.zero_grad(set_to_none=True)
-            prediction = model(**inputs)["action"]
-            loss = F.mse_loss(prediction, target)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite loss in batch {batch_index}")
-            if training:
-                loss.backward()
-                if gradient_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p.requires_grad],
-                        gradient_clip,
-                    )
-                optimizer.step()
-            meter.update(prediction, target, tasks, phases)
-            batches += 1
-            if training and batch_index % log_every == 0:
-                print(f"  batch {batch_index}: loss={float(loss.detach()):.6f}")
-    result = meter.result()
-    result["batches"] = batches
-    result["seconds"] = time.monotonic() - started
-    return result
-
-
 def checkpoint_payload(args, model, optimizer, epoch, global_step, best, history):
     return {
         "format_version": 1,
-        "policy_type": "visual_bc",
+        "policy_type": "history_visual_bc",
         "epoch": epoch,
         "global_step": global_step,
         "best_val_loss": best,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "model_config": {
-            "policy_type": "visual_bc",
+            "policy_type": "history_visual_bc",
             "visual_fusion": model.visual_fusion,
             "camera_names": list(model.camera_names),
-            "proprio_dim": model.proprio_encoder.input_dim,
+            "proprio_dim": model.temporal_encoder.proprio_dim,
             "action_dim": model.action_dim,
+            "history_size": model.history_size,
             "fixed_target_color": args.fixed_target_color,
             "pretrained_visual": args.pretrained_visual,
             "freeze_visual_backbone": True,
@@ -234,6 +96,8 @@ def checkpoint_payload(args, model, optimizer, epoch, global_step, best, history
 def main():
     args = parse_args()
     validate_args(args)
+    if args.history_size <= 1:
+        raise ValueError("--history-size must be greater than one")
     set_seed(args.seed)
     device = resolve_device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -247,12 +111,15 @@ def main():
     train_dataset, val_dataset, train_loader, val_loader = build_loaders(
         args, normalizer.proprio_keys
     )
+    if train_dataset.history_size != args.history_size:
+        raise ValueError("Dataset history size does not match command")
     if train_dataset.proprio_dim != normalizer.proprio_dim:
         raise ValueError("Dataset and normalizer proprio dimensions do not match")
     if train_dataset.action_dim != normalizer.action_dim:
         raise ValueError("Dataset and normalizer action dimensions do not match")
 
-    model = VisualBCPolicy(
+    model = HistoryVisualBCPolicy(
+        history_size=args.history_size,
         visual_fusion=args.visual_fusion,
         camera_names=args.camera_names,
         action_dim=normalizer.action_dim,
@@ -265,21 +132,28 @@ def main():
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+
     start_epoch = 1
     global_step = 0
     best_val_loss = float("inf")
     history = []
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        if checkpoint.get("policy_type") != "visual_bc":
-            raise ValueError("Resume checkpoint is not a Visual-BC checkpoint")
+        if checkpoint.get("policy_type") != "history_visual_bc":
+            raise ValueError("Resume checkpoint is not History-Visual-BC")
         config = checkpoint["model_config"]
         expected = (
             config.get("visual_fusion"),
             tuple(config.get("camera_names", [])),
             config.get("fixed_target_color"),
+            int(config.get("history_size", -1)),
         )
-        actual = (args.visual_fusion, tuple(args.camera_names), args.fixed_target_color)
+        actual = (
+            args.visual_fusion,
+            tuple(args.camera_names),
+            args.fixed_target_color,
+            args.history_size,
+        )
         if expected != actual:
             raise ValueError(f"Resume configuration mismatch: {expected} != {actual}")
         model.load_state_dict(checkpoint["model_state"])
@@ -290,7 +164,8 @@ def main():
         history = list(checkpoint.get("history", []))
 
     print(f"Device: {device}")
-    print("Policy: Visual-BC (no language)")
+    print("Policy: History-Visual-BC (no language)")
+    print(f"History size: {args.history_size}")
     print(f"Fixed target color: {args.fixed_target_color}")
     print(f"Visual fusion: {args.visual_fusion}")
     print(f"Cameras: {', '.join(args.camera_names)}")

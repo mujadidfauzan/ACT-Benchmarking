@@ -349,6 +349,7 @@ def build_loaders(args, proprio_keys):
         "camera_keys": tuple(
             CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
         ),
+        "history_size": getattr(args, "history_size", 1),
     }
     train_dataset = ManipulationDataset(
         split_manifest=args.train_split,
