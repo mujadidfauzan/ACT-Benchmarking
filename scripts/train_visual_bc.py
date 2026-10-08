@@ -54,9 +54,18 @@ def parse_args():
         "--phase-balanced",
         action=argparse.BooleanOptionalAction,
         default=False,
+        help="Balance training batches across expert phases",
     )
-    parser.add_argument("--batches-per-phase", type=int)
-    parser.add_argument("--batches-per-task", type=int)
+    parser.add_argument(
+        "--batches-per-phase",
+        type=int,
+        help="Batches sampled for each phase when --phase-balanced is active",
+    )
+    parser.add_argument(
+        "--batches-per-task",
+        type=int,
+        help="Batches sampled for each task when phase balancing is disabled",
+    )
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-val-batches", type=int)
     parser.add_argument("--log-every", type=int, default=25)
@@ -87,7 +96,17 @@ def validate_args(args):
         if value is not None and value < (1 if name.startswith("batches") or name.startswith("max") else 0):
             raise ValueError(f"Invalid --{name.replace('_', '-')}")
     if args.phase_balanced and args.batches_per_task is not None:
-        raise ValueError("--batches-per-task cannot be combined with --phase-balanced")
+        raise ValueError(
+            "--phase-balanced selects the phase sampler, so "
+            "--batches-per-task cannot be used with it. Remove "
+            "--batches-per-task and use --batches-per-phase to control "
+            "the epoch length."
+        )
+    if not args.phase_balanced and args.batches_per_phase is not None:
+        raise ValueError(
+            "--batches-per-phase requires --phase-balanced. Either add "
+            "--phase-balanced or remove --batches-per-phase."
+        )
     if args.camera_names[0] != "agentview":
         raise ValueError("--camera-names must start with agentview")
     if len(set(args.camera_names)) != len(args.camera_names):

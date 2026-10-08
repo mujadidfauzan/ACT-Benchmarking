@@ -217,6 +217,11 @@ This branch reuses the same demonstrations, split, and normalization. It adds
 the current and seven previous proprio states plus the seven previously
 executed actions. Current RGB remains the only visual history.
 
+History training uses the phase-balanced sampler. Pick has five recorded
+phases, so `--batches-per-phase 80` produces 400 optimizer batches per epoch.
+Do not combine `--phase-balanced` with `--batches-per-task`; those options
+select different samplers.
+
 Test history-window alignment:
 
 ```bat
@@ -260,14 +265,15 @@ python -m scripts.train_history_visual_bc ^
   --visual-fusion spatial_attention ^
   --camera-names agentview robot0_eye_in_hand ^
   --phase-balanced ^
+  --batches-per-phase 80 ^
   --output-dir results/history_visual_bc/pick_fixed_red_h8_seed42 ^
   --epochs 80 ^
-  --batch-size 64 ^
-  --image-size 224 ^
+  --batch-size 32 ^
+  --image-size 128 ^
   --learning-rate 1e-4 ^
   --weight-decay 1e-4 ^
   --gradient-clip 1.0 ^
-  --num-workers 4 ^
+  --num-workers 0 ^
   --cache-size 8 ^
   --seed 42 ^
   --pretrained-visual ^

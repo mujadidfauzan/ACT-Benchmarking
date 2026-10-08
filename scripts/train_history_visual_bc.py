@@ -55,9 +55,18 @@ def parse_args():
         "--phase-balanced",
         action=argparse.BooleanOptionalAction,
         default=False,
+        help="Balance training batches across expert phases",
     )
-    parser.add_argument("--batches-per-phase", type=int)
-    parser.add_argument("--batches-per-task", type=int)
+    parser.add_argument(
+        "--batches-per-phase",
+        type=int,
+        help="Batches sampled for each phase when --phase-balanced is active",
+    )
+    parser.add_argument(
+        "--batches-per-task",
+        type=int,
+        help="Batches sampled for each task when phase balancing is disabled",
+    )
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-val-batches", type=int)
     parser.add_argument("--log-every", type=int, default=25)
