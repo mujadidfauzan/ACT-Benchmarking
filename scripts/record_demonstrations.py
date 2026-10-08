@@ -26,6 +26,11 @@ def parse_args():
     parser.add_argument("--output", type=Path, default=Path("data/demos"))
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--num-cubes", type=int, choices=(3, 4), default=3)
+    parser.add_argument(
+        "--fixed-target-color",
+        choices=tuple(PickEnv.COLOR_PALETTE),
+        help="Always use this target color for Pick; object ID stays random",
+    )
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--camera-obs", action="store_true")
     parser.add_argument(
@@ -67,7 +72,12 @@ def build_task(args):
     }
 
     if args.task == "pick":
-        env = PickEnv(num_objects=args.num_cubes, horizon=1500, **common)
+        env = PickEnv(
+            num_objects=args.num_cubes,
+            fixed_target_color=args.fixed_target_color,
+            horizon=1500,
+            **common,
+        )
     elif args.task == "place":
         env = PlaceEnv(horizon=3000, **common)
     else:
@@ -150,6 +160,8 @@ def main():
         raise ValueError("episodes must be positive")
     if not args.camera_obs and args.camera_names != ["agentview"]:
         raise ValueError("--camera-names requires --camera-obs")
+    if args.fixed_target_color is not None and args.task != "pick":
+        raise ValueError("--fixed-target-color is only valid for --task pick")
     max_attempts = args.max_attempts or args.episodes * 3
     task_dir = args.output / args.task
     task_dir.mkdir(parents=True, exist_ok=True)

@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from language.instruction_generator import TEMPLATES
+from environments.entity_utils import COLOR_PALETTE
 
 
 TASKS = ("pick", "place", "stack")
@@ -68,6 +69,11 @@ def parse_args():
         "--check-duplicates",
         action="store_true",
         help="Hash complete NPZ files to detect byte-identical episodes",
+    )
+    parser.add_argument(
+        "--expected-pick-target-color",
+        choices=tuple(COLOR_PALETTE),
+        help="Require every audited Pick episode to target this color",
     )
     parser.add_argument(
         "--output",
@@ -464,6 +470,35 @@ def audit_task(dataset_root, task, args, digest_paths):
                         }
                     )
         if metadata is not None:
+            if task == "pick" and args.expected_pick_target_color is not None:
+                try:
+                    target = entity_by_id(
+                        metadata["objects"], metadata["target_object"]
+                    )
+                    if target["color"] != args.expected_pick_target_color:
+                        errors.append(
+                            {
+                                "path": relative_path,
+                                "error": (
+                                    f"target color is {target['color']!r}, expected "
+                                    f"{args.expected_pick_target_color!r}"
+                                ),
+                            }
+                        )
+                    if metadata.get("policy_conditioning") != "vision_only":
+                        errors.append(
+                            {
+                                "path": relative_path,
+                                "error": "fixed-color Pick metadata is not vision_only",
+                            }
+                        )
+                except (KeyError, TypeError, ValueError) as error:
+                    errors.append(
+                        {
+                            "path": relative_path,
+                            "error": f"fixed target metadata: {error}",
+                        }
+                    )
             try:
                 add_semantics(semantics, task, metadata)
             except (KeyError, TypeError, ValueError) as error:

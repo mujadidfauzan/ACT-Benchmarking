@@ -1,0 +1,54 @@
+{
+  "dataset_root": "E:\\Fauzan\\ACT-Benchmarking\\data\\demos\\pilot_v03",
+  "fallback_iid_tasks": [],
+  "protocol": "iid",
+  "ratios": {
+    "test": 0.1,
+    "train": 0.8,
+    "val": 0.1
+  },
+  "seed": 42,
+  "splits": {
+    "test": {
+      "episodes": 10,
+      "instruction_splits": {
+        "train": 10
+      },
+      "semantic_splits": {
+        "train": 10
+      },
+      "steps": 1096,
+      "tasks": {
+        "pick": 10
+      }
+    },
+    "train": {
+      "episodes": 80,
+      "instruction_splits": {
+        "train": 80
+      },
+      "semantic_splits": {
+        "train": 80
+      },
+      "steps": 8605,
+      "tasks": {
+        "pick": 80
+      }
+    },
+    "val": {
+      "episodes": 10,
+      "instruction_splits": {
+        "train": 10
+      },
+      "semantic_splits": {
+        "train": 10
+      },
+      "steps": 1063,
+      "tasks": {
+        "pick": 10
+      }
+    }
+  },
+  "total_episodes": 100,
+  "version": "1.0"
+}
