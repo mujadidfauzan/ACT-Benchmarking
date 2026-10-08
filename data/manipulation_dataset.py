@@ -24,6 +24,11 @@ DEFAULT_POLICY_PROPRIO_KEYS = (
     "obs__robot0_eef_pos",
     "obs__robot0_eef_quat",
 )
+EEF_GRIPPER_PROPRIO_KEYS = (
+    "obs__robot0_eef_pos",
+    "obs__robot0_eef_quat",
+    "obs__robot0_gripper_qpos",
+)
 CAMERA_OBSERVATION_KEYS = {
     "agentview": "obs__agentview_image",
     "robot0_eye_in_hand": "obs__robot0_eye_in_hand_image",

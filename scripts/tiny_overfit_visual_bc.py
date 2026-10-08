@@ -18,6 +18,7 @@ from models.visual_bc import (
     HistoryVisualBCPolicy,
     VisualBCPolicy,
 )
+from models.spatial_softmax_visual_bc import SpatialSoftmaxVisualBCPolicy
 
 
 def parse_args():
@@ -29,6 +30,14 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--image-size", type=int, default=128)
+    parser.add_argument(
+        "--architecture",
+        choices=("standard", "spatial_softmax"),
+        default="standard",
+        help="standard keeps the existing Visual-BC model",
+    )
+    parser.add_argument("--spatial-channels", type=int, default=64)
+    parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument(
         "--history-size",
         type=int,
@@ -90,6 +99,10 @@ def main():
         raise ValueError("Invalid learning rate or image size")
     if args.history_size <= 0:
         raise ValueError("--history-size must be positive")
+    if args.architecture == "spatial_softmax" and args.history_size != 1:
+        raise ValueError("spatial_softmax supports no temporal history")
+    if args.spatial_channels <= 0 or args.spatial_channels % 8:
+        raise ValueError("--spatial-channels must be a positive multiple of 8")
     if args.camera_names[0] != "agentview":
         raise ValueError("--camera-names must start with agentview")
     set_seed(args.seed)
@@ -142,18 +155,31 @@ def main():
         )
     target = normalizer.normalize_action(batch["action"])
 
-    model_class = HistoryVisualBCPolicy if args.history_size > 1 else VisualBCPolicy
-    model_kwargs = {
-        "visual_fusion": args.visual_fusion,
-        "camera_names": args.camera_names,
-        "action_dim": normalizer.action_dim,
-        "proprio_dim": normalizer.proprio_dim,
-        "pretrained_visual": args.pretrained_visual,
-        "freeze_visual_backbone": True,
-        "dropout": 0.0,
-    }
-    if args.history_size > 1:
-        model_kwargs["history_size"] = args.history_size
+    if args.architecture == "spatial_softmax":
+        model_class = SpatialSoftmaxVisualBCPolicy
+        model_kwargs = {
+            "camera_names": args.camera_names,
+            "action_dim": normalizer.action_dim,
+            "proprio_dim": normalizer.proprio_dim,
+            "spatial_channels": args.spatial_channels,
+            "hidden_dim": args.hidden_dim,
+            "pretrained_visual": args.pretrained_visual,
+            "freeze_visual_backbone": True,
+            "dropout": 0.0,
+        }
+    else:
+        model_class = HistoryVisualBCPolicy if args.history_size > 1 else VisualBCPolicy
+        model_kwargs = {
+            "visual_fusion": args.visual_fusion,
+            "camera_names": args.camera_names,
+            "action_dim": normalizer.action_dim,
+            "proprio_dim": normalizer.proprio_dim,
+            "pretrained_visual": args.pretrained_visual,
+            "freeze_visual_backbone": True,
+            "dropout": 0.0,
+        }
+        if args.history_size > 1:
+            model_kwargs["history_size"] = args.history_size
     model = model_class(**model_kwargs)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, weight_decay=0.0)
@@ -199,7 +225,10 @@ def main():
         "dataset": str(args.dataset),
         "split": str(args.split),
         "camera_names": list(args.camera_names),
+        "architecture": args.architecture,
         "visual_fusion": args.visual_fusion,
+        "spatial_channels": args.spatial_channels,
+        "hidden_dim": args.hidden_dim,
         "history_size": args.history_size,
         "batch_size": args.batch_size,
         "timesteps": batch["timestep"].tolist(),

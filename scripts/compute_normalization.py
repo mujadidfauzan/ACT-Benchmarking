@@ -7,9 +7,15 @@ from pathlib import Path
 
 import numpy as np
 
-from data.manipulation_dataset import DEFAULT_POLICY_PROPRIO_KEYS
+from data.manipulation_dataset import (
+    DEFAULT_POLICY_PROPRIO_KEYS,
+    EEF_GRIPPER_PROPRIO_KEYS,
+)
 
-PROPRIO_KEYS = DEFAULT_POLICY_PROPRIO_KEYS
+PROPRIO_PRESETS = {
+    "full": DEFAULT_POLICY_PROPRIO_KEYS,
+    "eef_gripper": EEF_GRIPPER_PROPRIO_KEYS,
+}
 
 
 def parse_args():
@@ -34,6 +40,12 @@ def parse_args():
         choices=("opengl", "opencv"),
         default="opengl",
         help="Convention of stored RGB observations; pilot_v01 uses opengl",
+    )
+    parser.add_argument(
+        "--proprio-preset",
+        choices=tuple(PROPRIO_PRESETS),
+        default="full",
+        help="Robot state included in normalization and policy inputs",
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -144,6 +156,7 @@ def main():
         raise FileExistsError(f"Output exists: {args.output}; use --overwrite")
 
     entries = read_entries(args.split)
+    proprio_keys = PROPRIO_PRESETS[args.proprio_preset]
     proprio_stats = RunningStats()
     action_stats = RunningStats()
     task_proprio_stats = {}
@@ -156,7 +169,7 @@ def main():
         if not path.is_file():
             raise FileNotFoundError(f"Episode does not exist: {path}")
         with np.load(path, allow_pickle=False) as archive:
-            required = ("actions", *PROPRIO_KEYS)
+            required = ("actions", *proprio_keys)
             missing = [key for key in required if key not in archive]
             if missing:
                 raise KeyError(f"{path} is missing keys: {missing}")
@@ -165,7 +178,7 @@ def main():
             if steps != int(entry["steps"]):
                 raise ValueError(f"Step count mismatch: {path}")
             proprio_parts = []
-            for key in PROPRIO_KEYS:
+            for key in proprio_keys:
                 values = np.asarray(archive[key], dtype=np.float64)
                 if len(values) != steps + 1:
                     raise ValueError(f"Observation alignment mismatch: {path}, {key}")
@@ -198,12 +211,12 @@ def main():
             "output_range": [0.0, 1.0],
         },
         "proprio": {
-            "keys": list(PROPRIO_KEYS),
+            "keys": list(proprio_keys),
             **proprio_stats.result(),
         },
         "action": action_stats.result(),
         "task_balanced_proprio": {
-            "keys": list(PROPRIO_KEYS),
+            "keys": list(proprio_keys),
             **equal_task_result(task_proprio_stats),
         },
         "task_balanced_action": equal_task_result(task_action_stats),

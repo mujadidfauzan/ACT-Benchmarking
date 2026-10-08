@@ -15,6 +15,7 @@ from robosuite.utils import RandomizationError
 
 from data.normalization import PolicyNormalizer
 from environments.pick_env import PickEnv
+from models.spatial_softmax_visual_bc import SpatialSoftmaxVisualBCPolicy
 from models.visual_bc import HistoryVisualBCPolicy, VisualBCPolicy
 from scripts.evaluate_language_bc import (
     EvaluationVideoRecorder,
@@ -81,24 +82,41 @@ def load_policy(args, device):
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = checkpoint.get("model_config", {})
     policy_type = checkpoint.get("policy_type", config.get("policy_type"))
-    if policy_type not in {"visual_bc", "history_visual_bc"}:
+    if policy_type not in {
+        "visual_bc",
+        "history_visual_bc",
+        "spatial_softmax_visual_bc",
+    }:
         raise ValueError("Checkpoint is not a supported Visual-BC checkpoint")
     normalizer = PolicyNormalizer.from_json(args.normalization).to(device)
     if int(config.get("proprio_dim", -1)) != normalizer.proprio_dim:
         raise ValueError("Checkpoint and normalizer proprio dimensions do not match")
-    model_class = (
-        HistoryVisualBCPolicy
-        if policy_type == "history_visual_bc"
-        else VisualBCPolicy
-    )
-    model_kwargs = {
-        "visual_fusion": config["visual_fusion"],
-        "camera_names": tuple(config["camera_names"]),
-        "action_dim": normalizer.action_dim,
-        "proprio_dim": normalizer.proprio_dim,
-        "pretrained_visual": False,
-        "freeze_visual_backbone": True,
-    }
+    if policy_type == "spatial_softmax_visual_bc":
+        model_class = SpatialSoftmaxVisualBCPolicy
+        model_kwargs = {
+            "camera_names": tuple(config["camera_names"]),
+            "action_dim": normalizer.action_dim,
+            "proprio_dim": normalizer.proprio_dim,
+            "spatial_channels": int(config["spatial_channels"]),
+            "hidden_dim": int(config["hidden_dim"]),
+            "dropout": float(config.get("dropout", 0.1)),
+            "pretrained_visual": False,
+            "freeze_visual_backbone": True,
+        }
+    else:
+        model_class = (
+            HistoryVisualBCPolicy
+            if policy_type == "history_visual_bc"
+            else VisualBCPolicy
+        )
+        model_kwargs = {
+            "visual_fusion": config["visual_fusion"],
+            "camera_names": tuple(config["camera_names"]),
+            "action_dim": normalizer.action_dim,
+            "proprio_dim": normalizer.proprio_dim,
+            "pretrained_visual": False,
+            "freeze_visual_backbone": True,
+        }
     if policy_type == "history_visual_bc":
         model_kwargs["history_size"] = int(config["history_size"])
     model = model_class(
@@ -388,6 +406,84 @@ def evaluate_episode(
     }
 
 
+def run_rollout_evaluation(
+    model,
+    normalizer,
+    *,
+    image_size,
+    device,
+    target_color,
+    episodes=20,
+    seed_offset=0,
+    num_cubes=3,
+    max_steps=DEFAULT_MAX_STEPS,
+    success_hold_steps=5,
+):
+    """Run deterministic development rollouts without creating artifacts."""
+
+    if min(episodes, max_steps, success_hold_steps) <= 0:
+        raise ValueError("Episode and step counts must be positive")
+    seed_start = 11000 + int(seed_offset)
+    was_training = model.training
+    model.eval()
+    env = build_environment(
+        seed_start,
+        num_cubes,
+        False,
+        model.camera_names,
+        target_color,
+        max_steps,
+    )
+    successes = 0
+    failures = Counter()
+    clip_fractions = []
+    total_steps = 0
+    try:
+        for episode in range(episodes):
+            try:
+                result = evaluate_episode(
+                    env,
+                    model,
+                    normalizer,
+                    image_size,
+                    device,
+                    max_steps,
+                    success_hold_steps,
+                    False,
+                    episode,
+                    None,
+                    20.0,
+                    target_color,
+                )
+            except RandomizationError as error:
+                result = {
+                    "success": False,
+                    "failure_reason": "scene_sampling_failure",
+                    "steps": 0,
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                }
+            successes += int(result["success"])
+            total_steps += int(result["steps"])
+            if result["failure_reason"]:
+                failures[result["failure_reason"]] += 1
+            if "action_clip_fraction" in result:
+                clip_fractions.append(result["action_clip_fraction"])
+    finally:
+        env.close()
+        model.train(was_training)
+    return {
+        "seed_start": seed_start,
+        "attempted": episodes,
+        "successful": successes,
+        "failed": episodes - successes,
+        "success_rate": successes / episodes,
+        "failure_counts": dict(sorted(failures.items())),
+        "mean_steps": total_steps / episodes,
+        "mean_action_clip_fraction": float(np.mean(clip_fractions)),
+    }
+
+
 def main():
     args = parse_args()
     if min(args.episodes, args.max_steps, args.success_hold_steps) <= 0:
@@ -491,6 +587,7 @@ def main():
         "history_size": getattr(model, "history_size", 1),
         "image_size": image_size,
         "device": str(device),
+        "seed_start": 11000 + args.seed_offset,
         "record_video": args.record_video,
         "log_rollout": args.log_rollout,
         "rollout_dir": (

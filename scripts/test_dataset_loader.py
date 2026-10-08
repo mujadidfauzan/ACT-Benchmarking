@@ -9,9 +9,17 @@ import torch
 
 from data.manipulation_dataset import (
     CAMERA_OBSERVATION_KEYS,
+    DEFAULT_POLICY_PROPRIO_KEYS,
+    EEF_GRIPPER_PROPRIO_KEYS,
     ManipulationDataset,
     create_dataloader,
 )
+
+
+PROPRIO_PRESETS = {
+    "full": DEFAULT_POLICY_PROPRIO_KEYS,
+    "eef_gripper": EEF_GRIPPER_PROPRIO_KEYS,
+}
 
 
 def parse_args():
@@ -35,6 +43,11 @@ def parse_args():
         help="Emit BC proprio/action history when greater than one",
     )
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--proprio-preset",
+        choices=tuple(PROPRIO_PRESETS),
+        default="full",
+    )
     parser.add_argument(
         "--camera-names",
         nargs="+",
@@ -107,6 +120,7 @@ def verify_bc(args):
         camera_keys=tuple(
             CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
         ),
+        proprio_keys=PROPRIO_PRESETS[args.proprio_preset],
         history_size=args.history_size,
     )
     sample = dataset[0]
@@ -173,6 +187,7 @@ def verify_act(args):
         camera_keys=tuple(
             CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
         ),
+        proprio_keys=PROPRIO_PRESETS[args.proprio_preset],
     )
     sample = dataset[0]
     verify_common_sample(sample, dataset.proprio_dim)
@@ -303,6 +318,7 @@ def main():
     print("Split:", args.split)
     print("Vertical flip:", args.vertical_flip)
     print("Cameras:", args.camera_names)
+    print("Proprio preset:", args.proprio_preset)
     bc_dataset, bc_batch = verify_bc(args)
     print_batch("BC LOADER", bc_dataset, bc_batch)
     act_dataset, act_batch = verify_act(args)

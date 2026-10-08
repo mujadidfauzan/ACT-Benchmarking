@@ -98,6 +98,11 @@ class ResNet18VisualEncoder(nn.Module):
     def forward_spatial(self, image):
         """Return the final ResNet feature map before global pooling."""
 
+        return self.backbone.layer4(self.forward_layer3(image))
+
+    def forward_layer3(self, image):
+        """Return the stride-16 ResNet feature map for spatial policies."""
+
         if image.ndim != 4 or image.shape[1] != 3:
             raise ValueError("image must have shape [B, 3, H, W]")
         if not image.is_floating_point():
@@ -109,5 +114,4 @@ class ResNet18VisualEncoder(nn.Module):
         feature = self.backbone.maxpool(feature)
         feature = self.backbone.layer1(feature)
         feature = self.backbone.layer2(feature)
-        feature = self.backbone.layer3(feature)
-        return self.backbone.layer4(feature)
+        return self.backbone.layer3(feature)
