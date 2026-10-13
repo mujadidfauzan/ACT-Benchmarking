@@ -4,7 +4,7 @@ import argparse
 import json
 import random
 import time
-from collections import Counter, deque
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -14,8 +14,10 @@ from robosuite import load_composite_controller_config
 from robosuite.utils import RandomizationError
 
 from data.normalization import PolicyNormalizer
+from data.policy_history import PolicyHistory
 from environments.pick_env import PickEnv
 from models.spatial_softmax_visual_bc import SpatialSoftmaxVisualBCPolicy
+from models.history_spatial_softmax_visual_bc import HistorySpatialSoftmaxVisualBCPolicy
 from models.visual_bc import HistoryVisualBCPolicy, VisualBCPolicy
 from scripts.evaluate_language_bc import (
     EvaluationVideoRecorder,
@@ -36,7 +38,8 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seed-offset", type=int, default=0)
-    parser.add_argument("--num-cubes", type=int, choices=(3, 4), default=3)
+    parser.add_argument("--num-cubes", "--num-objects", dest="num_cubes",
+                        type=int, choices=(1, 2, 3, 4), default=3)
     parser.add_argument("--image-size", type=int)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--success-hold-steps", type=int, default=5)
@@ -86,13 +89,18 @@ def load_policy(args, device):
         "visual_bc",
         "history_visual_bc",
         "spatial_softmax_visual_bc",
+        "history_spatial_softmax_visual_bc",
     }:
         raise ValueError("Checkpoint is not a supported Visual-BC checkpoint")
     normalizer = PolicyNormalizer.from_json(args.normalization).to(device)
     if int(config.get("proprio_dim", -1)) != normalizer.proprio_dim:
         raise ValueError("Checkpoint and normalizer proprio dimensions do not match")
-    if policy_type == "spatial_softmax_visual_bc":
-        model_class = SpatialSoftmaxVisualBCPolicy
+    if policy_type in {"spatial_softmax_visual_bc", "history_spatial_softmax_visual_bc"}:
+        model_class = (
+            HistorySpatialSoftmaxVisualBCPolicy
+            if policy_type == "history_spatial_softmax_visual_bc"
+            else SpatialSoftmaxVisualBCPolicy
+        )
         model_kwargs = {
             "camera_names": tuple(config["camera_names"]),
             "action_dim": normalizer.action_dim,
@@ -103,6 +111,9 @@ def load_policy(args, device):
             "pretrained_visual": False,
             "freeze_visual_backbone": True,
         }
+        if policy_type == "history_spatial_softmax_visual_bc":
+            model_kwargs.update(history_size=int(config["history_size"]),
+                                rgb_history=bool(config["rgb_history"]))
     else:
         model_class = (
             HistoryVisualBCPolicy
@@ -209,9 +220,11 @@ def evaluate_episode(
         np.asarray(value, dtype=np.float32) for value in env.action_spec
     )
     started = time.monotonic()
-    uses_history = isinstance(model, HistoryVisualBCPolicy)
-    proprio_queue = deque(maxlen=model.history_size if uses_history else 1)
-    action_queue = deque(maxlen=model.history_size - 1 if uses_history else 1)
+    uses_history = isinstance(model, (HistoryVisualBCPolicy, HistorySpatialSoftmaxVisualBCPolicy))
+    history = (
+        PolicyHistory(model.history_size, getattr(model, "rgb_history", False))
+        if uses_history else None
+    )
     try:
         for step in range(1, max_steps + 1):
             eef_before = np.asarray(
@@ -230,48 +243,10 @@ def evaluate_episode(
                 model.camera_names,
             )
             if uses_history:
-                proprio_queue.append(proprio[0].detach().clone())
-                proprio_history = torch.zeros(
-                    (1, model.history_size, normalizer.proprio_dim),
-                    dtype=proprio.dtype,
-                    device=device,
-                )
-                proprio_mask = torch.zeros(
-                    (1, model.history_size), dtype=torch.bool, device=device
-                )
-                proprio_count = len(proprio_queue)
-                proprio_history[0, -proprio_count:] = torch.stack(
-                    tuple(proprio_queue)
-                )
-                proprio_mask[0, -proprio_count:] = True
-                action_history = torch.zeros(
-                    (1, model.history_size - 1, normalizer.action_dim),
-                    dtype=proprio.dtype,
-                    device=device,
-                )
-                action_mask = torch.zeros(
-                    (1, model.history_size - 1),
-                    dtype=torch.bool,
-                    device=device,
-                )
-                action_count = len(action_queue)
-                if action_count:
-                    action_history[0, -action_count:] = torch.stack(
-                        tuple(action_queue)
-                    )
-                    action_mask[0, -action_count:] = True
-                policy_inputs = {
-                    "proprio_history": normalizer.normalize_proprio(
-                        proprio_history
-                    )
-                    * proprio_mask.unsqueeze(-1),
-                    "action_history": normalizer.normalize_action(
-                        action_history
-                    )
-                    * action_mask.unsqueeze(-1),
-                    "proprio_history_mask": proprio_mask,
-                    "action_history_mask": action_mask,
-                }
+                policy_inputs = history.observe(camera_inputs, proprio, normalizer)
+                camera_inputs = {}
+                proprio_count = len(history.proprio)
+                action_count = len(history.actions)
             else:
                 proprio_count = 1
                 action_count = 0
@@ -287,7 +262,7 @@ def evaluate_episode(
             raw_action = raw_action.cpu().numpy().astype(np.float32)
             action = np.clip(raw_action, action_low, action_high)
             if uses_history:
-                action_queue.append(
+                history.record_action(
                     torch.from_numpy(action.copy()).to(device=device)
                 )
             clipped_mask = action != raw_action
@@ -336,6 +311,9 @@ def evaluate_episode(
                         "gripper_action": float(action[6]),
                         "proprio_history_valid": proprio_count,
                         "action_history_valid": action_count,
+                        "image_history_valid": (
+                            proprio_count if getattr(model, "rgb_history", False) else 1
+                        ),
                         "eef_position_after": eef_after,
                         "target_position_after": target_after,
                         "eef_target_xy_distance_after": float(
@@ -546,7 +524,7 @@ def main():
                     "error_type": type(error).__name__,
                     "error_message": str(error),
                 }
-            result.update({"episode": episode, "task": "pick"})
+            result.update({"episode": episode, "task": "pick", "num_objects": args.num_cubes})
             append_jsonl(attempts_path, result)
             successes += int(result["success"])
             total_steps += int(result["steps"])
@@ -564,6 +542,7 @@ def main():
 
     task_summary = {
         "task": "pick",
+        "num_objects": args.num_cubes,
         "attempted": args.episodes,
         "successful": successes,
         "failed": args.episodes - successes,
@@ -581,10 +560,12 @@ def main():
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "checkpoint_best_val_loss": float(checkpoint["best_val_loss"]),
         "fixed_target_color": target_color,
+        "num_objects": args.num_cubes,
         "camera_names": list(model.camera_names),
         "visual_fusion": model.visual_fusion,
         "proprio_dim": normalizer.proprio_dim,
         "history_size": getattr(model, "history_size", 1),
+        "rgb_history": getattr(model, "rgb_history", False),
         "image_size": image_size,
         "device": str(device),
         "seed_start": 11000 + args.seed_offset,

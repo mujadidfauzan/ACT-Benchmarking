@@ -90,7 +90,7 @@ python -m scripts.train_spatial_softmax_visual_bc ^
   --dropout 0.1 ^
   --phase-balanced ^
   --batches-per-phase 80 ^
-  --epochs 80 ^
+  --epochs 200 ^
   --batch-size 32 ^
   --image-size 128 ^
   --learning-rate 0.0001 ^

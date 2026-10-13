@@ -12,10 +12,14 @@ def main():
     parser.add_argument("--resets", type=int, default=10)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--num-objects", type=int, choices=(1, 2, 3, 4), default=3)
+    parser.add_argument("--fixed-target-color", choices=tuple(PickEnv.COLOR_PALETTE))
     args = parser.parse_args()
 
     config = load_composite_controller_config(controller="BASIC")
     env = PickEnv(
+        num_objects=args.num_objects,
+        fixed_target_color=args.fixed_target_color,
         robots="Panda",
         controller_configs=config,
         has_renderer=args.render,
@@ -42,11 +46,12 @@ def main():
                 np.linalg.norm(positions[a][:2] - positions[b][:2])
                 for a, b in combinations(env.object_ids, 2)
             ]
-            assert min(distances) >= env.minimum_object_distance - 1e-3
+            assert all(distance >= env.minimum_object_distance - 1e-3 for distance in distances)
             print(index + 1, metadata["instruction"], metadata["target_object"])
             if args.render:
                 env.render()
-        assert len(targets) > 1
+        if args.resets > 1 and args.num_objects > 1:
+            assert len(targets) > 1
     finally:
         env.close()
     print(f"{args.resets} PICK RESETS PASSED")

@@ -11,6 +11,9 @@ from controllers.panda_controller import PandaController
 from environments.pick_env import PickEnv
 from environments.place_env import PlaceEnv
 from environments.stack_env import StackEnv
+from environments.scene_counts import (
+    add_count_arguments, balanced_count_plan, count_label, count_options,
+)
 from experts.pick_expert import PickExpert
 from experts.place_expert import PlaceExpert
 from experts.stack_expert import StackExpert
@@ -48,10 +51,13 @@ def parse_args():
     parser.add_argument("--instruction-split", choices=("train", "held_out"), default="train")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--enforce-gates", action="store_true")
+    add_count_arguments(parser)
+    parser.add_argument("--fixed-target-color", choices=tuple(PickEnv.COLOR_PALETTE))
     return parser.parse_args()
 
 
-def build_task(task, seed, instruction_split, render):
+def build_task(task, seed, instruction_split, render, num_objects=3,
+               num_receptacles=3, fixed_target_color=None):
     config = load_composite_controller_config(controller="BASIC")
     common = {
         "robots": "Panda",
@@ -66,11 +72,13 @@ def build_task(task, seed, instruction_split, render):
         "seed": seed,
     }
     if task == "pick":
-        env = PickEnv(num_objects=3, horizon=1500, **common)
+        env = PickEnv(num_objects=num_objects, fixed_target_color=fixed_target_color,
+                      horizon=1500, **common)
     elif task == "place":
-        env = PlaceEnv(horizon=3000, **common)
+        env = PlaceEnv(num_objects=num_objects, num_receptacles=num_receptacles,
+                       horizon=3000, **common)
     else:
-        env = StackEnv(num_cubes=3, horizon=6000, **common)
+        env = StackEnv(num_cubes=num_objects, horizon=6000, **common)
 
     controller = PandaController(env)
     pick_expert = PickExpert(controller)
@@ -164,13 +172,22 @@ def benchmark_task(
     instruction_split,
     render,
     seed_offset=0,
+    object_counts=(3,),
+    receptacle_counts=(None,),
+    fixed_target_color=None,
 ):
     attempts_path = run_dir / f"{task}_attempts.jsonl"
     successes = 0
     failure_counts = Counter()
+    if task == "place" and receptacle_counts == (None,):
+        receptacle_counts = (3,)
+    plan = balanced_count_plan(episodes, object_counts, receptacle_counts,
+                               TASK_DEFAULTS[task]["seed_start"] + seed_offset)
+    groups = {}
 
     with attempts_path.open("w", encoding="utf-8") as attempts_file:
         for episode_index in range(episodes):
+            num_objects, num_receptacles = configuration = plan[episode_index]
             seed = (
                 TASK_DEFAULTS[task]["seed_start"]
                 + seed_offset
@@ -183,7 +200,8 @@ def benchmark_task(
             info = {"success": False, "stage": "exception"}
             steps = 0
             try:
-                env, expert = build_task(task, seed, instruction_split, render)
+                env, expert = build_task(task, seed, instruction_split, render,
+                                         num_objects, num_receptacles, fixed_target_color)
                 observation = env.reset()
                 metadata = env.get_task_metadata()
                 initial_scene = snapshot_scene(observation)
@@ -210,11 +228,21 @@ def benchmark_task(
             successes += int(success)
             if failure_reason is not None:
                 failure_counts[failure_reason] += 1
+            group = groups.setdefault(count_label(configuration), {
+                "num_objects": num_objects, "num_receptacles": num_receptacles,
+                "attempted": 0, "successful": 0, "failure_counts": Counter(),
+            })
+            group["attempted"] += 1
+            group["successful"] += int(success)
+            if failure_reason is not None:
+                group["failure_counts"][failure_reason] += 1
 
             entry = {
                 "attempt": episode_index,
                 "seed": seed,
                 "task": task,
+                "num_objects": num_objects,
+                "num_receptacles": num_receptacles,
                 "success": success,
                 "failure_reason": failure_reason,
                 "steps": steps,
@@ -233,6 +261,13 @@ def benchmark_task(
 
     success_rate = successes / episodes
     gate = TASK_DEFAULTS[task]["gate"]
+    by_scene_counts = {
+        label: {**values, "success_rate": values["successful"] / values["attempted"],
+                "required_success_rate": gate,
+                "gate_passed": values["successful"] / values["attempted"] >= gate,
+                "failure_counts": dict(sorted(values["failure_counts"].items()))}
+        for label, values in sorted(groups.items())
+    }
     return {
         "task": task,
         "attempted": episodes,
@@ -240,13 +275,16 @@ def benchmark_task(
         "failed": episodes - successes,
         "success_rate": success_rate,
         "required_success_rate": gate,
-        "gate_passed": success_rate >= gate,
+        "gate_passed": success_rate >= gate and all(
+            group["gate_passed"] for group in by_scene_counts.values()
+        ),
         "failure_counts": dict(sorted(failure_counts.items())),
         "seed_start": TASK_DEFAULTS[task]["seed_start"] + seed_offset,
         "seed_end": (
             TASK_DEFAULTS[task]["seed_start"] + seed_offset + episodes - 1
         ),
         "attempts_log": attempts_path.name,
+        "by_scene_counts": by_scene_counts,
     }
 
 
@@ -254,10 +292,15 @@ def main():
     args = parse_args()
     if args.episodes <= 0:
         raise ValueError("episodes must be positive")
+    if args.fixed_target_color is not None and args.task != "pick":
+        raise ValueError("--fixed-target-color requires --task pick")
+    tasks = ("pick", "place", "stack") if args.task == "all" else (args.task,)
+    configurations = {task: count_options(task, args) for task in tasks}
+    for task, (objects, receptacles) in configurations.items():
+        balanced_count_plan(args.episodes, objects, receptacles)
     run_name = args.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
     run_dir = args.output / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
-    tasks = ("pick", "place", "stack") if args.task == "all" else (args.task,)
 
     summaries = [
         benchmark_task(
@@ -267,6 +310,8 @@ def main():
             args.instruction_split,
             args.render,
             args.seed_offset,
+            *configurations[task],
+            args.fixed_target_color,
         )
         for task in tasks
     ]

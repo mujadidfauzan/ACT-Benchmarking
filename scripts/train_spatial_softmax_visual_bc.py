@@ -19,6 +19,7 @@ from data.manipulation_dataset import (
 )
 from data.normalization import PolicyNormalizer
 from models.spatial_softmax_visual_bc import SpatialSoftmaxVisualBCPolicy
+from models.history_spatial_softmax_visual_bc import HistorySpatialSoftmaxVisualBCPolicy
 
 
 def set_seed(seed):
@@ -102,18 +103,34 @@ def prepare_batch(batch, normalizer, device, image_size):
     def resize(image):
         if image.shape[-2:] == (image_size, image_size):
             return image
-        return F.interpolate(
-            image, size=(image_size, image_size), mode="bilinear",
+        leading = image.shape[:-3]
+        resized = F.interpolate(
+            image.reshape(-1, *image.shape[-3:]), size=(image_size, image_size), mode="bilinear",
             align_corners=False, antialias=True,
         )
+        return resized.reshape(*leading, 3, image_size, image_size)
 
-    inputs = {"image": resize(batch["image"].to(device, non_blocking=True))}
-    inputs["proprio"] = normalizer.normalize_proprio(
-        batch["proprio"].to(device, non_blocking=True)
+    inputs = {}
+    camera_keys = (
+        ("image_history", "eye_in_hand_image_history") if "image_history" in batch
+        else ("image", "eye_in_hand_image")
     )
-    if "eye_in_hand_image" in batch:
-        inputs["eye_in_hand_image"] = resize(
-            batch["eye_in_hand_image"].to(device, non_blocking=True)
+    for key in camera_keys:
+        if key in batch:
+            inputs[key] = resize(batch[key].to(device, non_blocking=True))
+    if "proprio_history" in batch:
+        for kind, normalize in (
+            ("proprio", normalizer.normalize_proprio),
+            ("action", normalizer.normalize_action),
+        ):
+            mask = batch[f"{kind}_history_mask"].to(device, non_blocking=True)
+            inputs[f"{kind}_history_mask"] = mask
+            inputs[f"{kind}_history"] = normalize(
+                batch[f"{kind}_history"].to(device, non_blocking=True)
+            ).masked_fill(~mask.unsqueeze(-1), 0)
+    else:
+        inputs["proprio"] = normalizer.normalize_proprio(
+            batch["proprio"].to(device, non_blocking=True)
         )
     target = normalizer.normalize_action(batch["action"].to(device, non_blocking=True))
     return inputs, target, list(batch["task"]), list(batch["phase"])
@@ -168,6 +185,8 @@ def build_loaders(args, proprio_keys):
         "cache_size": args.cache_size,
         "proprio_keys": proprio_keys,
         "camera_keys": tuple(CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names),
+        "history_size": args.history_size,
+        "rgb_history": args.rgb_history,
     }
     train_dataset = ManipulationDataset(split_manifest=args.train_split, **common)
     val_dataset = ManipulationDataset(split_manifest=args.val_split, **common)
@@ -218,6 +237,9 @@ def parse_args():
     parser.add_argument("--spatial-channels", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--history-size", type=int, default=1)
+    parser.add_argument("--rgb-history", action="store_true",
+                        help="Stack past/current RGB for every camera; requires history-size >= 2")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -271,12 +293,15 @@ def validate_spatial_args(args):
         "learning_rate": args.learning_rate,
         "image_size": args.image_size,
         "log_every": args.log_every,
+        "history_size": args.history_size,
     }
     for name, value in positive.items():
         if value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.image_size < 32:
         raise ValueError("--image-size must be at least 32")
+    if args.rgb_history and args.history_size < 2:
+        raise ValueError("--rgb-history requires --history-size >= 2")
     if args.weight_decay < 0 or args.gradient_clip < 0:
         raise ValueError("Weight decay and gradient clip cannot be negative")
     for name in ("num_workers", "cache_size"):
@@ -347,6 +372,8 @@ def checkpoint_payload(
             "fixed_target_color": args.fixed_target_color,
             "pretrained_visual": args.pretrained_visual,
             "freeze_visual_backbone": True,
+            "history_size": getattr(model, "history_size", 1),
+            "rgb_history": getattr(model, "rgb_history", False),
         },
         "training_config": {
             key: json_value(value) for key, value in vars(args).items()
@@ -369,6 +396,8 @@ def resume_training(args, model, optimizer, device):
         int(config.get("spatial_channels", -1)),
         int(config.get("hidden_dim", -1)),
         int(config.get("proprio_dim", -1)),
+        int(config.get("history_size", 1)),
+        bool(config.get("rgb_history", False)),
     )
     actual = (
         tuple(args.camera_names),
@@ -376,6 +405,8 @@ def resume_training(args, model, optimizer, device):
         args.spatial_channels,
         args.hidden_dim,
         model.proprio_dim,
+        args.history_size,
+        args.rgb_history,
     )
     if expected != actual:
         raise ValueError(f"Resume configuration mismatch: {expected} != {actual}")
@@ -412,7 +443,16 @@ def main():
     if train_dataset.action_dim != normalizer.action_dim:
         raise ValueError("Dataset and normalizer action dimensions do not match")
 
-    model = SpatialSoftmaxVisualBCPolicy(
+    model_class = (
+        HistorySpatialSoftmaxVisualBCPolicy if args.history_size > 1
+        else SpatialSoftmaxVisualBCPolicy
+    )
+    history_kwargs = (
+        {"history_size": args.history_size, "rgb_history": args.rgb_history}
+        if args.history_size > 1 else {}
+    )
+    model = model_class(
+        **history_kwargs,
         camera_names=args.camera_names,
         action_dim=normalizer.action_dim,
         proprio_dim=normalizer.proprio_dim,
@@ -440,7 +480,8 @@ def main():
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     print(f"Device: {device}")
-    print("Policy: Spatial-softmax Visual-BC (no language, no history)")
+    print("Policy: Spatial-softmax Visual-BC (no language)")
+    print(f"History size: {args.history_size}; RGB history: {args.rgb_history}")
     print(f"Fixed target color: {args.fixed_target_color}")
     print(f"Cameras: {', '.join(args.camera_names)}")
     print(f"Proprio dimension: {normalizer.proprio_dim}")

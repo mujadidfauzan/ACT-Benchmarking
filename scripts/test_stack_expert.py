@@ -11,7 +11,7 @@ from experts.stack_expert import StackExpert
 def parse_args():
     parser = argparse.ArgumentParser(description="Run StackExpert")
     parser.add_argument("--episodes", type=int, default=1)
-    parser.add_argument("--num-cubes", type=int, choices=(3, 4), default=3)
+    parser.add_argument("--num-cubes", type=int, choices=(2, 3, 4), default=3)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()

@@ -17,6 +17,10 @@ _EXPORTS = {
         "models.spatial_softmax_visual_bc",
         "SpatialSoftmaxVisualBCPolicy",
     ),
+    "HistorySpatialSoftmaxVisualBCPolicy": (
+        "models.history_spatial_softmax_visual_bc",
+        "HistorySpatialSoftmaxVisualBCPolicy",
+    ),
 }
 
 __all__ = list(_EXPORTS)

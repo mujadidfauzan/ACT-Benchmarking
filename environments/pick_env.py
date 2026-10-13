@@ -9,6 +9,7 @@ class PickEnv(StackEnv):
     """Multi-object pick task with one instructed target and distractor cubes."""
 
     COLOR_PALETTE = COLOR_PALETTE
+    MIN_CUBES = 1
 
     def __init__(
         self,
@@ -18,8 +19,8 @@ class PickEnv(StackEnv):
         fixed_target_color=None,
         **kwargs,
     ):
-        if num_objects not in (3, 4):
-            raise ValueError("num_objects must be either 3 or 4")
+        if num_objects not in (1, 2, 3, 4):
+            raise ValueError("num_objects must be between 1 and 4")
         self.target_object_id = None
         self.instruction_split = instruction_split
         if fixed_target_color is not None and fixed_target_color not in COLOR_PALETTE:
@@ -83,6 +84,7 @@ class PickEnv(StackEnv):
         target_color = self.object_id_to_color[self.target_object_id]
         return {
             "task": "pick",
+            "num_objects": self.num_objects,
             "objects": [
                 {
                     "id": object_id,

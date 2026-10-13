@@ -12,10 +12,14 @@ def main():
     parser.add_argument("--resets", type=int, default=10)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--num-objects", type=int, choices=(1, 2, 3, 4), default=3)
+    parser.add_argument("--num-receptacles", type=int, choices=(1, 2, 3, 4), default=3)
     args = parser.parse_args()
 
     config = load_composite_controller_config(controller="BASIC")
     env = PlaceEnv(
+        num_objects=args.num_objects,
+        num_receptacles=args.num_receptacles,
         robots="Panda",
         controller_configs=config,
         has_renderer=args.render,
@@ -49,7 +53,8 @@ def main():
             print(index + 1, metadata["instruction"], pair)
             if args.render:
                 env.render()
-        assert len(target_pairs) > 1
+        if args.resets > 1 and (args.num_objects > 1 or args.num_receptacles > 1):
+            assert len(target_pairs) > 1
     finally:
         env.close()
     print(f"{args.resets} PLACE RESETS PASSED")

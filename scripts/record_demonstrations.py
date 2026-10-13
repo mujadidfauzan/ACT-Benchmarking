@@ -12,6 +12,9 @@ from data.trajectory_recorder import TrajectoryRecorder
 from environments.pick_env import PickEnv
 from environments.place_env import PlaceEnv
 from environments.stack_env import StackEnv
+from environments.scene_counts import (
+    add_count_arguments, balanced_count_plan, count_distribution, count_options,
+)
 from experts.pick_expert import PickExpert
 from experts.place_expert import PlaceExpert
 from experts.stack_expert import StackExpert
@@ -25,7 +28,7 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--output", type=Path, default=Path("data/demos"))
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--num-cubes", type=int, choices=(3, 4), default=3)
+    add_count_arguments(parser)
     parser.add_argument(
         "--fixed-target-color",
         choices=tuple(PickEnv.COLOR_PALETTE),
@@ -49,7 +52,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_task(args):
+def build_task(args, num_objects=None, num_receptacles=None, seed=None):
+    num_objects = args.num_cubes if num_objects is None else num_objects
+    if num_receptacles is None:
+        num_receptacles = getattr(args, "num_receptacles", None) or 3
     if args.camera_names[0] != "agentview":
         raise ValueError("--camera-names must start with agentview")
     if len(set(args.camera_names)) != len(args.camera_names):
@@ -68,20 +74,21 @@ def build_task(args):
         "camera_widths": [256] * len(args.camera_names),
         "control_freq": 20,
         "hard_reset": False,
-        "seed": args.seed,
+        "seed": args.seed if seed is None else seed,
     }
 
     if args.task == "pick":
         env = PickEnv(
-            num_objects=args.num_cubes,
+            num_objects=num_objects,
             fixed_target_color=args.fixed_target_color,
             horizon=1500,
             **common,
         )
     elif args.task == "place":
-        env = PlaceEnv(horizon=3000, **common)
+        env = PlaceEnv(num_objects=num_objects, num_receptacles=num_receptacles,
+                       horizon=3000, **common)
     else:
-        env = StackEnv(num_cubes=args.num_cubes, horizon=6000, **common)
+        env = StackEnv(num_cubes=num_objects, horizon=6000, **common)
 
     controller = PandaController(env)
     pick_expert = PickExpert(controller)
@@ -162,7 +169,11 @@ def main():
         raise ValueError("--camera-names requires --camera-obs")
     if args.fixed_target_color is not None and args.task != "pick":
         raise ValueError("--fixed-target-color is only valid for --task pick")
-    max_attempts = args.max_attempts or args.episodes * 3
+    object_counts, receptacle_counts = count_options(args.task, args)
+    plan = balanced_count_plan(args.episodes, object_counts, receptacle_counts, args.seed)
+    max_attempts = args.episodes * 3 if args.max_attempts is None else args.max_attempts
+    if max_attempts <= 0:
+        raise ValueError("max-attempts must be positive")
     task_dir = args.output / args.task
     task_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = task_dir / "manifest.jsonl"
@@ -181,14 +192,33 @@ def main():
             if line.strip()
         )
 
-    env, expert = build_task(args)
+    env = expert = None
+    current_configuration = None
+    environment_seed = None
+    saved_configurations = []
+    print("Successful episode quotas:", count_distribution(plan))
     saved = 0
     attempts = 0
     try:
         while saved < args.episodes and attempts < max_attempts:
             attempts += 1
             attempt_index = existing_attempts + attempts - 1
+            configuration = plan[saved]
+            counts = {"num_objects": configuration[0]}
+            if args.task == "place":
+                counts["num_receptacles"] = configuration[1]
             try:
+                if env is None or configuration != current_configuration:
+                    if env is not None:
+                        env.close()
+                        env = None
+                    environment_seed = (
+                        args.seed if attempt_index == 0 else int(
+                            np.random.SeedSequence([args.seed, attempt_index]).generate_state(1)[0]
+                        )
+                    )
+                    env, expert = build_task(args, *configuration, seed=environment_seed)
+                    current_configuration = configuration
                 observation = env.reset()
             except RandomizationError as error:
                 append_jsonl(
@@ -198,6 +228,8 @@ def main():
                         "session_attempt": attempts,
                         "task": args.task,
                         "seed": args.seed,
+                        "environment_seed": environment_seed,
+                        **counts,
                         "success": False,
                         "failure_reason": "scene_sampling_failure",
                         "saved_episode": None,
@@ -244,6 +276,8 @@ def main():
                         "session_attempt": attempts,
                         "task": args.task,
                         "seed": args.seed,
+                        "environment_seed": environment_seed,
+                        **counts,
                         "success": False,
                         "failure_reason": reason,
                         "saved_episode": None,
@@ -268,6 +302,7 @@ def main():
                 "phase_counts": summary["phase_counts"],
                 "path": episode_path.name,
                 "metadata": metadata,
+                **counts,
                 "camera_names": list(args.camera_names) if args.camera_obs else [],
             }
             append_jsonl(manifest_path, manifest_entry)
@@ -278,6 +313,8 @@ def main():
                     "session_attempt": attempts,
                     "task": args.task,
                     "seed": args.seed,
+                    "environment_seed": environment_seed,
+                    **counts,
                     "success": True,
                     "failure_reason": None,
                     "saved_episode": episode_index,
@@ -290,12 +327,25 @@ def main():
                 },
             )
             saved += 1
+            saved_configurations.append(configuration)
             print(
                 f"Saved {saved}/{args.episodes}: {episode_path} "
                 f"({summary['steps']} steps)"
             )
     finally:
-        env.close()
+        if env is not None:
+            env.close()
+
+    collection_summary = {
+        "task": args.task, "seed": args.seed, "requested": args.episodes,
+        "saved": saved, "attempted": attempts, "start_episode": start_index,
+        "target_count_distribution": count_distribution(plan),
+        "saved_count_distribution": count_distribution(saved_configurations),
+    }
+    summary_path = task_dir / f"collection_{existing_attempts:06d}.json"
+    summary_path.write_text(json.dumps(collection_summary, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8")
+    print("Saved scene counts:", collection_summary["saved_count_distribution"])
 
     if saved < args.episodes:
         raise RuntimeError(

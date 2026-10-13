@@ -19,6 +19,7 @@ from data.normalization import PolicyNormalizer
 from environments.pick_env import PickEnv
 from environments.place_env import PlaceEnv
 from environments.stack_env import StackEnv
+from environments.scene_counts import add_count_arguments, count_options
 from language.frozen_minilm import (
     CachedLanguageEmbeddings,
     CachedTokenEmbeddings,
@@ -59,7 +60,7 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seed-offset", type=int, default=0)
-    parser.add_argument("--num-cubes", type=int, choices=(3, 4), default=3)
+    add_count_arguments(parser, mixed=False)
     parser.add_argument(
         "--instruction-split", choices=("train", "held_out"), default="train"
     )
@@ -93,6 +94,9 @@ def parse_args():
 
 
 def validate_args(args):
+    tasks = TASKS if args.task == "all" else (args.task,)
+    for task in tasks:
+        count_options(task, args)
     if args.episodes <= 0:
         raise ValueError("--episodes must be positive")
     if args.image_size is not None and args.image_size < 32:
@@ -208,7 +212,8 @@ class EvaluationVideoRecorder:
 
 
 def build_environment(
-    task, seed, instruction_split, num_cubes, render, camera_names
+    task, seed, instruction_split, num_cubes, render, camera_names,
+    num_receptacles=3,
 ):
     controller_config = load_composite_controller_config(controller="BASIC")
     common = {
@@ -229,7 +234,8 @@ def build_environment(
     if task == "pick":
         return PickEnv(num_objects=num_cubes, horizon=DEFAULT_MAX_STEPS[task], **common)
     if task == "place":
-        return PlaceEnv(horizon=DEFAULT_MAX_STEPS[task], **common)
+        return PlaceEnv(num_objects=num_cubes, num_receptacles=num_receptacles,
+                        horizon=DEFAULT_MAX_STEPS[task], **common)
     return StackEnv(
         num_cubes=num_cubes, horizon=DEFAULT_MAX_STEPS[task], **common
     )
@@ -644,6 +650,7 @@ def evaluate_task(
         args.num_cubes,
         args.render,
         model.camera_names,
+        args.num_receptacles or 3,
     )
     try:
         for episode_index in range(args.episodes):
@@ -699,6 +706,8 @@ def evaluate_task(
                     "episode": episode_index,
                     "task": task,
                     "seed_start": seed,
+                    "num_objects": args.num_cubes,
+                    "num_receptacles": args.num_receptacles or 3 if task == "place" else None,
                 }
             )
             append_jsonl(output_path, result)
@@ -722,6 +731,8 @@ def evaluate_task(
     return {
         "task": task,
         "attempted": args.episodes,
+        "num_objects": args.num_cubes,
+        "num_receptacles": args.num_receptacles or 3 if task == "place" else None,
         "successful": successes,
         "failed": args.episodes - successes,
         "success_rate": successes / args.episodes,

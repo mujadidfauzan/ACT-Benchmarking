@@ -17,6 +17,8 @@ from language.instruction_generator import generate_instruction
 class StackEnv(ManipulationEnv):
     """Multi-object cube stacking environment with stable object IDs."""
 
+    MIN_CUBES = 2
+
     COLOR_PALETTE = {
         "red": np.array([0.90, 0.10, 0.10, 1.0], dtype=np.float32),
         "blue": np.array([0.10, 0.30, 0.90, 1.0], dtype=np.float32),
@@ -65,8 +67,8 @@ class StackEnv(ManipulationEnv):
         renderer_config=None,
         seed=None,
     ):
-        if num_cubes not in (3, 4):
-            raise ValueError("num_cubes must be either 3 or 4")
+        if num_cubes not in range(self.MIN_CUBES, 5):
+            raise ValueError(f"num_cubes must be between {self.MIN_CUBES} and 4")
         if minimum_object_distance < 0.0:
             raise ValueError("minimum_object_distance must be non-negative")
 

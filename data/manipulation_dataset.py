@@ -57,7 +57,8 @@ def read_split_manifest(path):
 class ManipulationDataset(Dataset):
     """Expose each trajectory timestep as a BC or ACT training sample.
 
-    The policy receives one RGB frame and robot proprioception. The current
+    The policy receives RGB and robot proprioception, optionally with causal
+    RGB/proprio/action history in BC mode. The current
     default includes joint state, gripper state, and EEF pose; normalization
     metadata can select an older compatible key set. Object poses and other
     privileged observations remain inaccessible.
@@ -74,6 +75,7 @@ class ManipulationDataset(Dataset):
         proprio_keys=DEFAULT_POLICY_PROPRIO_KEYS,
         camera_keys=DEFAULT_POLICY_CAMERA_KEYS,
         history_size=1,
+        rgb_history=False,
     ):
         if mode not in {"bc", "act"}:
             raise ValueError("mode must be 'bc' or 'act'")
@@ -83,6 +85,8 @@ class ManipulationDataset(Dataset):
             raise ValueError("cache_size cannot be negative")
         if history_size <= 0:
             raise ValueError("history_size must be positive")
+        if rgb_history and (mode != "bc" or history_size < 2):
+            raise ValueError("rgb_history requires BC mode and history_size >= 2")
 
         self.dataset_root = Path(dataset_root)
         self.split_manifest = Path(split_manifest)
@@ -93,6 +97,7 @@ class ManipulationDataset(Dataset):
         self.proprio_keys = tuple(proprio_keys)
         self.camera_keys = tuple(camera_keys)
         self.history_size = int(history_size)
+        self.rgb_history = bool(rgb_history)
         if not self.proprio_keys:
             raise ValueError("proprio_keys cannot be empty")
         if any(not key.startswith("obs__") for key in self.proprio_keys):
@@ -295,6 +300,22 @@ class ManipulationDataset(Dataset):
                     sample["proprio_history_mask"],
                     sample["action_history_mask"],
                 ) = self._history_tensors(episode, timestep)
+                if self.rgb_history:
+                    start = max(0, timestep - self.history_size + 1)
+                    for camera, output_key in (
+                        ("agentview", "image_history"),
+                        ("robot0_eye_in_hand", "eye_in_hand_image_history"),
+                    ):
+                        key = CAMERA_OBSERVATION_KEYS[camera]
+                        if key not in self.camera_keys:
+                            continue
+                        frames = torch.stack([
+                            self._image_tensor(episode[key][time])
+                            for time in range(start, timestep + 1)
+                        ])
+                        history = frames.new_zeros((self.history_size, *frames.shape[1:]))
+                        history[-len(frames):] = frames
+                        sample[output_key] = history
         else:
             actions, padding_mask = self._act_target(episode["actions"], timestep)
             sample["actions"] = actions

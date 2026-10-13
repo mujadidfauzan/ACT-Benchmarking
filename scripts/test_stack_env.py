@@ -11,7 +11,7 @@ from environments.stack_env import StackEnv
 def parse_args():
     parser = argparse.ArgumentParser(description="Validate StackEnv resets")
     parser.add_argument("--render", action="store_true")
-    parser.add_argument("--num-cubes", type=int, choices=(3, 4), default=3)
+    parser.add_argument("--num-cubes", type=int, choices=(2, 3, 4), default=3)
     parser.add_argument("--resets", type=int, default=10)
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()

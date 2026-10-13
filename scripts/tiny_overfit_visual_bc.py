@@ -19,6 +19,8 @@ from models.visual_bc import (
     VisualBCPolicy,
 )
 from models.spatial_softmax_visual_bc import SpatialSoftmaxVisualBCPolicy
+from models.history_spatial_softmax_visual_bc import HistorySpatialSoftmaxVisualBCPolicy
+from scripts.train_spatial_softmax_visual_bc import prepare_batch
 
 
 def parse_args():
@@ -38,6 +40,7 @@ def parse_args():
     )
     parser.add_argument("--spatial-channels", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=1024)
+    parser.add_argument("--rgb-history", action="store_true")
     parser.add_argument(
         "--history-size",
         type=int,
@@ -99,8 +102,8 @@ def main():
         raise ValueError("Invalid learning rate or image size")
     if args.history_size <= 0:
         raise ValueError("--history-size must be positive")
-    if args.architecture == "spatial_softmax" and args.history_size != 1:
-        raise ValueError("spatial_softmax supports no temporal history")
+    if args.rgb_history and (args.architecture != "spatial_softmax" or args.history_size < 2):
+        raise ValueError("--rgb-history requires spatial_softmax and --history-size >= 2")
     if args.spatial_channels <= 0 or args.spatial_channels % 8:
         raise ValueError("--spatial-channels must be a positive multiple of 8")
     if args.camera_names[0] != "agentview":
@@ -120,6 +123,7 @@ def main():
             CAMERA_OBSERVATION_KEYS[name] for name in args.camera_names
         ),
         history_size=args.history_size,
+        rgb_history=args.rgb_history,
     )
     episode = dataset.episode_sample_ranges[0]
     indices = np.linspace(
@@ -156,7 +160,11 @@ def main():
     target = normalizer.normalize_action(batch["action"])
 
     if args.architecture == "spatial_softmax":
-        model_class = SpatialSoftmaxVisualBCPolicy
+        inputs, target, _, _ = prepare_batch(batch, normalizer, torch.device("cpu"), args.image_size)
+        model_class = (
+            HistorySpatialSoftmaxVisualBCPolicy if args.history_size > 1
+            else SpatialSoftmaxVisualBCPolicy
+        )
         model_kwargs = {
             "camera_names": args.camera_names,
             "action_dim": normalizer.action_dim,
@@ -167,6 +175,8 @@ def main():
             "freeze_visual_backbone": True,
             "dropout": 0.0,
         }
+        if args.history_size > 1:
+            model_kwargs.update(history_size=args.history_size, rgb_history=args.rgb_history)
     else:
         model_class = HistoryVisualBCPolicy if args.history_size > 1 else VisualBCPolicy
         model_kwargs = {
@@ -230,6 +240,7 @@ def main():
         "spatial_channels": args.spatial_channels,
         "hidden_dim": args.hidden_dim,
         "history_size": args.history_size,
+        "rgb_history": args.rgb_history,
         "batch_size": args.batch_size,
         "timesteps": batch["timestep"].tolist(),
         "initial_loss": initial,

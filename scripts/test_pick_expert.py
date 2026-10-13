@@ -10,7 +10,7 @@ from experts.pick_expert import PickExpert
 def parse_args():
     parser = argparse.ArgumentParser(description="Run multi-object PickExpert")
     parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--num-objects", type=int, choices=(3, 4), default=3)
+    parser.add_argument("--num-objects", type=int, choices=(1, 2, 3, 4), default=3)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()

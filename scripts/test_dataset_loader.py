@@ -43,6 +43,7 @@ def parse_args():
         help="Emit BC proprio/action history when greater than one",
     )
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--rgb-history", action="store_true")
     parser.add_argument(
         "--proprio-preset",
         choices=tuple(PROPRIO_PRESETS),
@@ -122,6 +123,7 @@ def verify_bc(args):
         ),
         proprio_keys=PROPRIO_PRESETS[args.proprio_preset],
         history_size=args.history_size,
+        rgb_history=args.rgb_history,
     )
     sample = dataset[0]
     verify_common_sample(sample, dataset.proprio_dim)
@@ -154,6 +156,17 @@ def verify_bc(args):
             "invalid BC eye-in-hand image batch",
         )
     if args.history_size > 1:
+        if args.rgb_history:
+            for key in ("image", "eye_in_hand_image"):
+                if key in batch:
+                    frames = batch[f"{key}_history"]
+                    require(frames.shape == (batch_size, args.history_size, 3, 256, 256),
+                            f"Invalid {key} history shape")
+                    require(torch.equal(frames[:, -1], batch[key]),
+                            f"Current {key} does not match history")
+                    require(not torch.count_nonzero(frames[~batch["proprio_history_mask"]]),
+                            f"Nonzero {key} padding")
+                    assert_finite(f"{key} history", frames)
         require(
             batch["proprio_history"].shape
             == (batch_size, args.history_size, dataset.proprio_dim),
@@ -263,6 +276,10 @@ def print_batch(name, dataset, batch):
         )
     print("Proprio:", tuple(batch["proprio"].shape), batch["proprio"].dtype)
     if "proprio_history" in batch:
+        if "image_history" in batch:
+            print("RGB history:", tuple(batch["image_history"].shape))
+        if "eye_in_hand_image_history" in batch:
+            print("Wrist RGB history:", tuple(batch["eye_in_hand_image_history"].shape))
         print("Proprio history:", tuple(batch["proprio_history"].shape))
         print("Action history:", tuple(batch["action_history"].shape))
         print("Proprio history mask:", tuple(batch["proprio_history_mask"].shape))

@@ -669,6 +669,8 @@ class PlaceEnv(ManipulationEnv):
         receptacle_color = self.receptacle_id_to_color[self.target_receptacle_id]
         return {
             "task": "place",
+            "num_objects": self.num_objects,
+            "num_receptacles": self.num_receptacles,
             "objects": [
                 {
                     "id": object_id,

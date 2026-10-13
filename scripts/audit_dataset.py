@@ -230,6 +230,12 @@ def file_digest(path):
 
 
 def add_semantics(stats, task, metadata):
+    num_objects = len(metadata["objects"])
+    stats["object_counts"][str(num_objects)] += 1
+    if task == "place":
+        num_receptacles = len(metadata["receptacles"])
+        stats["receptacle_counts"][str(num_receptacles)] += 1
+        stats["scene_count_pairs"][f"objects={num_objects},receptacles={num_receptacles}"] += 1
     if task == "pick":
         target = entity_by_id(metadata["objects"], metadata["target_object"])
         stats["target_colors"][target["color"]] += 1
@@ -361,6 +367,18 @@ def audit_episode(path, task, manifest_entry, args):
 
             if metadata.get("task") != task:
                 errors.append(f"metadata task is {metadata.get('task')!r}, expected {task!r}")
+            count_fields = [
+                ("num_objects", metadata.get("objects", []), 2 if task == "stack" else 1)
+            ]
+            if task == "place":
+                count_fields.append(("num_receptacles", metadata.get("receptacles", []), 1))
+            for field, entities, minimum in count_fields:
+                if not minimum <= len(entities) <= 4:
+                    errors.append(f"{field}: invalid entity count {len(entities)} for {task}")
+                if field in metadata and metadata[field] != len(entities):
+                    errors.append(f"{field} does not match metadata entity list")
+                if field in manifest_entry and manifest_entry[field] != len(entities):
+                    errors.append(f"manifest {field} does not match metadata entity list")
             if manifest_entry.get("task") != task:
                 errors.append("manifest task does not match directory")
             if manifest_entry.get("steps") != len(actions):

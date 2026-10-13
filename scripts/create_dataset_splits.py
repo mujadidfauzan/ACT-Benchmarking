@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
+from environments.scene_counts import count_label
 
 
 TASKS = ("pick", "place", "stack")
@@ -40,6 +41,8 @@ def parse_args():
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
+    parser.add_argument("--stratify-counts", action="store_true",
+                        help="IID only: split each object/receptacle count group separately")
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -77,6 +80,11 @@ def read_manifest(path, dataset_root, task):
                     ),
                     "instruction_split": metadata.get("instruction_split"),
                     "semantic_split": metadata.get("semantic_split"),
+                    "num_objects": metadata.get("num_objects") or len(metadata.get("objects", [])) or None,
+                    "num_receptacles": (
+                        metadata.get("num_receptacles") or len(metadata.get("receptacles", [])) or None
+                        if task == "place" else None
+                    ),
                 }
             )
     return entries
@@ -116,6 +124,24 @@ def partition_with_held_out(entries, rng, held_out_key, held_out_value, ratios):
     return result, False
 
 
+def partition_count_stratified(entries, rng, ratios):
+    groups = defaultdict(list)
+    for entry in entries:
+        if entry.get("num_objects") is None or (
+            entry["task"] == "place" and entry.get("num_receptacles") is None
+        ):
+            raise ValueError("Count-stratified splits require object/receptacle counts in metadata")
+        groups[(entry["num_objects"], entry.get("num_receptacles"))].append(entry)
+    result = {split: [] for split in SPLIT_NAMES}
+    for configuration, group in sorted(groups.items()):
+        partition = partition_iid(group, rng, ratios)
+        if any(not values for values in partition.values()):
+            raise ValueError(f"Too few episodes for train/val/test in {count_label(configuration)}")
+        for split, values in partition.items():
+            result[split].extend(values)
+    return result
+
+
 def assign_task(entries, protocol, rng, ratios):
     if protocol == "iid":
         return partition_iid(entries, rng, ratios), False
@@ -146,6 +172,10 @@ def summarize(splits, fallback_tasks):
             "semantic_splits": dict(
                 sorted(Counter(semantic_label(entry) for entry in entries).items())
             ),
+            "scene_counts": dict(sorted(Counter(
+                f"{entry['task']}:{count_label((entry.get('num_objects'), entry.get('num_receptacles')))}"
+                for entry in entries
+            ).items())),
             "instruction_splits": dict(
                 sorted(
                     Counter(
@@ -166,6 +196,8 @@ def write_jsonl(path, entries):
 
 def main():
     args = parse_args()
+    if args.stratify_counts and args.protocol != "iid":
+        raise ValueError("--stratify-counts requires --protocol iid")
     ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
     if any(ratio < 0 for ratio in ratios):
         raise ValueError("Split ratios cannot be negative")
@@ -191,7 +223,10 @@ def main():
         entries = read_manifest(
             args.dataset / task / "manifest.jsonl", args.dataset, task
         )
-        task_splits, used_fallback = assign_task(entries, args.protocol, rng, ratios)
+        if args.stratify_counts:
+            task_splits, used_fallback = partition_count_stratified(entries, rng, ratios), False
+        else:
+            task_splits, used_fallback = assign_task(entries, args.protocol, rng, ratios)
         if used_fallback:
             fallback_tasks.append(task)
         for split, split_entries in task_splits.items():
@@ -210,6 +245,7 @@ def main():
         "version": "1.0",
         "dataset_root": str(args.dataset.resolve()),
         "protocol": args.protocol,
+        "stratify_counts": args.stratify_counts,
         "seed": args.seed,
         "ratios": {
             "train": args.train_ratio,
