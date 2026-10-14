@@ -47,6 +47,7 @@ class ResNet18VisualEncoder(nn.Module):
         )
         self._backbone_frozen = False
         self._layer4_trainable = False
+        self._layer3_trainable = False
         if freeze_backbone:
             self.freeze_backbone()
 
@@ -55,6 +56,7 @@ class ResNet18VisualEncoder(nn.Module):
             parameter.requires_grad_(False)
         self._backbone_frozen = True
         self._layer4_trainable = False
+        self._layer3_trainable = False
         self.backbone.eval()
         return self
 
@@ -65,9 +67,22 @@ class ResNet18VisualEncoder(nn.Module):
             parameter.requires_grad_(True)
         self._backbone_frozen = False
         self._layer4_trainable = True
+        self._layer3_trainable = False
         if self.training:
             self.backbone.eval()
             self.backbone.layer4.train()
+        return self
+
+    def unfreeze_layer3(self):
+        """Fine-tune layer3 weights while keeping all BatchNorm statistics fixed."""
+        for parameter in self.backbone.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.backbone.layer3.parameters():
+            parameter.requires_grad_(True)
+        self._backbone_frozen = False
+        self._layer3_trainable = True
+        self._layer4_trainable = False
+        self.backbone.eval()
         return self
 
     def unfreeze_backbone(self):
@@ -75,12 +90,15 @@ class ResNet18VisualEncoder(nn.Module):
             parameter.requires_grad_(True)
         self._backbone_frozen = False
         self._layer4_trainable = False
+        self._layer3_trainable = False
         self.backbone.train(self.training)
         return self
 
     def train(self, mode=True):
         super().train(mode)
         if self._backbone_frozen:
+            self.backbone.eval()
+        elif self._layer3_trainable:
             self.backbone.eval()
         elif self._layer4_trainable:
             self.backbone.eval()

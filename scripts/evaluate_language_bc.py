@@ -326,13 +326,14 @@ def load_policy(args, device):
             "Checkpoint and normalizer proprio dimensions do not match: "
             f"{checkpoint_proprio_dim} != {normalizer.proprio_dim}"
         )
-    model = LanguageBCPolicy(
-        language_mode=language_mode,
-        visual_fusion=visual_fusion,
-        camera_names=camera_names,
-        action_dim=normalizer.action_dim,
-        proprio_dim=normalizer.proprio_dim,
-        language_input_dim=language.embedding_dim,
+    if int(model_config.get("action_dim", normalizer.action_dim)) != normalizer.action_dim:
+        raise ValueError("Checkpoint and normalizer action dimensions do not match")
+    if int(model_config.get("language_input_dim", language.embedding_dim)) != language.embedding_dim:
+        raise ValueError("Checkpoint and language cache embedding dimensions do not match")
+    model = LanguageBCPolicy.from_config(
+        {**model_config, "visual_fusion": visual_fusion, "camera_names": camera_names,
+         "proprio_dim": normalizer.proprio_dim, "action_dim": normalizer.action_dim,
+         "language_input_dim": language.embedding_dim},
         pretrained_visual=False,
         freeze_visual_backbone=True,
     ).to(device)

@@ -244,6 +244,10 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--backbone-learning-rate", type=float, default=1e-5,
+                        help="Separate learning rate for trainable ResNet layer3")
+    parser.add_argument("--unfreeze-layer3-epoch", type=int,
+                        help="Unfreeze only layer3 at this one-based epoch; default keeps it frozen")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -261,7 +265,10 @@ def parse_args():
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-val-batches", type=int)
     parser.add_argument("--log-every", type=int, default=25)
-    parser.add_argument("--resume", type=Path)
+    checkpoint = parser.add_mutually_exclusive_group()
+    checkpoint.add_argument("--resume", type=Path)
+    checkpoint.add_argument("--init-checkpoint", type=Path,
+                            help="Load model weights only for a new run; optimizer/epochs start fresh")
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--pretrained-visual",
@@ -294,6 +301,7 @@ def validate_spatial_args(args):
         "image_size": args.image_size,
         "log_every": args.log_every,
         "history_size": args.history_size,
+        "backbone_learning_rate": args.backbone_learning_rate,
     }
     for name, value in positive.items():
         if value <= 0:
@@ -302,6 +310,8 @@ def validate_spatial_args(args):
         raise ValueError("--image-size must be at least 32")
     if args.rgb_history and args.history_size < 2:
         raise ValueError("--rgb-history requires --history-size >= 2")
+    if args.unfreeze_layer3_epoch is not None and args.unfreeze_layer3_epoch <= 0:
+        raise ValueError("--unfreeze-layer3-epoch must be positive")
     if args.weight_decay < 0 or args.gradient_clip < 0:
         raise ValueError("Weight decay and gradient clip cannot be negative")
     for name in ("num_workers", "cache_size"):
@@ -371,7 +381,9 @@ def checkpoint_payload(
             "dropout": model.dropout,
             "fixed_target_color": args.fixed_target_color,
             "pretrained_visual": args.pretrained_visual,
-            "freeze_visual_backbone": True,
+            "freeze_visual_backbone": not model.visual_encoder._layer3_trainable,
+            "layer3_trainable": model.visual_encoder._layer3_trainable,
+            "batch_norm_statistics_frozen": True,
             "history_size": getattr(model, "history_size", 1),
             "rgb_history": getattr(model, "rgb_history", False),
         },
@@ -383,10 +395,7 @@ def checkpoint_payload(
     }
 
 
-def resume_training(args, model, optimizer, device):
-    if args.resume is None:
-        return 1, 0, float("inf"), -1.0, [], []
-    checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+def validate_model_checkpoint(args, model, checkpoint):
     if checkpoint.get("policy_type") != model.policy_type:
         raise ValueError("Resume checkpoint is not a spatial-softmax Visual-BC checkpoint")
     config = checkpoint["model_config"]
@@ -398,6 +407,8 @@ def resume_training(args, model, optimizer, device):
         int(config.get("proprio_dim", -1)),
         int(config.get("history_size", 1)),
         bool(config.get("rgb_history", False)),
+        int(config.get("action_dim", model.action_dim)),
+        float(config.get("dropout", 0.1)),
     )
     actual = (
         tuple(args.camera_names),
@@ -407,11 +418,50 @@ def resume_training(args, model, optimizer, device):
         model.proprio_dim,
         args.history_size,
         args.rgb_history,
+        model.action_dim,
+        model.dropout,
     )
     if expected != actual:
         raise ValueError(f"Resume configuration mismatch: {expected} != {actual}")
+
+
+def build_optimizer(args, model):
+    return torch.optim.AdamW(
+        [{"params": [p for p in model.parameters() if p.requires_grad], "name": "heads"}],
+        lr=args.learning_rate, weight_decay=args.weight_decay,
+    )
+
+
+def enable_layer3_finetuning(args, model, optimizer):
+    if model.visual_encoder._layer3_trainable:
+        return False
+    model.visual_encoder.unfreeze_layer3()
+    optimizer.add_param_group({
+        "params": list(model.visual_encoder.backbone.layer3.parameters()),
+        "lr": args.backbone_learning_rate, "name": "backbone_layer3",
+    })
+    return True
+
+
+def resume_training(args, model, optimizer, device):
+    if args.resume is None:
+        return 1, 0, float("inf"), -1.0, [], []
+    checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+    validate_model_checkpoint(args, model, checkpoint)
+    saved_unfreeze_epoch = checkpoint.get("training_config", {}).get("unfreeze_layer3_epoch")
+    if saved_unfreeze_epoch is not None and saved_unfreeze_epoch != args.unfreeze_layer3_epoch:
+        raise ValueError("Resume must retain --unfreeze-layer3-epoch from the checkpoint")
+    active = bool(checkpoint["model_config"].get("layer3_trainable", False))
+    if active and args.unfreeze_layer3_epoch is None:
+        raise ValueError("Fine-tuned checkpoint requires --unfreeze-layer3-epoch on resume")
     model.load_state_dict(checkpoint["model_state"])
+    if active:
+        enable_layer3_finetuning(args, model, optimizer)
     optimizer.load_state_dict(checkpoint["optimizer_state"])
+    # CLI learning rates apply on resume as well, including legacy unnamed groups.
+    for index, group in enumerate(optimizer.param_groups):
+        group["name"] = "heads" if index == 0 else "backbone_layer3"
+        group["lr"] = args.learning_rate if index == 0 else args.backbone_learning_rate
     return (
         int(checkpoint["epoch"]) + 1,
         int(checkpoint.get("global_step", 0)),
@@ -428,10 +478,6 @@ def main():
     set_seed(args.seed)
     device = resolve_device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    save_json(
-        args.output_dir / "config.json",
-        {key: json_value(value) for key, value in vars(args).items()},
-    )
 
     normalizer = PolicyNormalizer.from_json(args.normalization).to(device)
     normalizer.validate_split(args.train_split)
@@ -459,14 +505,15 @@ def main():
         spatial_channels=args.spatial_channels,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
-        pretrained_visual=args.pretrained_visual,
+        pretrained_visual=(args.pretrained_visual and args.resume is None and args.init_checkpoint is None),
         freeze_visual_backbone=True,
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    if args.init_checkpoint is not None:
+        checkpoint = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
+        validate_model_checkpoint(args, model, checkpoint)
+        model.load_state_dict(checkpoint["model_state"])
+        print(f"Initialized model weights from {args.init_checkpoint}; starting a new run")
+    optimizer = build_optimizer(args, model)
     (
         start_epoch,
         global_step,
@@ -475,6 +522,8 @@ def main():
         history,
         rollout_evaluations,
     ) = resume_training(args, model, optimizer, device)
+    save_json(args.output_dir / "config.json",
+              {key: json_value(value) for key, value in vars(args).items()})
 
     trainable_parameters = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -485,6 +534,9 @@ def main():
     print(f"Fixed target color: {args.fixed_target_color}")
     print(f"Cameras: {', '.join(args.camera_names)}")
     print(f"Proprio dimension: {normalizer.proprio_dim}")
+    print(f"Layer3 unfreeze epoch: {args.unfreeze_layer3_epoch}; "
+          f"head LR: {args.learning_rate}; backbone LR: {args.backbone_learning_rate}; "
+          "BatchNorm statistics frozen")
     print(
         f"Spatial channels per camera: {args.spatial_channels}; "
         f"MLP: {args.hidden_dim} -> {args.hidden_dim}; "
@@ -496,6 +548,9 @@ def main():
     )
 
     for epoch in range(start_epoch, args.epochs + 1):
+        if args.unfreeze_layer3_epoch is not None and epoch >= args.unfreeze_layer3_epoch:
+            if enable_layer3_finetuning(args, model, optimizer):
+                print(f"Unfroze ResNet layer3 at epoch {epoch}; LR={args.backbone_learning_rate}")
         print(f"Epoch {epoch}/{args.epochs}")
         train_metrics = run_epoch(
             model, train_loader, normalizer, device, args.image_size,
@@ -514,6 +569,8 @@ def main():
             "global_step": global_step,
             "train": train_metrics,
             "val": val_metrics,
+            "layer3_trainable": model.visual_encoder._layer3_trainable,
+            "learning_rates": {group["name"]: group["lr"] for group in optimizer.param_groups},
         })
         improved_val = val_metrics["loss"] < best_val_loss
         if improved_val:

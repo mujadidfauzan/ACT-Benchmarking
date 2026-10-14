@@ -23,6 +23,7 @@ from models.language_bc import (
     VISUAL_FUSION_MODES,
     LanguageBCPolicy,
 )
+from scripts.train_language_bc import add_architecture_arguments, fusion_hidden_dims
 
 
 def parse_args():
@@ -64,6 +65,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    add_architecture_arguments(parser)
     parser.add_argument("--image-size", type=int, default=96)
     parser.add_argument(
         "--visual-fusion",
@@ -192,11 +194,8 @@ def gradient_norm(parameters):
 
 def checkpoint_round_trip(model, model_inputs, expected):
     state = copy.deepcopy(model.state_dict())
-    restored = LanguageBCPolicy(
-        language_mode=model.language_mode,
-        visual_fusion=model.visual_fusion,
-        camera_names=model.camera_names,
-        proprio_dim=model.proprio_encoder.input_dim,
+    restored = LanguageBCPolicy.from_config(
+        model.get_config(),
         pretrained_visual=False,
         freeze_visual_backbone=True,
         dropout=0.0,
@@ -217,6 +216,8 @@ def overfit_mode(mode, common, args, pooled_cache, token_cache):
         visual_fusion=args.visual_fusion,
         camera_names=args.camera_names,
         proprio_dim=common["proprio"].shape[-1],
+        fusion_hidden_dims=fusion_hidden_dims(args),
+        spatial_channels=args.spatial_channels,
         pretrained_visual=args.pretrained_visual,
         freeze_visual_backbone=True,
         dropout=0.0,

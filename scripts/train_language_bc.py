@@ -25,6 +25,22 @@ from models.language_bc import (
 )
 
 
+def add_architecture_arguments(parser):
+    hidden = parser.add_mutually_exclusive_group()
+    hidden.add_argument("--hidden-dims", "--fusion-hidden-dims", dest="hidden_dims",
+                        nargs=2, type=int, metavar=("H1", "H2"),
+                        help="Fusion MLP widths; default: 1024 1024 for spatial_softmax, 256 128 otherwise")
+    hidden.add_argument("--hidden-dim", type=int,
+                        help="Use this width for both fusion hidden layers")
+    parser.add_argument("--spatial-channels", type=int, default=64)
+
+
+def fusion_hidden_dims(args):
+    if args.hidden_dim is not None:
+        return (args.hidden_dim, args.hidden_dim)
+    return tuple(args.hidden_dims) if args.hidden_dims is not None else None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Language-BC")
     parser.add_argument("--dataset", type=Path, default=Path("data/demos/pilot_v01"))
@@ -72,6 +88,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    add_architecture_arguments(parser)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--cache-size", type=int, default=2)
@@ -141,6 +159,15 @@ def validate_args(args):
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.unfreeze_layer4_epoch is not None and args.unfreeze_layer4_epoch <= 0:
         raise ValueError("--unfreeze-layer4-epoch must be positive")
+    widths = fusion_hidden_dims(args)
+    if widths is not None and min(widths) <= 0:
+        raise ValueError("Hidden dimensions must be positive")
+    if args.spatial_channels <= 0 or args.spatial_channels % 8:
+        raise ValueError("--spatial-channels must be a positive multiple of eight")
+    if not 0 <= args.dropout < 1:
+        raise ValueError("--dropout must be in [0, 1)")
+    if args.visual_fusion == "spatial_softmax" and args.unfreeze_layer4_epoch is not None:
+        raise ValueError("spatial_softmax reads layer3, so --unfreeze-layer4-epoch is not applicable")
     if args.phase_balanced and args.batches_per_task is not None:
         raise ValueError(
             "--batches-per-task cannot be combined with --phase-balanced"
@@ -394,12 +421,7 @@ def checkpoint_payload(
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "model_config": {
-            "language_mode": args.language_mode,
-            "visual_fusion": args.visual_fusion,
-            "camera_names": list(model.camera_names),
-            "proprio_dim": model.proprio_encoder.input_dim,
-            "action_dim": model.action_dim,
-            "language_input_dim": model.language_head.input_dim,
+            **model.get_config(),
             "pretrained_visual": args.pretrained_visual,
             "freeze_visual_backbone": True,
         },
@@ -437,6 +459,7 @@ def load_checkpoint(path, device, expected_mode):
 
 
 def restore_checkpoint(checkpoint, model, optimizer):
+    validate_checkpoint_architecture(checkpoint, model)
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     rng = checkpoint.get("rng_state")
@@ -447,6 +470,24 @@ def restore_checkpoint(checkpoint, model, optimizer):
         if torch.cuda.is_available() and rng.get("cuda") is not None:
             torch.cuda.set_rng_state_all(rng["cuda"])
     return checkpoint
+
+
+def validate_checkpoint_architecture(checkpoint, model):
+    config = checkpoint.get("model_config", {})
+    mode = config.get("visual_fusion", "global")
+    defaults = {
+        "visual_fusion": "global", "camera_names": ["agentview"],
+        "proprio_dim": 16, "action_dim": 7, "language_input_dim": 384,
+        "visual_dim": 256, "proprio_feature_dim": 64, "language_feature_dim": 128,
+        "fusion_hidden_dims": [1024, 1024] if mode == "spatial_softmax" else [256, 128],
+        "spatial_channels": 64, "dropout": 0.1,
+    }
+    for key, actual in model.get_config().items():
+        expected = config.get(key, defaults.get(key))
+        if key in ("camera_names", "fusion_hidden_dims"):
+            expected, actual = tuple(expected), tuple(actual)
+        if expected != actual:
+            raise ValueError(f"Checkpoint {key} does not match command: {expected!r} != {actual!r}")
 
 
 def format_metrics(name, metrics):
@@ -491,10 +532,6 @@ def main():
     set_seed(args.seed)
     device = resolve_device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    save_json(
-        args.output_dir / "config.json",
-        {key: json_value(value) for key, value in vars(args).items()},
-    )
 
     normalizer = PolicyNormalizer.from_json(args.normalization).to(device)
     normalizer.validate_split(args.train_split)
@@ -516,6 +553,9 @@ def main():
         action_dim=normalizer.action_dim,
         proprio_dim=normalizer.proprio_dim,
         language_input_dim=language.embedding_dim,
+        fusion_hidden_dims=fusion_hidden_dims(args),
+        spatial_channels=args.spatial_channels,
+        dropout=args.dropout,
         pretrained_visual=args.pretrained_visual,
         freeze_visual_backbone=True,
     ).to(device)
@@ -540,6 +580,7 @@ def main():
                 "Checkpoint cameras do not match command: "
                 f"{resumed_cameras!r} != {tuple(args.camera_names)!r}"
             )
+        validate_checkpoint_architecture(resume_checkpoint, model)
         resumed_epoch = int(resume_checkpoint["epoch"])
         if (
             args.unfreeze_layer4_epoch is not None
@@ -566,11 +607,17 @@ def main():
         history = list(checkpoint.get("history", []))
         print(f"Resumed {args.resume} at epoch {start_epoch}")
 
+    save_json(
+        args.output_dir / "config.json",
+        {key: json_value(value) for key, value in vars(args).items()},
+    )
     print(f"Device: {device}")
     print(f"Language mode: {args.language_mode}")
     print(f"Visual fusion: {args.visual_fusion}")
     print(f"Cameras: {', '.join(args.camera_names)}")
     print(f"Proprio dimension: {normalizer.proprio_dim}")
+    print(f"Fusion: {model.fusion_input_dim} -> {model.fusion_hidden_dims[0]} -> "
+          f"{model.fusion_hidden_dims[1]} -> {model.action_dim}")
     print(f"Phase-balanced sampling: {args.phase_balanced}")
     print(
         f"Samples: train={len(train_dataset)}, val={len(val_dataset)}; "

@@ -193,11 +193,8 @@ def checkpoint_round_trip(model, model_inputs, expected):
     buffer = io.BytesIO()
     torch.save(model.state_dict(), buffer)
     buffer.seek(0)
-    restored = LanguageBCPolicy(
-        language_mode=model.language_mode,
-        visual_fusion=model.visual_fusion,
-        camera_names=model.camera_names,
-        proprio_dim=model.proprio_encoder.input_dim,
+    restored = LanguageBCPolicy.from_config(
+        model.get_config(),
         pretrained_visual=False,
         freeze_visual_backbone=True,
         dropout=0.0,

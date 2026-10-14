@@ -8,10 +8,11 @@ from torch import nn
 from language.frozen_minilm import TrainableAttentionPooling
 from models.policy_components import ProprioEncoder
 from models.visual_encoder import ResNet18VisualEncoder
+from models.spatial_softmax_visual_bc import CameraSpatialSoftmaxEncoder
 
 
 LANGUAGE_MODES = ("pooled", "token_attention")
-VISUAL_FUSION_MODES = ("global", "spatial_attention")
+VISUAL_FUSION_MODES = ("global", "spatial_attention", "spatial_softmax")
 POLICY_CAMERAS = ("agentview", "robot0_eye_in_hand")
 
 
@@ -108,15 +109,16 @@ class LanguageBCPolicy(nn.Module):
         visual_fusion="spatial_attention",
         camera_names=("agentview",),
         action_dim=7,
-        proprio_dim=16,
+        proprio_dim=None,
         visual_dim=256,
         proprio_feature_dim=64,
         language_input_dim=384,
         language_feature_dim=128,
-        fusion_hidden_dims=(256, 128),
+        fusion_hidden_dims=None,
         pretrained_visual=True,
         freeze_visual_backbone=True,
         dropout=0.1,
+        spatial_channels=64,
     ):
         super().__init__()
         if language_mode not in LANGUAGE_MODES:
@@ -139,21 +141,36 @@ class LanguageBCPolicy(nn.Module):
             raise ValueError(f"Unsupported policy cameras: {sorted(unknown_cameras)}")
         if action_dim <= 0:
             raise ValueError("action_dim must be positive")
+        if fusion_hidden_dims is None:
+            fusion_hidden_dims = (1024, 1024) if visual_fusion == "spatial_softmax" else (256, 128)
         if len(fusion_hidden_dims) != 2 or min(fusion_hidden_dims) <= 0:
             raise ValueError("fusion_hidden_dims must contain two positive values")
+        if proprio_dim is None:
+            proprio_dim = 9 if visual_fusion == "spatial_softmax" else 16
+        if proprio_dim <= 0:
+            raise ValueError("proprio_dim must be positive")
+        if spatial_channels <= 0 or spatial_channels % 8:
+            raise ValueError("spatial_channels must be a positive multiple of eight")
 
         self.language_mode = language_mode
         self.visual_fusion = visual_fusion
         self.camera_names = camera_names
         self.use_eye_in_hand = "robot0_eye_in_hand" in camera_names
         self.action_dim = int(action_dim)
+        self.proprio_dim = int(proprio_dim)
+        self.visual_dim = int(visual_dim)
+        self.proprio_feature_dim = int(proprio_feature_dim)
+        self.language_feature_dim = int(language_feature_dim)
+        self.fusion_hidden_dims = tuple(int(value) for value in fusion_hidden_dims)
+        self.spatial_channels = int(spatial_channels)
+        self.dropout = float(dropout)
         self.visual_encoder = ResNet18VisualEncoder(
             output_dim=visual_dim,
             pretrained=pretrained_visual,
             freeze_backbone=freeze_visual_backbone,
             dropout=dropout,
         )
-        self.proprio_encoder = ProprioEncoder(
+        self.proprio_encoder = None if visual_fusion == "spatial_softmax" else ProprioEncoder(
             input_dim=proprio_dim,
             hidden_dim=proprio_feature_dim,
             output_dim=proprio_feature_dim,
@@ -194,24 +211,71 @@ class LanguageBCPolicy(nn.Module):
             self.spatial_attention = None
             self.eye_in_hand_spatial_attention = None
 
+        if visual_fusion == "spatial_softmax":
+            for parameter in self.visual_encoder.projection.parameters():
+                parameter.requires_grad_(False)
+            self.agentview_spatial_softmax = CameraSpatialSoftmaxEncoder(
+                input_channels=256, spatial_channels=spatial_channels
+            )
+            self.eye_in_hand_spatial_softmax = (
+                CameraSpatialSoftmaxEncoder(input_channels=256, spatial_channels=spatial_channels)
+                if self.use_eye_in_hand else None
+            )
+        else:
+            self.agentview_spatial_softmax = None
+            self.eye_in_hand_spatial_softmax = None
+
         visual_feature_count = 2 if self.use_eye_in_hand else 1
-        fusion_input_dim = (
-            visual_dim * visual_feature_count
-            + proprio_feature_dim
+        self.visual_feature_dim = 2 * spatial_channels if visual_fusion == "spatial_softmax" else visual_dim
+        self.fusion_input_dim = (
+            self.visual_feature_dim * visual_feature_count
+            + (proprio_dim if visual_fusion == "spatial_softmax" else proprio_feature_dim)
             + language_feature_dim
         )
-        hidden_1, hidden_2 = fusion_hidden_dims
+        hidden_1, hidden_2 = self.fusion_hidden_dims
+        activation = nn.ReLU if visual_fusion == "spatial_softmax" else nn.GELU
         self.fusion = nn.Sequential(
-            nn.Linear(fusion_input_dim, hidden_1),
+            nn.Linear(self.fusion_input_dim, hidden_1),
             nn.LayerNorm(hidden_1),
-            nn.GELU(),
+            activation(),
             nn.Dropout(dropout),
             nn.Linear(hidden_1, hidden_2),
             nn.LayerNorm(hidden_2),
-            nn.GELU(),
+            activation(),
             nn.Dropout(dropout),
         )
         self.action_head = nn.Linear(hidden_2, action_dim)
+
+    def get_config(self):
+        """Constructor fields needed to recreate this policy without guessing sizes."""
+        return {
+            "language_mode": self.language_mode,
+            "visual_fusion": self.visual_fusion,
+            "camera_names": list(self.camera_names),
+            "action_dim": self.action_dim,
+            "proprio_dim": self.proprio_dim,
+            "visual_dim": self.visual_dim,
+            "proprio_feature_dim": self.proprio_feature_dim,
+            "language_input_dim": self.language_head.input_dim,
+            "language_feature_dim": self.language_feature_dim,
+            "fusion_hidden_dims": list(self.fusion_hidden_dims),
+            "spatial_channels": self.spatial_channels,
+            "dropout": self.dropout,
+        }
+
+    @classmethod
+    def from_config(cls, config, **overrides):
+        fields = (
+            "language_mode", "visual_fusion", "camera_names", "action_dim", "proprio_dim",
+            "visual_dim", "proprio_feature_dim", "language_input_dim", "language_feature_dim",
+            "fusion_hidden_dims", "spatial_channels", "dropout",
+        )
+        kwargs = {key: config[key] for key in fields if key in config}
+        # Historical checkpoints before spatial attention omitted this field.
+        kwargs.setdefault("visual_fusion", "global")
+        kwargs.setdefault("pretrained_visual", False)
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
     def _encode_language(
         self,
@@ -246,6 +310,8 @@ class LanguageBCPolicy(nn.Module):
         token_embeddings=None,
         attention_mask=None,
     ):
+        if proprio.ndim != 2 or proprio.shape[-1] != self.proprio_dim:
+            raise ValueError(f"proprio must have shape [B, {self.proprio_dim}]")
         language_output = self._encode_language(
             language_embedding=language_embedding,
             token_embeddings=token_embeddings,
@@ -256,7 +322,25 @@ class LanguageBCPolicy(nn.Module):
             raise ValueError("Dual-camera policy requires eye_in_hand_image")
         if not self.use_eye_in_hand and eye_in_hand_image is not None:
             raise ValueError("Single-camera policy does not accept eye_in_hand_image")
-        if self.visual_fusion == "spatial_attention":
+        if self.visual_fusion == "spatial_softmax":
+            visual_feature, spatial_attention_weights = self.agentview_spatial_softmax(
+                self.visual_encoder.forward_layer3(image)
+            )
+            spatial_attention_coordinates = visual_feature.reshape(
+                visual_feature.shape[0], self.spatial_channels, 2
+            )
+            if self.use_eye_in_hand:
+                eye_in_hand_visual_feature, eye_in_hand_attention_weights = self.eye_in_hand_spatial_softmax(
+                    self.visual_encoder.forward_layer3(eye_in_hand_image)
+                )
+                eye_in_hand_attention_coordinates = eye_in_hand_visual_feature.reshape(
+                    eye_in_hand_visual_feature.shape[0], self.spatial_channels, 2
+                )
+            else:
+                eye_in_hand_visual_feature = None
+                eye_in_hand_attention_weights = None
+                eye_in_hand_attention_coordinates = None
+        elif self.visual_fusion == "spatial_attention":
             spatial_feature = self.visual_encoder.forward_spatial(image)
             (
                 visual_feature,
@@ -289,7 +373,7 @@ class LanguageBCPolicy(nn.Module):
             )
             eye_in_hand_attention_weights = None
             eye_in_hand_attention_coordinates = None
-        proprio_feature = self.proprio_encoder(proprio)
+        proprio_feature = proprio if self.proprio_encoder is None else self.proprio_encoder(proprio)
 
         batch_sizes = {
             visual_feature.shape[0],
