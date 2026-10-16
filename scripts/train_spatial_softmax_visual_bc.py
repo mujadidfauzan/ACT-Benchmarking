@@ -20,6 +20,11 @@ from data.manipulation_dataset import (
 from data.normalization import PolicyNormalizer
 from models.spatial_softmax_visual_bc import SpatialSoftmaxVisualBCPolicy
 from models.history_spatial_softmax_visual_bc import HistorySpatialSoftmaxVisualBCPolicy
+from models.small_cnn_visual_bc import SmallCNNVisualBCPolicy
+
+
+def layer3_trainable(model):
+    return bool(getattr(model.visual_encoder, "_layer3_trainable", False))
 
 
 def set_seed(seed):
@@ -221,7 +226,7 @@ def format_metrics(name, metrics):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train spatial-softmax Visual-BC for fixed-target Pick"
+        description="Train fixed-target Visual-BC with ResNet spatial softmax or Small CNN"
     )
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--train-split", type=Path, required=True)
@@ -234,8 +239,9 @@ def parse_args():
         choices=tuple(CAMERA_OBSERVATION_KEYS),
         default=["agentview", "robot0_eye_in_hand"],
     )
-    parser.add_argument("--spatial-channels", type=int, default=64)
-    parser.add_argument("--hidden-dim", type=int, default=1024)
+    parser.add_argument("--visual-encoder", choices=("resnet18", "small_cnn"), default="resnet18")
+    parser.add_argument("--spatial-channels", type=int, help="ResNet mode only; default: 64")
+    parser.add_argument("--hidden-dim", type=int, help="ResNet mode only; default: 1024")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--history-size", type=int, default=1)
     parser.add_argument("--rgb-history", action="store_true",
@@ -290,10 +296,22 @@ def parse_args():
     parser.add_argument("--rollout-eval-seed-offset", type=int, default=0)
     parser.add_argument("--rollout-eval-max-steps", type=int, default=400)
     parser.add_argument("--rollout-eval-success-hold-steps", type=int, default=5)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.visual_encoder == "small_cnn":
+        if args.hidden_dim is not None or args.spatial_channels is not None:
+            parser.error("Small CNN dimensions/depth are configured in models/small_cnn_visual_*.py, not CLI")
+    else:
+        args.hidden_dim = 1024 if args.hidden_dim is None else args.hidden_dim
+        args.spatial_channels = 64 if args.spatial_channels is None else args.spatial_channels
+    return args
 
 
 def validate_spatial_args(args):
+    if args.visual_encoder == "small_cnn":
+        if args.history_size != 1 or args.rgb_history:
+            raise ValueError("--visual-encoder small_cnn supports current frames only, without history")
+        if args.pretrained_visual or args.unfreeze_layer3_epoch is not None:
+            raise ValueError("Small CNN trains from scratch; omit --pretrained-visual and --unfreeze-layer3-epoch")
     positive = {
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -333,9 +351,9 @@ def validate_spatial_args(args):
         raise ValueError("--camera-names must start with agentview")
     if len(set(args.camera_names)) != len(args.camera_names):
         raise ValueError("--camera-names cannot contain duplicates")
-    if args.spatial_channels <= 0 or args.spatial_channels % 8:
+    if args.visual_encoder == "resnet18" and (args.spatial_channels <= 0 or args.spatial_channels % 8):
         raise ValueError("--spatial-channels must be a positive multiple of 8")
-    if args.hidden_dim <= 0:
+    if args.visual_encoder == "resnet18" and args.hidden_dim <= 0:
         raise ValueError("--hidden-dim must be positive")
     if not 0.0 <= args.dropout < 1.0:
         raise ValueError("--dropout must be in [0, 1)")
@@ -381,11 +399,15 @@ def checkpoint_payload(
             "dropout": model.dropout,
             "fixed_target_color": args.fixed_target_color,
             "pretrained_visual": args.pretrained_visual,
-            "freeze_visual_backbone": not model.visual_encoder._layer3_trainable,
-            "layer3_trainable": model.visual_encoder._layer3_trainable,
+            "freeze_visual_backbone": not layer3_trainable(model),
+            "layer3_trainable": layer3_trainable(model),
             "batch_norm_statistics_frozen": True,
             "history_size": getattr(model, "history_size", 1),
             "rgb_history": getattr(model, "rgb_history", False),
+        } if not isinstance(model, SmallCNNVisualBCPolicy) else {
+            **model.get_config(), "fixed_target_color": args.fixed_target_color,
+            "pretrained_visual": False, "freeze_visual_backbone": False,
+            "history_size": 1, "rgb_history": False,
         },
         "training_config": {
             key: json_value(value) for key, value in vars(args).items()
@@ -397,8 +419,13 @@ def checkpoint_payload(
 
 def validate_model_checkpoint(args, model, checkpoint):
     if checkpoint.get("policy_type") != model.policy_type:
-        raise ValueError("Resume checkpoint is not a spatial-softmax Visual-BC checkpoint")
+        raise ValueError("Checkpoint policy type does not match the selected visual encoder/history")
     config = checkpoint["model_config"]
+    if isinstance(model, SmallCNNVisualBCPolicy):
+        expected = {key: config.get(key) for key in model.get_config()}
+        if expected != model.get_config() or config.get("fixed_target_color") != args.fixed_target_color:
+            raise ValueError("Resume configuration mismatch for Small CNN architecture or target color")
+        return
     expected = (
         tuple(config.get("camera_names", [])),
         config.get("fixed_target_color"),
@@ -427,7 +454,8 @@ def validate_model_checkpoint(args, model, checkpoint):
 
 def build_optimizer(args, model):
     return torch.optim.AdamW(
-        [{"params": [p for p in model.parameters() if p.requires_grad], "name": "heads"}],
+        [{"params": [p for p in model.parameters() if p.requires_grad],
+          "name": "policy" if isinstance(model, SmallCNNVisualBCPolicy) else "heads"}],
         lr=args.learning_rate, weight_decay=args.weight_decay,
     )
 
@@ -460,7 +488,8 @@ def resume_training(args, model, optimizer, device):
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     # CLI learning rates apply on resume as well, including legacy unnamed groups.
     for index, group in enumerate(optimizer.param_groups):
-        group["name"] = "heads" if index == 0 else "backbone_layer3"
+        group["name"] = ("policy" if isinstance(model, SmallCNNVisualBCPolicy)
+                         else "heads" if index == 0 else "backbone_layer3")
         group["lr"] = args.learning_rate if index == 0 else args.backbone_learning_rate
     return (
         int(checkpoint["epoch"]) + 1,
@@ -469,6 +498,33 @@ def resume_training(args, model, optimizer, device):
         float(checkpoint.get("best_rollout_success_rate", -1.0)),
         list(checkpoint.get("history", [])),
         list(checkpoint.get("rollout_evaluations", [])),
+    )
+
+
+def build_policy(args, normalizer):
+    if args.visual_encoder == "small_cnn":
+        return SmallCNNVisualBCPolicy(
+            camera_names=args.camera_names, action_dim=normalizer.action_dim,
+            proprio_dim=normalizer.proprio_dim, dropout=args.dropout,
+        )
+    model_class = (
+        HistorySpatialSoftmaxVisualBCPolicy if args.history_size > 1
+        else SpatialSoftmaxVisualBCPolicy
+    )
+    history_kwargs = (
+        {"history_size": args.history_size, "rgb_history": args.rgb_history}
+        if args.history_size > 1 else {}
+    )
+    return model_class(
+        **history_kwargs,
+        camera_names=args.camera_names,
+        action_dim=normalizer.action_dim,
+        proprio_dim=normalizer.proprio_dim,
+        spatial_channels=args.spatial_channels,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
+        pretrained_visual=(args.pretrained_visual and args.resume is None and args.init_checkpoint is None),
+        freeze_visual_backbone=True,
     )
 
 
@@ -489,25 +545,7 @@ def main():
     if train_dataset.action_dim != normalizer.action_dim:
         raise ValueError("Dataset and normalizer action dimensions do not match")
 
-    model_class = (
-        HistorySpatialSoftmaxVisualBCPolicy if args.history_size > 1
-        else SpatialSoftmaxVisualBCPolicy
-    )
-    history_kwargs = (
-        {"history_size": args.history_size, "rgb_history": args.rgb_history}
-        if args.history_size > 1 else {}
-    )
-    model = model_class(
-        **history_kwargs,
-        camera_names=args.camera_names,
-        action_dim=normalizer.action_dim,
-        proprio_dim=normalizer.proprio_dim,
-        spatial_channels=args.spatial_channels,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-        pretrained_visual=(args.pretrained_visual and args.resume is None and args.init_checkpoint is None),
-        freeze_visual_backbone=True,
-    ).to(device)
+    model = build_policy(args, normalizer).to(device)
     if args.init_checkpoint is not None:
         checkpoint = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
         validate_model_checkpoint(args, model, checkpoint)
@@ -529,19 +567,24 @@ def main():
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     print(f"Device: {device}")
-    print("Policy: Spatial-softmax Visual-BC (no language)")
+    print(f"Policy: {model.policy_type} (no language)")
     print(f"History size: {args.history_size}; RGB history: {args.rgb_history}")
     print(f"Fixed target color: {args.fixed_target_color}")
     print(f"Cameras: {', '.join(args.camera_names)}")
     print(f"Proprio dimension: {normalizer.proprio_dim}")
-    print(f"Layer3 unfreeze epoch: {args.unfreeze_layer3_epoch}; "
-          f"head LR: {args.learning_rate}; backbone LR: {args.backbone_learning_rate}; "
-          "BatchNorm statistics frozen")
-    print(
-        f"Spatial channels per camera: {args.spatial_channels}; "
-        f"MLP: {args.hidden_dim} -> {args.hidden_dim}; "
-        f"trainable parameters: {trainable_parameters:,}"
-    )
+    if isinstance(model, SmallCNNVisualBCPolicy):
+        print(f"Small CNN: fully trainable from scratch; LR: {args.learning_rate}; "
+              f"features per camera: {model.visual_encoder.output_dim}; "
+              f"MLP: {model.hidden_dims}; trainable parameters: {trainable_parameters:,}")
+    else:
+        print(f"Layer3 unfreeze epoch: {args.unfreeze_layer3_epoch}; "
+              f"head LR: {args.learning_rate}; backbone LR: {args.backbone_learning_rate}; "
+              "BatchNorm statistics frozen")
+        print(
+            f"Spatial channels per camera: {args.spatial_channels}; "
+            f"MLP: {args.hidden_dim} -> {args.hidden_dim}; "
+            f"trainable parameters: {trainable_parameters:,}"
+        )
     print(
         f"Samples: train={len(train_dataset)}, val={len(val_dataset)}; "
         f"loader batches: train={len(train_loader)}, val={len(val_loader)}"
@@ -569,7 +612,7 @@ def main():
             "global_step": global_step,
             "train": train_metrics,
             "val": val_metrics,
-            "layer3_trainable": model.visual_encoder._layer3_trainable,
+            "layer3_trainable": layer3_trainable(model),
             "learning_rates": {group["name"]: group["lr"] for group in optimizer.param_groups},
         })
         improved_val = val_metrics["loss"] < best_val_loss

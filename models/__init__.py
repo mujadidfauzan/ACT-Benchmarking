@@ -9,6 +9,8 @@ _EXPORTS = {
     "VISUAL_FUSION_MODES": ("models.language_bc", "VISUAL_FUSION_MODES"),
     "LanguageBCPolicy": ("models.language_bc", "LanguageBCPolicy"),
     "ResNet18VisualEncoder": ("models.visual_encoder", "ResNet18VisualEncoder"),
+    "SmallCNNVisualEncoder": ("models.small_cnn_visual_encoder", "SmallCNNVisualEncoder"),
+    "SmallCNNVisualBCPolicy": ("models.small_cnn_visual_bc", "SmallCNNVisualBCPolicy"),
     "VISUAL_BC_FUSION_MODES": ("models.visual_bc", "VISUAL_BC_FUSION_MODES"),
     "LearnedSpatialAttention": ("models.visual_bc", "LearnedSpatialAttention"),
     "HistoryVisualBCPolicy": ("models.visual_bc", "HistoryVisualBCPolicy"),

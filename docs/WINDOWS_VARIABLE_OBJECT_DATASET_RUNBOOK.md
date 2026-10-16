@@ -456,3 +456,93 @@ python -m scripts.test_layer3_finetuning
 ```
 
 Use the same `scripts.evaluate_visual_bc` command from section 4 with the fine-tuned checkpoint path and a new evaluation output directory. The evaluator loads the updated ResNet weights automatically; it does not need an unfreeze flag. Fine-tuning increases training memory/compute; reducing batch size may be necessary, but changes the sample budget at a fixed 400 batches per epoch.
+
+## 7. Small CNN Visual Encoder From Scratch
+
+This is a separate fixed-red, vision-only experiment using the existing dataset, split, normalizer, MSE on all seven normalized action dimensions, and rollout evaluator. It changes only the visual path and its input connection to the control MLP. There is no language or temporal history, and rotation is still predicted, not fixed to zero.
+
+Both cameras share a fully trainable CNN. Images remain RGB floats in [0, 1], with no ImageNet normalization or pretrained download:
+
+```text
+Each camera: 4 Conv + ReLU -> AdaptiveAvgPool(4, 4) -> Flatten -> Linear -> ReLU -> 256D
+Agentview 256D + eye-in-hand 256D + direct normalized proprio 9D = 521D
+521 -> 1024 -> 1024 -> normalized action 7D
+```
+
+The control hidden layers retain LayerNorm, ReLU, and dropout. Configure widths/depth **in code**, not in the command:
+
+- `models/small_cnn_visual_encoder.py`: `CONV_LAYERS`, `POOL_SIZE`, `FEATURE_DIM`.
+- `models/small_cnn_visual_bc.py`: `CONTROL_HIDDEN_DIMS = (1024, 1024)`.
+
+The checkpoint saves the actual architecture, so evaluation can reconstruct it even after these source defaults change. A changed architecture starts a new run; resuming a checkpoint with different architecture settings is rejected. ResNet checkpoints cannot initialize this CNN.
+
+### Train
+
+Run in Windows CMD with the Conda environment active. The trainer retains its old module name for compatibility; `--visual-encoder small_cnn` selects the new policy. Do not pass `--hidden-dim`, `--spatial-channels`, `--pretrained-visual`, `--unfreeze-layer3-epoch`, or history flags in this mode.
+
+```bat
+python -m scripts.train_spatial_softmax_visual_bc ^
+  --visual-encoder small_cnn ^
+  --dataset data/demos/pick_fixed_red_counts_v02 ^
+  --train-split data/splits/pick_fixed_red_counts_v02_iid/train.jsonl ^
+  --val-split data/splits/pick_fixed_red_counts_v02_iid/val.jsonl ^
+  --normalization data/splits/pick_fixed_red_counts_v02_iid/normalization_eef_gripper_9d.json ^
+  --fixed-target-color red ^
+  --camera-names agentview robot0_eye_in_hand ^
+  --dropout 0.1 ^
+  --no-phase-balanced ^
+  --batches-per-task 400 ^
+  --epochs 200 ^
+  --batch-size 32 ^
+  --image-size 128 ^
+  --learning-rate 0.0001 ^
+  --weight-decay 0.0001 ^
+  --gradient-clip 1.0 ^
+  --num-workers 0 ^
+  --seed 42 ^
+  --no-vertical-flip ^
+  --rollout-eval-every 20 ^
+  --rollout-eval-episodes 20 ^
+  --rollout-eval-seed-offset 0 ^
+  --device cuda ^
+  --output-dir results/small_cnn_visual_bc/pick_red_counts_v02_seed42
+```
+
+The log must show `Policy: small_cnn_visual_bc` and `Small CNN: fully trainable from scratch`. All CNN and control parameters train at LR 0.0001 from the first update. `--no-phase-balanced` retains the existing task-balanced sampler; with just Pick there is no cross-task balancing and phases are not balanced. Phase losses are still reported as diagnostics.
+
+Periodic rollouts use the existing default three-object development scenes. They do not evaluate all variable-count groups. Compare against the ResNet baseline on the same seeds and counts, not training loss alone.
+
+### Resume
+
+Repeat the complete training command above, with the same output directory/settings, and append:
+
+```bat
+  --resume results/small_cnn_visual_bc/pick_red_counts_v02_seed42/latest.pt
+```
+
+Add `^` after the preceding output-directory line when appending this flag. `--epochs` is the final epoch number, not the number of additional epochs. To start a separate experiment from existing Small CNN weights, use `--init-checkpoint <small-cnn-checkpoint>` instead and choose a new output directory.
+
+### Evaluate
+
+The existing evaluator detects Small CNN from the checkpoint; no architecture flag is needed. Use `best_rollout.pt` after a periodic evaluation, or `best_val.pt` when no rollout checkpoint exists:
+
+```bat
+python -m scripts.evaluate_visual_bc ^
+  --checkpoint results/small_cnn_visual_bc/pick_red_counts_v02_seed42/best_rollout.pt ^
+  --normalization data/splits/pick_fixed_red_counts_v02_iid/normalization_eef_gripper_9d.json ^
+  --num-objects 3 ^
+  --episodes 20 ^
+  --seed-offset 10000 ^
+  --record-video ^
+  --log-rollout ^
+  --device cuda ^
+  --output-dir results/small_cnn_visual_bc_evaluation/pick_red_counts_v02_n3
+```
+
+Repeat with `--num-objects 1` and `2`, each with a distinct output directory. For local CPU evaluation, use `--device cpu` and the local checkpoint/normalizer paths.
+
+Offline code tests with synthetic data, no simulator rollouts or downloads:
+
+```bat
+python -m scripts.test_small_cnn_visual_bc
+```

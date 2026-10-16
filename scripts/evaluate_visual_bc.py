@@ -18,6 +18,7 @@ from data.policy_history import PolicyHistory
 from environments.pick_env import PickEnv
 from models.spatial_softmax_visual_bc import SpatialSoftmaxVisualBCPolicy
 from models.history_spatial_softmax_visual_bc import HistorySpatialSoftmaxVisualBCPolicy
+from models.small_cnn_visual_bc import SmallCNNVisualBCPolicy
 from models.visual_bc import HistoryVisualBCPolicy, VisualBCPolicy
 from scripts.evaluate_language_bc import (
     EvaluationVideoRecorder,
@@ -90,12 +91,17 @@ def load_policy(args, device):
         "history_visual_bc",
         "spatial_softmax_visual_bc",
         "history_spatial_softmax_visual_bc",
+        "small_cnn_visual_bc",
     }:
         raise ValueError("Checkpoint is not a supported Visual-BC checkpoint")
     normalizer = PolicyNormalizer.from_json(args.normalization).to(device)
     if int(config.get("proprio_dim", -1)) != normalizer.proprio_dim:
         raise ValueError("Checkpoint and normalizer proprio dimensions do not match")
-    if policy_type in {"spatial_softmax_visual_bc", "history_spatial_softmax_visual_bc"}:
+    if int(config.get("action_dim", normalizer.action_dim)) != normalizer.action_dim:
+        raise ValueError("Checkpoint and normalizer action dimensions do not match")
+    if policy_type == "small_cnn_visual_bc":
+        model = SmallCNNVisualBCPolicy.from_config(config).to(device)
+    elif policy_type in {"spatial_softmax_visual_bc", "history_spatial_softmax_visual_bc"}:
         model_class = (
             HistorySpatialSoftmaxVisualBCPolicy
             if policy_type == "history_spatial_softmax_visual_bc"
@@ -130,9 +136,8 @@ def load_policy(args, device):
         }
     if policy_type == "history_visual_bc":
         model_kwargs["history_size"] = int(config["history_size"])
-    model = model_class(
-        **model_kwargs
-    ).to(device)
+    if policy_type != "small_cnn_visual_bc":
+        model = model_class(**model_kwargs).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     training = checkpoint.get("training_config", {})
