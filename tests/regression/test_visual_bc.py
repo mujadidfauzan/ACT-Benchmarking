@@ -1,6 +1,7 @@
 """Visual-BC contract tests; synthetic episodes and no real simulator execution."""
 
 import io
+import hashlib
 import json
 import math
 import tempfile
@@ -17,7 +18,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from controllers.panda_controller import PandaController
-from data.bc_preparation import prepare_bc_training, load_bc_training, suspicious_camera_frames
+from data.bc_preparation import prepare_bc_training, load_bc_training, suspicious_camera_frames, write_split
 from data.manipulation_dataset import ManipulationDataset, CAMERA_OBSERVATION_KEYS
 from data.normalization import PolicyNormalizer
 from data.episode_io import open_episode, write_episode
@@ -64,6 +65,21 @@ class VisualBCTests(unittest.TestCase):
 
     def prepare(self):
         return prepare_bc_training(self.dataset, self.prepared)
+
+    def test_split_hash_is_platform_independent_without_text_newline_translation(self):
+        path = self.root / "train.jsonl"
+        original_write_text = Path.write_text
+
+        def windows_write_text(target, text, *args, **kwargs):
+            return original_write_text(target, text.replace("\n", "\r\n"), *args, **kwargs)
+
+        entries = [{"task": "pick", "instruction": "angkat kubus", "steps": 3}]
+        with patch.object(Path, "write_text", windows_write_text):
+            digest = write_split(path, entries)
+        content = path.read_bytes()
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+        self.assertEqual(content, (json.dumps(entries[0], sort_keys=True) + "\n").encode("utf-8"))
+        self.assertNotIn(b"\r\n", content)
 
     def command(self, *extra):
         return ["train", "--dataset", str(self.dataset), "--training-dir", str(self.prepared),

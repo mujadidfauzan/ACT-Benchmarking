@@ -82,11 +82,11 @@ def source_digest(dataset, entries):
 
 
 def write_split(path, entries):
-    text = "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in entries)
+    content = "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in entries).encode("utf-8")
     temporary = path.with_suffix(".jsonl.tmp")
-    temporary.write_text(text, encoding="utf-8")
+    temporary.write_bytes(content)
     temporary.replace(path)
-    return hashlib.sha256(text.encode()).hexdigest()
+    return hashlib.sha256(content).hexdigest()
 
 
 def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
