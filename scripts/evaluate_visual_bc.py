@@ -6,21 +6,18 @@ import random
 import time
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import robosuite.macros as macros
 import torch
-from robosuite import load_composite_controller_config
 from robosuite.utils import RandomizationError
 
 from data.normalization import PolicyNormalizer
-from data.policy_history import PolicyHistory
-from environments.pick_env import PickEnv
-from models.spatial_softmax_visual_bc import SpatialSoftmaxVisualBCPolicy
-from models.history_spatial_softmax_visual_bc import HistorySpatialSoftmaxVisualBCPolicy
-from models.small_cnn_visual_bc import SmallCNNVisualBCPolicy
-from models.visual_bc import HistoryVisualBCPolicy, VisualBCPolicy
-from scripts.evaluate_language_bc import (
+from models.visual_bc import VisualBCPolicy
+from scripts.evaluation_utils import (
+    append_jsonl,
+    json_default,
     EvaluationVideoRecorder,
     compose_camera_frame,
     entity_positions,
@@ -29,21 +26,22 @@ from scripts.evaluate_language_bc import (
 
 
 macros.IMAGE_CONVENTION = "opencv"
-DEFAULT_MAX_STEPS = 400
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate fixed-target Visual-BC")
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--normalization", type=Path, required=True)
+    parser.add_argument("--normalization", type=Path, help="Optional verification of embedded checkpoint statistics")
     parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument("--num-seeds", type=int, default=5)
+    parser.add_argument("--seed-step", type=int, default=1)
     parser.add_argument("--seed-offset", type=int, default=0)
     parser.add_argument("--num-cubes", "--num-objects", dest="num_cubes",
-                        type=int, choices=(1, 2, 3, 4), default=3)
+                        type=int, choices=(1, 2, 3, 4))
     parser.add_argument("--image-size", type=int)
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
-    parser.add_argument("--success-hold-steps", type=int, default=5)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--success-hold-steps", type=int)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--record-video", action="store_true")
@@ -63,113 +61,30 @@ def parse_args():
     return parser.parse_args()
 
 
-def json_default(value):
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    raise TypeError(f"Cannot serialize {type(value).__name__}")
-
-
-def append_jsonl(path, value):
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, default=json_default, sort_keys=True) + "\n")
-
-
 def write_jsonl(handle, value):
     handle.write(json.dumps(value, default=json_default, sort_keys=True) + "\n")
 
 
 def load_policy(args, device):
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint.get("model_config", {})
     policy_type = checkpoint.get("policy_type", config.get("policy_type"))
-    if policy_type not in {
-        "visual_bc",
-        "history_visual_bc",
-        "spatial_softmax_visual_bc",
-        "history_spatial_softmax_visual_bc",
-        "small_cnn_visual_bc",
-    }:
-        raise ValueError("Checkpoint is not a supported Visual-BC checkpoint")
-    normalizer = PolicyNormalizer.from_json(args.normalization).to(device)
-    if int(config.get("proprio_dim", -1)) != normalizer.proprio_dim:
-        raise ValueError("Checkpoint and normalizer proprio dimensions do not match")
-    if int(config.get("action_dim", normalizer.action_dim)) != normalizer.action_dim:
-        raise ValueError("Checkpoint and normalizer action dimensions do not match")
-    if policy_type == "small_cnn_visual_bc":
-        model = SmallCNNVisualBCPolicy.from_config(config).to(device)
-    elif policy_type in {"spatial_softmax_visual_bc", "history_spatial_softmax_visual_bc"}:
-        model_class = (
-            HistorySpatialSoftmaxVisualBCPolicy
-            if policy_type == "history_spatial_softmax_visual_bc"
-            else SpatialSoftmaxVisualBCPolicy
-        )
-        model_kwargs = {
-            "camera_names": tuple(config["camera_names"]),
-            "action_dim": normalizer.action_dim,
-            "proprio_dim": normalizer.proprio_dim,
-            "spatial_channels": int(config["spatial_channels"]),
-            "hidden_dim": int(config["hidden_dim"]),
-            "dropout": float(config.get("dropout", 0.1)),
-            "pretrained_visual": False,
-            "freeze_visual_backbone": True,
-        }
-        if policy_type == "history_spatial_softmax_visual_bc":
-            model_kwargs.update(history_size=int(config["history_size"]),
-                                rgb_history=bool(config["rgb_history"]))
-    else:
-        model_class = (
-            HistoryVisualBCPolicy
-            if policy_type == "history_visual_bc"
-            else VisualBCPolicy
-        )
-        model_kwargs = {
-            "visual_fusion": config["visual_fusion"],
-            "camera_names": tuple(config["camera_names"]),
-            "action_dim": normalizer.action_dim,
-            "proprio_dim": normalizer.proprio_dim,
-            "pretrained_visual": False,
-            "freeze_visual_backbone": True,
-        }
-    if policy_type == "history_visual_bc":
-        model_kwargs["history_size"] = int(config["history_size"])
-    if policy_type != "small_cnn_visual_bc":
-        model = model_class(**model_kwargs).to(device)
+    if policy_type != "visual_bc" or checkpoint.get("data_config", {}).get("method") != "visual_bc":
+        raise ValueError("Only visual_bc checkpoints are supported; use the earlier code version for old Visual-BC models")
+    prepared = checkpoint["data_config"]
+    if args.image_size is not None and args.image_size != 128:
+        raise ValueError("Visual-BC uses 128x128 policy images")
+    normalizer = PolicyNormalizer.from_statistics(prepared["normalization"]).to(device)
+    if getattr(args, "normalization", None) is not None:
+        supplied = PolicyNormalizer.from_json(args.normalization).to(device)
+        if supplied.proprio_keys != normalizer.proprio_keys or any(
+            not torch.equal(value, supplied.state_dict()[key]) for key, value in normalizer.state_dict().items()
+        ):
+            raise ValueError("Supplied normalization differs from checkpoint statistics")
+    model = VisualBCPolicy.from_config(config).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
-    training = checkpoint.get("training_config", {})
-    image_size = args.image_size or int(training.get("image_size", 224))
-    target_color = config.get("fixed_target_color")
-    if target_color is None:
-        raise ValueError("Checkpoint does not define fixed_target_color")
-    return model, normalizer, checkpoint, image_size, target_color
-
-
-def build_environment(
-    seed, num_cubes, render, camera_names, target_color, max_steps
-):
-    config = load_composite_controller_config(controller="BASIC")
-    return PickEnv(
-        robots="Panda",
-        controller_configs=config,
-        num_objects=num_cubes,
-        fixed_target_color=target_color,
-        instruction_split="train",
-        has_renderer=render,
-        has_offscreen_renderer=True,
-        use_camera_obs=True,
-        use_object_obs=True,
-        camera_names=list(camera_names),
-        camera_heights=[256] * len(camera_names),
-        camera_widths=[256] * len(camera_names),
-        control_freq=20,
-        horizon=max_steps,
-        hard_reset=False,
-        seed=seed,
-    )
+    return model, normalizer, checkpoint, 128, prepared["fixed_target_color"]
 
 
 def evaluate_episode(
@@ -216,7 +131,7 @@ def evaluate_episode(
             },
         )
 
-    initial_positions = entity_positions(env, "pick")
+    initial_positions = entity_positions(env)
     maximum_lifts = {object_id: 0.0 for object_id in env.object_ids}
     success_streak = 0
     clipped_values = 0
@@ -225,11 +140,8 @@ def evaluate_episode(
         np.asarray(value, dtype=np.float32) for value in env.action_spec
     )
     started = time.monotonic()
-    uses_history = isinstance(model, (HistoryVisualBCPolicy, HistorySpatialSoftmaxVisualBCPolicy))
-    history = (
-        PolicyHistory(model.history_size, getattr(model, "rgb_history", False))
-        if uses_history else None
-    )
+    hidden = None
+    previous_gripper = -1.0
     try:
         for step in range(1, max_steps + 1):
             eef_before = np.asarray(
@@ -247,29 +159,20 @@ def evaluate_episode(
                 normalizer.proprio_keys,
                 model.camera_names,
             )
-            if uses_history:
-                policy_inputs = history.observe(camera_inputs, proprio, normalizer)
-                camera_inputs = {}
-                proprio_count = len(history.proprio)
-                action_count = len(history.actions)
-            else:
-                proprio_count = 1
-                action_count = 0
-                policy_inputs = {
-                    "proprio": normalizer.normalize_proprio(proprio)
-                }
+            policy_inputs = {"proprio": normalizer.normalize_proprio(proprio)}
             with torch.inference_mode():
-                prediction = model(
+                output = model.step(
                     **camera_inputs,
                     **policy_inputs,
-                )["action"]
+                    previous_gripper=previous_gripper,
+                    hidden=hidden,
+                )
+                prediction = output["action"]
+                hidden = output.get("hidden")
                 raw_action = normalizer.denormalize_action(prediction)[0]
             raw_action = raw_action.cpu().numpy().astype(np.float32)
             action = np.clip(raw_action, action_low, action_high)
-            if uses_history:
-                history.record_action(
-                    torch.from_numpy(action.copy()).to(device=device)
-                )
+            previous_gripper = float(action[6])
             clipped_mask = action != raw_action
             clipped_values += int(np.count_nonzero(clipped_mask))
             action_values += action.size
@@ -314,11 +217,6 @@ def evaluate_episode(
                         "translation_action": action[:3],
                         "rotation_action": action[3:6],
                         "gripper_action": float(action[6]),
-                        "proprio_history_valid": proprio_count,
-                        "action_history_valid": action_count,
-                        "image_history_valid": (
-                            proprio_count if getattr(model, "rgb_history", False) else 1
-                        ),
                         "eef_position_after": eef_after,
                         "target_position_after": target_after,
                         "eef_target_xy_distance_after": float(
@@ -335,7 +233,8 @@ def evaluate_episode(
                         "done": bool(done),
                     },
                 )
-            if env._check_success():
+            lifted = env.get_object_position(target_id)[2] - initial_positions["objects"][target_id][2] >= .18
+            if env._check_success() and lifted:
                 success_streak += 1
                 if success_streak >= success_hold_steps:
                     return {
@@ -347,7 +246,7 @@ def evaluate_episode(
                         "target_maximum_lift": maximum_lifts[target_id],
                         "action_clip_fraction": clipped_values / action_values,
                         "initial_positions": initial_positions,
-                        "final_positions": entity_positions(env, "pick"),
+                        "final_positions": entity_positions(env),
                         "elapsed_seconds": time.monotonic() - started,
                         "video_path": str(video_path) if video_path else None,
                         "rollout_path": str(rollout_path) if rollout_path else None,
@@ -382,216 +281,114 @@ def evaluate_episode(
         "target_maximum_lift": maximum_lifts[target_id],
         "action_clip_fraction": clipped_values / max(action_values, 1),
         "initial_positions": initial_positions,
-        "final_positions": entity_positions(env, "pick"),
+        "final_positions": entity_positions(env),
         "elapsed_seconds": time.monotonic() - started,
         "video_path": str(video_path) if video_path else None,
         "rollout_path": str(rollout_path) if rollout_path else None,
     }
 
 
-def run_rollout_evaluation(
-    model,
-    normalizer,
-    *,
-    image_size,
-    device,
-    target_color,
-    episodes=20,
-    seed_offset=0,
-    num_cubes=3,
-    max_steps=DEFAULT_MAX_STEPS,
-    success_hold_steps=5,
-):
-    """Run deterministic development rollouts without creating artifacts."""
+def build_environment(seed, num_objects, render, model, prepared, max_steps):
+    # Use the same factory/controller/reset settings as collection, not an eval-only scene.
+    from scripts.record_demonstrations import build_task
 
-    if min(episodes, max_steps, success_hold_steps) <= 0:
-        raise ValueError("Episode and step counts must be positive")
-    seed_start = 11000 + int(seed_offset)
-    was_training = model.training
-    model.eval()
-    env = build_environment(
-        seed_start,
-        num_cubes,
-        False,
-        model.camera_names,
-        target_color,
-        max_steps,
-    )
-    successes = 0
+    size = int(prepared["camera_sizes"][0][0])
+    collection = prepared.get("environment_configs", {}).get("pick", {})
+    args = SimpleNamespace(task="pick", num_cubes=num_objects, fixed_target_color=prepared["fixed_target_color"],
+                           camera_names=list(model.camera_names), camera_obs=True, render=render,
+                           instruction_split="train", image_size=size, seed=seed,
+                           max_steps=max_steps,
+                           environment_kwargs=collection.get("environment_kwargs", {}),
+                           controller_config=collection.get("controller_config"),
+                           rotation_mode=collection.get("rotation_mode", prepared.get("rotation_mode", "align_yaw")),
+                           yaw_range_deg=collection.get("yaw_range_deg"),
+                           joint_noise_degrees=collection.get("joint_noise_degrees", 3))
+    env, _ = build_task(args, num_objects=num_objects, seed=seed)
+    return env
+
+
+def evaluate_policy(args, model, normalizer, checkpoint, device):
+    prepared = checkpoint["data_config"]
+    args.max_steps = 500 if args.max_steps is None else args.max_steps
+    args.success_hold_steps = 20 if args.success_hold_steps is None else args.success_hold_steps
+    if args.success_hold_steps != 20:
+        raise ValueError("Pick evaluation requires 20 consecutive success steps")
+    if min(args.episodes, args.num_seeds, args.seed_step, args.max_steps) <= 0:
+        raise ValueError("Episodes, seeds, and maximum steps must be positive")
+    num_objects = args.num_cubes or max(value[0] for value in prepared["scene_counts"])
+    seeds = [args.seed + args.seed_offset + i * args.seed_step for i in range(args.num_seeds)]
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    attempts_path = args.output_dir / "pick_attempts.jsonl"
+    if attempts_path.exists():
+        raise FileExistsError(attempts_path)
+    seed_results = []
     failures = Counter()
-    clip_fractions = []
+    global_episode = 0
     total_steps = 0
-    try:
-        for episode in range(episodes):
-            try:
-                result = evaluate_episode(
-                    env,
-                    model,
-                    normalizer,
-                    image_size,
-                    device,
-                    max_steps,
-                    success_hold_steps,
-                    False,
-                    episode,
-                    None,
-                    20.0,
-                    target_color,
-                )
-            except RandomizationError as error:
-                result = {
-                    "success": False,
-                    "failure_reason": "scene_sampling_failure",
-                    "steps": 0,
-                    "error_type": type(error).__name__,
-                    "error_message": str(error),
-                }
-            successes += int(result["success"])
-            total_steps += int(result["steps"])
-            if result["failure_reason"]:
-                failures[result["failure_reason"]] += 1
-            if "action_clip_fraction" in result:
-                clip_fractions.append(result["action_clip_fraction"])
-    finally:
-        env.close()
-        model.train(was_training)
-    return {
-        "seed_start": seed_start,
-        "attempted": episodes,
-        "successful": successes,
-        "failed": episodes - successes,
-        "success_rate": successes / episodes,
-        "failure_counts": dict(sorted(failures.items())),
-        "mean_steps": total_steps / episodes,
-        "mean_action_clip_fraction": float(np.mean(clip_fractions)),
-    }
+    for seed in seeds:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        env = build_environment(seed, num_objects, args.render, model, prepared, args.max_steps)
+        successful = 0
+        try:
+            for episode in range(args.episodes):
+                video_path = ((args.video_dir or args.output_dir / "videos") / f"pick_seed{seed}_episode{episode:03d}.mp4"
+                              if args.record_video else None)
+                rollout_path = ((args.rollout_dir or args.output_dir / "rollouts") / f"pick_seed{seed}_episode{episode:03d}.jsonl"
+                                if args.log_rollout else None)
+                try:
+                    result = evaluate_episode(env, model, normalizer, 128, device, args.max_steps, 20,
+                                              args.render, global_episode, video_path, args.video_fps,
+                                              prepared["fixed_target_color"], rollout_path)
+                except Exception as error:
+                    result = {"success": False, "failure_reason": "scene_sampling_failure" if isinstance(error, RandomizationError) else "exception",
+                              "steps": 0, "error_type": type(error).__name__, "error_message": str(error)}
+                result.update(seed=seed, episode=episode, global_episode=global_episode, task="pick", num_objects=num_objects)
+                append_jsonl(attempts_path, result)
+                successful += int(result["success"])
+                total_steps += result["steps"]
+                if result.get("failure_reason"):
+                    failures[result["failure_reason"]] += 1
+                global_episode += 1
+                print(f"Seed {seed} episode {episode + 1}/{args.episodes}: success={result['success']} failure={result.get('failure_reason')}")
+        finally:
+            env.close()
+        seed_results.append({"seed": seed, "successful": successful, "attempted": args.episodes,
+                             "success_rate": successful / args.episodes})
+    rates = np.asarray([value["success_rate"] for value in seed_results])
+    successes = sum(value["successful"] for value in seed_results)
+    summary = {"policy_type": model.policy_type, "checkpoint": str(args.checkpoint),
+               "checkpoint_epoch": checkpoint["epoch"], "checkpoint_best_val_loss": checkpoint["best_val_loss"],
+               "device": str(device), "camera_names": list(model.camera_names), "num_objects": num_objects,
+               "temporal": model.temporal, "predict_orientation": model.predict_orientation,
+               "rotation_mode": prepared.get("rotation_mode", "align_yaw" if model.predict_orientation else "none"),
+               "yaw_range_deg": prepared.get("environment_configs", {}).get("pick", {}).get("yaw_range_deg"),
+               "image_convention": "opencv", "vertical_flip": False, "image_size": 128,
+               "episodes_per_seed": args.episodes, "seeds": seeds, "seed_results": seed_results,
+               "lift_threshold_m": .18, "success_hold_steps": 20,
+               "mean_seed_success_rate": float(rates.mean()),
+               "std_seed_success_rate_sample": float(rates.std(ddof=1)) if len(rates) > 1 else 0.,
+               "overall_success_rate": successes / global_episode,
+               "tasks": [{"task": "pick", "successful": successes, "attempted": global_episode,
+                          "failed": global_episode - successes, "success_rate": successes / global_episode,
+                          "failure_counts": dict(failures), "mean_steps": total_steps / global_episode}]}
+    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(f"Evaluation: {successes}/{global_episode} ({successes / global_episode:.1%}), "
+          f"seed mean={rates.mean():.1%}, sample SD={summary['std_seed_success_rate_sample']:.1%}")
+    return summary
 
 
 def main():
     args = parse_args()
-    if min(args.episodes, args.max_steps, args.success_hold_steps) <= 0:
-        raise ValueError("Episode and step counts must be positive")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    model, normalizer, checkpoint, image_size, target_color = load_policy(args, device)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    attempts_path = args.output_dir / "pick_attempts.jsonl"
-    if attempts_path.exists():
-        raise FileExistsError(f"Output already exists: {attempts_path}")
-
-    env = build_environment(
-        11000 + args.seed_offset,
-        args.num_cubes,
-        args.render,
-        model.camera_names,
-        target_color,
-        args.max_steps,
-    )
-    successes = 0
-    failures = Counter()
-    clip_fractions = []
-    total_steps = 0
-    try:
-        for episode in range(args.episodes):
-            video_path = None
-            if args.record_video:
-                video_root = args.video_dir or (args.output_dir / "videos")
-                video_path = video_root / f"pick_episode_{episode:03d}.mp4"
-            rollout_path = None
-            if args.log_rollout:
-                rollout_root = args.rollout_dir or (args.output_dir / "rollouts")
-                rollout_path = rollout_root / f"pick_episode_{episode:03d}.jsonl"
-            try:
-                result = evaluate_episode(
-                    env,
-                    model,
-                    normalizer,
-                    image_size,
-                    device,
-                    args.max_steps,
-                    args.success_hold_steps,
-                    args.render,
-                    episode,
-                    video_path,
-                    args.video_fps,
-                    target_color,
-                    rollout_path,
-                )
-            except RandomizationError as error:
-                result = {
-                    "success": False,
-                    "failure_reason": "scene_sampling_failure",
-                    "steps": 0,
-                    "error_type": type(error).__name__,
-                    "error_message": str(error),
-                }
-            result.update({"episode": episode, "task": "pick", "num_objects": args.num_cubes})
-            append_jsonl(attempts_path, result)
-            successes += int(result["success"])
-            total_steps += int(result["steps"])
-            if result["failure_reason"]:
-                failures[result["failure_reason"]] += 1
-            if "action_clip_fraction" in result:
-                clip_fractions.append(result["action_clip_fraction"])
-            print(
-                f"[pick] {episode + 1}/{args.episodes} "
-                f"success={result['success']} steps={result['steps']} "
-                f"failure={result['failure_reason']}"
-            )
-    finally:
-        env.close()
-
-    task_summary = {
-        "task": "pick",
-        "num_objects": args.num_cubes,
-        "attempted": args.episodes,
-        "successful": successes,
-        "failed": args.episodes - successes,
-        "success_rate": successes / args.episodes,
-        "failure_counts": dict(sorted(failures.items())),
-        "mean_steps": total_steps / args.episodes,
-        "mean_action_clip_fraction": float(np.mean(clip_fractions)),
-        "attempts_log": attempts_path.name,
-    }
-    summary = {
-        "policy_type": checkpoint.get(
-            "policy_type", checkpoint.get("model_config", {}).get("policy_type")
-        ),
-        "checkpoint": str(args.checkpoint.resolve()),
-        "checkpoint_epoch": int(checkpoint["epoch"]),
-        "checkpoint_best_val_loss": float(checkpoint["best_val_loss"]),
-        "fixed_target_color": target_color,
-        "num_objects": args.num_cubes,
-        "camera_names": list(model.camera_names),
-        "visual_fusion": model.visual_fusion,
-        "proprio_dim": normalizer.proprio_dim,
-        "history_size": getattr(model, "history_size", 1),
-        "rgb_history": getattr(model, "rgb_history", False),
-        "image_size": image_size,
-        "device": str(device),
-        "seed_start": 11000 + args.seed_offset,
-        "record_video": args.record_video,
-        "log_rollout": args.log_rollout,
-        "rollout_dir": (
-            str(args.rollout_dir or (args.output_dir / "rollouts"))
-            if args.log_rollout
-            else None
-        ),
-        "tasks": [task_summary],
-    }
-    (args.output_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    print(
-        f"Evaluation summary: pick {successes}/{args.episodes} "
-        f"({successes / args.episodes:.1%}) failures={dict(failures)}"
-    )
-    print(f"Saved: {args.output_dir / 'summary.json'}")
+    model, normalizer, checkpoint, _, _ = load_policy(args, device)
+    return evaluate_policy(args, model, normalizer, checkpoint, device)
 
 
 if __name__ == "__main__":

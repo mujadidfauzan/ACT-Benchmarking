@@ -1,5 +1,3 @@
-from collections import OrderedDict
-
 import numpy as np
 from robosuite.environments.manipulation.manipulation_env import (
     ManipulationEnv,
@@ -21,14 +19,13 @@ from robosuite.utils.observables import (
     sensor,
 )
 from robosuite.utils.placement_samplers import (
-    SequentialCompositeSampler,
     UniformRandomSampler,
 )
 from robosuite.utils.transform_utils import (
     convert_quat,
 )
 
-from language.instruction_generator import generate_instruction
+from environments.instructions import generate_instruction
 
 from environments.entity_utils import (
     COLOR_PALETTE,

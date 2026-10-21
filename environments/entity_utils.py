@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from language.instruction_generator import generate_instruction
+from environments.instructions import generate_instruction
 
 
 COLOR_PALETTE = {

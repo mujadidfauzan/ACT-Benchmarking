@@ -175,7 +175,7 @@ def circular_stats(rows, field):
 
 def summarize(rows_by_split, entries_by_split):
     summary = {"splits": {}}
-    for split in SPLITS:
+    for split in rows_by_split:
         rows = rows_by_split[split]
         if not rows:
             raise ValueError(f"Split {split} contains no object poses")
@@ -214,7 +214,7 @@ def write_report(path, summary):
     overview = []
     position_rows = []
     orientation_rows = []
-    for split in SPLITS:
+    for split in summary["splits"]:
         values = summary["splits"][split]
         overview.append(
             [
@@ -282,8 +282,8 @@ def plot_distributions(output, rows_by_split):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9), constrained_layout=True)
-    for column, split in enumerate(SPLITS):
+    fig, axes = plt.subplots(2, len(rows_by_split), figsize=(5 * len(rows_by_split), 9), constrained_layout=True, squeeze=False)
+    for column, split in enumerate(rows_by_split):
         rows = rows_by_split[split]
         axis = axes[0, column]
         colors = sorted({row["color"] for row in rows})
@@ -332,7 +332,7 @@ def plot_distributions(output, rows_by_split):
         if math.isclose(low, high):
             low, high = low - 0.5, high + 0.5
         bins = np.linspace(low, high, 25)
-        for split in SPLITS:
+        for split in rows_by_split:
             axis.hist(
                 [row[field] for row in rows_by_split[split]],
                 bins=bins,
@@ -362,6 +362,8 @@ def main():
     for split in SPLITS:
         split_path = args.split_dir / f"{split}.jsonl"
         if not split_path.is_file():
+            if split == "test":
+                continue
             raise FileNotFoundError(f"Missing split manifest: {split_path}")
         entries = read_jsonl(split_path)
         rows = []
@@ -385,7 +387,7 @@ def main():
     plot_distributions(args.output, rows_by_split)
 
     print("Initial object pose audit complete")
-    for split in SPLITS:
+    for split in summary["splits"]:
         values = summary["splits"][split]
         print(
             f"  {split:5s}: {values['episodes']} episodes, "

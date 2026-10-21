@@ -94,7 +94,12 @@ class TrajectoryRecorder:
             except ValueError:
                 continue
 
-        np.savez_compressed(path, **payload)
+        if path.exists():
+            raise FileExistsError(f"Episode already exists: {path}")
+        temporary = path.with_suffix(".npz.tmp")
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, **payload)
+        temporary.replace(path)
         return {
             "path": str(path),
             "steps": len(self.actions),

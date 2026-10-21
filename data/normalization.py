@@ -65,9 +65,15 @@ class PolicyNormalizer(nn.Module):
         path = Path(path)
         with path.open(encoding="utf-8") as handle:
             statistics = json.load(handle)
+        return cls.from_statistics(statistics, source_path=path.resolve(), epsilon=epsilon)
+
+    @classmethod
+    def from_statistics(cls, statistics, *, source_path=None, epsilon=1e-6):
+        if statistics.get("normalization_type") != "visual_bc":
+            raise ValueError("Expected visual_bc normalization statistics; collect a new dataset")
         try:
-            proprio = statistics["task_balanced_proprio"]
-            action = statistics["task_balanced_action"]
+            proprio = statistics["proprio"]
+            action = statistics["action"]
             proprio_mean = proprio["mean"]
             proprio_std = proprio["std"]
             action_mean = action["mean"]
@@ -75,7 +81,7 @@ class PolicyNormalizer(nn.Module):
             proprio_keys = proprio["keys"]
         except KeyError as error:
             raise ValueError(
-                f"{path} does not contain task-balanced normalization statistics"
+                "Missing proprio/action normalization statistics"
             ) from error
         return cls(
             proprio_mean=proprio_mean,
@@ -83,7 +89,7 @@ class PolicyNormalizer(nn.Module):
             action_mean=action_mean,
             action_std=action_std,
             proprio_keys=proprio_keys,
-            source_path=path.resolve(),
+            source_path=source_path,
             split_sha256=statistics.get("split_sha256"),
             epsilon=epsilon,
         )

@@ -11,7 +11,7 @@ from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import convert_quat
 
 from environments.entity_utils import semantic_split_for
-from language.instruction_generator import generate_instruction
+from environments.instructions import generate_instruction
 
 
 class StackEnv(ManipulationEnv):

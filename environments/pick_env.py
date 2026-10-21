@@ -1,7 +1,5 @@
-import numpy as np
-
 from environments.entity_utils import COLOR_PALETTE, sample_unique_colors, semantic_split_for
-from language.instruction_generator import generate_instruction
+from environments.instructions import generate_instruction
 from environments.stack_env import StackEnv
 
 

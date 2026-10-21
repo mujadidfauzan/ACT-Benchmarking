@@ -9,12 +9,14 @@ from robosuite import load_composite_controller_config
 
 from controllers.panda_controller import PandaController
 from environments.pick_env import PickEnv
+from environments.pick_config import DEFAULT_YAW_RANGE_DEG, add_pick_arguments, validate_pick_arguments, validate_pick_settings
 from environments.place_env import PlaceEnv
 from environments.stack_env import StackEnv
 from environments.scene_counts import (
     add_count_arguments, balanced_count_plan, count_label, count_options,
 )
 from experts.pick_expert import PickExpert
+from experts.grasp_expert import GraspExpert
 from experts.place_expert import PlaceExpert
 from experts.stack_expert import StackExpert
 
@@ -52,13 +54,16 @@ def parse_args():
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--enforce-gates", action="store_true")
     add_count_arguments(parser)
+    add_pick_arguments(parser)
     parser.add_argument("--fixed-target-color", choices=tuple(PickEnv.COLOR_PALETTE))
     return parser.parse_args()
 
 
 def build_task(task, seed, instruction_split, render, num_objects=3,
-               num_receptacles=3, fixed_target_color=None):
+               num_receptacles=3, fixed_target_color=None, rotation_mode="align_yaw",
+               yaw_range_deg=DEFAULT_YAW_RANGE_DEG):
     config = load_composite_controller_config(controller="BASIC")
+    config["body_parts"]["right"].update(type="OSC_POSE", input_type="delta", input_ref_frame="world", impedance_mode="fixed")
     common = {
         "robots": "Panda",
         "controller_configs": config,
@@ -70,10 +75,12 @@ def build_task(task, seed, instruction_split, render, num_objects=3,
         "control_freq": 20,
         "hard_reset": False,
         "seed": seed,
+        "initialization_noise": {"magnitude": float(np.deg2rad(3)), "type": "uniform"},
     }
     if task == "pick":
+        validate_pick_settings(rotation_mode, yaw_range_deg)
         env = PickEnv(num_objects=num_objects, fixed_target_color=fixed_target_color,
-                      horizon=1500, **common)
+                      yaw_range=tuple(np.deg2rad(yaw_range_deg)), horizon=500, **common)
     elif task == "place":
         env = PlaceEnv(num_objects=num_objects, num_receptacles=num_receptacles,
                        horizon=3000, **common)
@@ -81,13 +88,13 @@ def build_task(task, seed, instruction_split, render, num_objects=3,
         env = StackEnv(num_cubes=num_objects, horizon=6000, **common)
 
     controller = PandaController(env)
-    pick_expert = PickExpert(controller)
+    grasp_expert = GraspExpert(controller)
     if task == "pick":
-        expert = pick_expert
+        expert = PickExpert(controller, rotation_mode=rotation_mode)
     elif task == "place":
-        expert = PlaceExpert(controller, pick_expert)
+        expert = PlaceExpert(controller, grasp_expert)
     else:
-        expert = StackExpert(controller, pick_expert)
+        expert = StackExpert(controller, grasp_expert)
     return env, expert
 
 
@@ -175,6 +182,8 @@ def benchmark_task(
     object_counts=(3,),
     receptacle_counts=(None,),
     fixed_target_color=None,
+    rotation_mode="align_yaw",
+    yaw_range_deg=DEFAULT_YAW_RANGE_DEG,
 ):
     attempts_path = run_dir / f"{task}_attempts.jsonl"
     successes = 0
@@ -201,9 +210,12 @@ def benchmark_task(
             steps = 0
             try:
                 env, expert = build_task(task, seed, instruction_split, render,
-                                         num_objects, num_receptacles, fixed_target_color)
+                                         num_objects, num_receptacles, fixed_target_color,
+                                         rotation_mode, yaw_range_deg)
                 observation = env.reset()
                 metadata = env.get_task_metadata()
+                metadata = {**metadata, "rotation_mode": rotation_mode, "control_orientation": rotation_mode != "none",
+                            "yaw_range_deg": list(yaw_range_deg)}
                 initial_scene = snapshot_scene(observation)
                 target_state = target_snapshot(task, env, metadata)
                 observation, info = run_expert(
@@ -290,6 +302,7 @@ def benchmark_task(
 
 def main():
     args = parse_args()
+    args.yaw_range_deg = validate_pick_arguments(args)
     if args.episodes <= 0:
         raise ValueError("episodes must be positive")
     if args.fixed_target_color is not None and args.task != "pick":
@@ -312,6 +325,8 @@ def main():
             args.seed_offset,
             *configurations[task],
             args.fixed_target_color,
+            args.rotation_mode,
+            args.yaw_range_deg,
         )
         for task in tasks
     ]

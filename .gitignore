@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 
 data/demos/
+data/splits/
 results/
 checkpoints/
 videos/
@@ -10,3 +11,16 @@ videos/
 .env
 .vscode/
 .idea/
+
+# OS/editor and test artifacts
+.DS_Store
+Thumbs.db
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Simulator logs and ad-hoc camera exports
+MUJOCO_LOG.TXT
+mujoco_log.txt
+/agentview*.png
+/robot0_eye_in_hand*.png

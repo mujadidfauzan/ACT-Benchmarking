@@ -1,4 +1,4 @@
-"""Train fixed-target Visual-BC from RGB and proprioception."""
+"""Visual-BC training: complete shuffled epochs and motion MSE + gripper BCE."""
 
 import argparse
 import random
@@ -7,110 +7,29 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 
-from data.manipulation_dataset import CAMERA_OBSERVATION_KEYS
+from data.bc_preparation import load_bc_training, prepare_bc_training, save_json
+from data.manipulation_dataset import CAMERA_OBSERVATION_KEYS, EpisodeSequenceDataset, ManipulationDataset
 from data.normalization import PolicyNormalizer
-from models.visual_bc import VISUAL_BC_FUSION_MODES, VisualBCPolicy
-from scripts.train_language_bc import (
-    LossMeter,
-    build_loaders,
-    format_metrics,
-    json_value,
-    resolve_device,
-    save_checkpoint,
-    save_json,
-)
+from models.visual_bc import VisualBCPolicy
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train fixed-target Visual-BC")
+    parser = argparse.ArgumentParser(description="Train Visual-BC from automatically prepared demos")
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--train-split", type=Path, required=True)
-    parser.add_argument("--val-split", type=Path, required=True)
-    parser.add_argument("--normalization", type=Path, required=True)
-    parser.add_argument("--fixed-target-color", default="red")
-    parser.add_argument(
-        "--visual-fusion",
-        choices=VISUAL_BC_FUSION_MODES,
-        default="spatial_attention",
-    )
-    parser.add_argument(
-        "--camera-names",
-        nargs="+",
-        choices=tuple(CAMERA_OBSERVATION_KEYS),
-        default=["agentview"],
-    )
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--cache-size", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gradient-clip", type=float, default=1.0)
-    parser.add_argument(
-        "--phase-balanced",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Balance training batches across expert phases",
-    )
-    parser.add_argument(
-        "--batches-per-phase",
-        type=int,
-        help="Batches sampled for each phase when --phase-balanced is active",
-    )
-    parser.add_argument(
-        "--batches-per-task",
-        type=int,
-        help="Batches sampled for each task when phase balancing is disabled",
-    )
-    parser.add_argument("--max-train-batches", type=int)
-    parser.add_argument("--max-val-batches", type=int)
-    parser.add_argument("--log-every", type=int, default=25)
-    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--training-dir", type=Path)
+    parser.add_argument("--output-dir", "--output", dest="output_dir", type=Path, required=True)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, help="Frames per batch (default 128), or temporal windows (default 8)")
+    parser.add_argument("--temporal", action="store_true", help="Use a GRU with RGB/proprio history and previous gripper input")
+    parser.add_argument("--sequence-length", type=int, help="Temporal window length (default 16)")
+    parser.add_argument("--sequence-stride", type=int, help="Temporal window stride (default 8)")
+    parser.add_argument("--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--pretrained-visual", action="store_true")
-    parser.add_argument("--no-vertical-flip", action="store_true")
+    parser.add_argument("--resume", type=Path)
     return parser.parse_args()
-
-
-def validate_args(args):
-    for name in ("epochs", "batch_size", "image_size", "log_every"):
-        if getattr(args, name) <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.image_size < 32:
-        raise ValueError("--image-size must be at least 32")
-    if args.learning_rate <= 0 or args.weight_decay < 0 or args.gradient_clip < 0:
-        raise ValueError("Invalid optimizer configuration")
-    for name in (
-        "num_workers",
-        "cache_size",
-        "batches_per_phase",
-        "batches_per_task",
-        "max_train_batches",
-        "max_val_batches",
-    ):
-        value = getattr(args, name)
-        if value is not None and value < (1 if name.startswith("batches") or name.startswith("max") else 0):
-            raise ValueError(f"Invalid --{name.replace('_', '-')}")
-    if args.phase_balanced and args.batches_per_task is not None:
-        raise ValueError(
-            "--phase-balanced selects the phase sampler, so "
-            "--batches-per-task cannot be used with it. Remove "
-            "--batches-per-task and use --batches-per-phase to control "
-            "the epoch length."
-        )
-    if not args.phase_balanced and args.batches_per_phase is not None:
-        raise ValueError(
-            "--batches-per-phase requires --phase-balanced. Either add "
-            "--phase-balanced or remove --batches-per-phase."
-        )
-    if args.camera_names[0] != "agentview":
-        raise ValueError("--camera-names must start with agentview")
-    if len(set(args.camera_names)) != len(args.camera_names):
-        raise ValueError("--camera-names cannot contain duplicates")
 
 
 def set_seed(seed):
@@ -121,251 +40,170 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def prepare_batch(batch, normalizer, device, image_size):
-    image = batch["image"].to(device, non_blocking=True)
-    if image.shape[-2:] != (image_size, image_size):
-        image = F.interpolate(
-            image,
-            size=(image_size, image_size),
-            mode="bilinear",
-            align_corners=False,
-            antialias=True,
-        )
-    inputs = {"image": image}
-    if "proprio_history" in batch:
-        proprio_mask = batch["proprio_history_mask"].to(
-            device, non_blocking=True
-        )
-        action_mask = batch["action_history_mask"].to(
-            device, non_blocking=True
-        )
-        proprio_history = normalizer.normalize_proprio(
-            batch["proprio_history"].to(device, non_blocking=True)
-        )
-        action_history = normalizer.normalize_action(
-            batch["action_history"].to(device, non_blocking=True)
-        )
-        inputs.update(
-            {
-                "proprio_history": proprio_history
-                * proprio_mask.unsqueeze(-1),
-                "action_history": action_history
-                * action_mask.unsqueeze(-1),
-                "proprio_history_mask": proprio_mask,
-                "action_history_mask": action_mask,
-            }
-        )
-    else:
-        inputs["proprio"] = normalizer.normalize_proprio(
-            batch["proprio"].to(device, non_blocking=True)
-        )
-    if "eye_in_hand_image" in batch:
-        eye = batch["eye_in_hand_image"].to(device, non_blocking=True)
-        if eye.shape[-2:] != (image_size, image_size):
-            eye = F.interpolate(
-                eye,
-                size=(image_size, image_size),
-                mode="bilinear",
-                align_corners=False,
-                antialias=True,
-            )
-        inputs["eye_in_hand_image"] = eye
-    target = normalizer.normalize_action(
-        batch["action"].to(device, non_blocking=True)
-    )
-    return inputs, target, list(batch["task"]), list(batch["phase"])
+def resolve_device(value):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if value == "auto" else torch.device(value)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable")
+    return device
 
 
-def run_epoch(
-    model,
-    loader,
-    normalizer,
-    device,
-    image_size,
-    optimizer=None,
-    gradient_clip=0.0,
-    max_batches=None,
-    log_every=25,
-):
-    import time
+def prepare_batch(batch, normalizer, device):
+    inputs = {}
+    for key in ("image", "eye_in_hand_image"):
+        if key in batch:
+            value = batch[key].to(device)
+            if value.shape[-2:] != (128, 128):
+                prefix = value.shape[:-3]
+                value = F.interpolate(value.reshape(-1, *value.shape[-3:]), size=(128, 128),
+                                      mode="bilinear", align_corners=False, antialias=True).reshape(*prefix, 3, 128, 128)
+            inputs[key] = value
+    inputs["proprio"] = normalizer.normalize_proprio(batch["proprio"].to(device))
+    if "previous_gripper" in batch:
+        inputs["previous_gripper"] = batch["previous_gripper"].to(device)
+    action = batch["action"].to(device)
+    return inputs, normalizer.normalize_action(action), (action[..., 6:7] > 0).float()
 
-    training = optimizer is not None
-    model.train(training)
-    meter = LossMeter()
-    started = time.monotonic()
+
+def run_epoch(model, loader, normalizer, device, optimizer=None):
+    model.train(optimizer is not None)
+    totals = np.zeros(4, dtype=np.float64)
+    count = 0
     batches = 0
-    context = torch.enable_grad() if training else torch.inference_mode()
-    with context:
-        for batch_index, batch in enumerate(loader, start=1):
-            if max_batches is not None and batch_index > max_batches:
-                break
-            inputs, target, tasks, phases = prepare_batch(
-                batch, normalizer, device, image_size
-            )
-            if training:
-                optimizer.zero_grad(set_to_none=True)
-            prediction = model(**inputs)["action"]
-            loss = F.mse_loss(prediction, target)
+    with torch.set_grad_enabled(optimizer is not None):
+        for batch in loader:
+            inputs, action, grip = prepare_batch(batch, normalizer, device)
+            output = model(**inputs)
+            mask = batch["valid_mask"].to(device) if "valid_mask" in batch else torch.ones(action.shape[:-1], dtype=torch.bool, device=device)
+            size = int(mask.sum())
+            if size == 0:
+                raise ValueError("Batch contains no valid timesteps")
+            xyz = (output["motion"][..., :3] - action[..., :3]).square().mean(-1)[mask].mean()
+            rotation = ((output["motion"][..., 3:6] - action[..., 3:6]).square().mean(-1)[mask].mean()
+                        if model.predict_orientation else xyz.new_zeros(()))
+            gripper = F.binary_cross_entropy_with_logits(output["gripper_logit"], grip, reduction="none").mean(-1)[mask].mean()
+            loss = xyz + rotation + .2 * gripper
             if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite loss in batch {batch_index}")
-            if training:
+                raise FloatingPointError("Nonfinite BC loss")
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                if gradient_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p.requires_grad],
-                        gradient_clip,
-                    )
                 optimizer.step()
-            meter.update(prediction, target, tasks, phases)
+            totals += np.asarray([x.detach().item() for x in (loss, xyz, rotation, gripper)]) * size
+            count += size
             batches += 1
-            if training and batch_index % log_every == 0:
-                print(f"  batch {batch_index}: loss={float(loss.detach()):.6f}")
-    result = meter.result()
-    result["batches"] = batches
-    result["seconds"] = time.monotonic() - started
-    return result
+    if not count:
+        raise ValueError("DataLoader contains no samples")
+    return {**dict(zip(("loss", "xyz_mse", "rotation_mse", "gripper_bce"), (totals / count).tolist())),
+            "samples": count, "batches": batches}
 
 
-def checkpoint_payload(args, model, optimizer, epoch, global_step, best, history):
-    return {
-        "format_version": 1,
-        "policy_type": "visual_bc",
-        "epoch": epoch,
-        "global_step": global_step,
-        "best_val_loss": best,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "model_config": {
-            "policy_type": "visual_bc",
-            "visual_fusion": model.visual_fusion,
-            "camera_names": list(model.camera_names),
-            "proprio_dim": model.proprio_encoder.input_dim,
-            "action_dim": model.action_dim,
-            "fixed_target_color": args.fixed_target_color,
-            "pretrained_visual": args.pretrained_visual,
-            "freeze_visual_backbone": True,
-        },
-        "training_config": {key: json_value(value) for key, value in vars(args).items()},
-        "history": history,
-    }
+def save_checkpoint(path, payload):
+    temporary = path.with_suffix(".pt.tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def main():
     args = parse_args()
-    validate_args(args)
+    checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
+    saved_config = checkpoint.get("model_config", {}) if checkpoint else {}
+    if checkpoint and args.temporal and not saved_config.get("temporal", False):
+        raise ValueError("--temporal does not match the checkpoint architecture")
+    args.temporal = args.temporal or saved_config.get("temporal", False)
+    saved_training = checkpoint.get("training_config", {}) if checkpoint else {}
+    if args.temporal:
+        for name, default in (("sequence_length", 16), ("sequence_stride", 8)):
+            value = getattr(args, name)
+            saved = saved_training.get(name, default)
+            if checkpoint and value is not None and value != saved:
+                raise ValueError(f"--{name.replace('_', '-')} differs from checkpoint")
+            setattr(args, name, saved if value is None else value)
+        if not 1 <= args.sequence_stride <= args.sequence_length:
+            raise ValueError("Need 1 <= sequence-stride <= sequence-length")
+    elif args.sequence_length is not None or args.sequence_stride is not None:
+        raise ValueError("Sequence options require --temporal")
+    args.batch_size = args.batch_size if args.batch_size is not None else (8 if args.temporal else 128)
+    if min(args.epochs, args.batch_size, args.learning_rate) <= 0:
+        raise ValueError("Epochs, batch size, and learning rate must be positive")
+    if args.resume and args.output_dir.resolve() != args.resume.resolve().parent:
+        raise ValueError("--output-dir must be the directory containing --resume")
     set_seed(args.seed)
     device = resolve_device(args.device)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    save_json(
-        args.output_dir / "config.json",
-        {key: json_value(value) for key, value in vars(args).items()},
-    )
-
-    normalizer = PolicyNormalizer.from_json(args.normalization).to(device)
-    normalizer.validate_split(args.train_split)
-    train_dataset, val_dataset, train_loader, val_loader = build_loaders(
-        args, normalizer.proprio_keys
-    )
-    if train_dataset.proprio_dim != normalizer.proprio_dim:
-        raise ValueError("Dataset and normalizer proprio dimensions do not match")
-    if train_dataset.action_dim != normalizer.action_dim:
-        raise ValueError("Dataset and normalizer action dimensions do not match")
-
-    model = VisualBCPolicy(
-        visual_fusion=args.visual_fusion,
-        camera_names=args.camera_names,
-        action_dim=normalizer.action_dim,
-        proprio_dim=normalizer.proprio_dim,
-        pretrained_visual=args.pretrained_visual,
-        freeze_visual_backbone=True,
-    ).to(device)
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
-    start_epoch = 1
-    global_step = 0
-    best_val_loss = float("inf")
-    history = []
-    if args.resume is not None:
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        if checkpoint.get("policy_type") != "visual_bc":
-            raise ValueError("Resume checkpoint is not a Visual-BC checkpoint")
-        config = checkpoint["model_config"]
-        expected = (
-            config.get("visual_fusion"),
-            tuple(config.get("camera_names", [])),
-            config.get("fixed_target_color"),
-        )
-        actual = (args.visual_fusion, tuple(args.camera_names), args.fixed_target_color)
-        if expected != actual:
-            raise ValueError(f"Resume configuration mismatch: {expected} != {actual}")
+    try:
+        prepared, directory = load_bc_training(args.dataset, args.training_dir)
+    except FileNotFoundError:
+        if args.resume:
+            raise
+        # Old completed recordings can enter the same workflow without a preparation command.
+        prepare_bc_training(args.dataset, args.training_dir)
+        prepared, directory = load_bc_training(args.dataset, args.training_dir)
+    if prepared["tasks"] != ["pick"] or prepared["fixed_target_color"] is None:
+        raise ValueError("Visual-BC requires a fixed-target Pick dataset; collect a dataset with one fixed target color")
+    normalizer = PolicyNormalizer.from_statistics(prepared["normalization"]).to(device)
+    common = dict(dataset_root=args.dataset, proprio_keys=prepared["proprio_keys"],
+                  camera_keys=[CAMERA_OBSERVATION_KEYS[name] for name in prepared["camera_names"]],
+                  cache_size=2)
+    dataset_class = EpisodeSequenceDataset if args.temporal else ManipulationDataset
+    if args.temporal:
+        common.update(sequence_length=args.sequence_length, sequence_stride=args.sequence_stride)
+    train = dataset_class(split_manifest=directory / "train.jsonl", **common)
+    val = dataset_class(split_manifest=directory / "val.jsonl", **common)
+    generator = torch.Generator().manual_seed(args.seed)
+    train_loader = DataLoader(train, batch_size=args.batch_size, shuffle=True, num_workers=0,
+                              drop_last=False, generator=generator)
+    val_loader = DataLoader(val, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    model = VisualBCPolicy(normalizer.proprio_dim, prepared["camera_names"],
+                           prepared["predict_orientation"], temporal=args.temporal).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    start_epoch, best, history = 1, float("inf"), []
+    if args.resume:
+        if checkpoint.get("policy_type") != model.policy_type or {**model.get_config(), **checkpoint["model_config"]} != model.get_config():
+            raise ValueError("Resume architecture mismatch")
+        if checkpoint["data_config"] != prepared:
+            raise ValueError("Resume dataset/split/normalization mismatch")
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
+        for group in optimizer.param_groups:
+            group["lr"] = args.learning_rate
         start_epoch = int(checkpoint["epoch"]) + 1
-        global_step = int(checkpoint.get("global_step", 0))
-        best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
-        history = list(checkpoint.get("history", []))
-
-    print(f"Device: {device}")
-    print("Policy: Visual-BC (no language)")
-    print(f"Fixed target color: {args.fixed_target_color}")
-    print(f"Visual fusion: {args.visual_fusion}")
-    print(f"Cameras: {', '.join(args.camera_names)}")
-    print(f"Proprio dimension: {normalizer.proprio_dim}")
-    print(f"Phase-balanced sampling: {args.phase_balanced}")
-    print(
-        f"Samples: train={len(train_dataset)}, val={len(val_dataset)}; "
-        f"loader batches: train={len(train_loader)}, val={len(val_loader)}"
-    )
-
+        best, history = float(checkpoint["best_val_loss"]), list(checkpoint["history"])
+        generator.set_state(checkpoint["shuffle_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+        if start_epoch > args.epochs:
+            raise ValueError("--epochs must be greater than the saved checkpoint epoch")
+    elif any((args.output_dir / name).exists() for name in ("latest.pt", "best.pt")):
+        raise FileExistsError("Output already contains checkpoints; use --resume or a new output directory")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    save_json(args.output_dir / "config.json", {**{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                                               "model_config": model.get_config(), "data_config": prepared})
+    print(f"Device: {device}; policy: {model.policy_type}; cameras: {model.camera_names}")
+    print(f"Proprio: {model.proprio_dim}D; orientation: {model.predict_orientation}; head: {model.hidden_dims}")
+    unit = "windows" if args.temporal else "frames"
+    print(f"Train: {len(train.episodes)} episodes/{len(train)} {unit}; val: {len(val.episodes)} episodes/{len(val)} {unit}")
+    if args.temporal:
+        print(f"GRU: {model.temporal_hidden_dim}; sequence length={args.sequence_length}, stride={args.sequence_stride}")
+    print(f"Batch size: {args.batch_size}; complete shuffled epochs; AdamW LR={args.learning_rate}, weight_decay=0.01")
     for epoch in range(start_epoch, args.epochs + 1):
-        print(f"Epoch {epoch}/{args.epochs}")
-        train_metrics = run_epoch(
-            model,
-            train_loader,
-            normalizer,
-            device,
-            args.image_size,
-            optimizer=optimizer,
-            gradient_clip=args.gradient_clip,
-            max_batches=args.max_train_batches,
-            log_every=args.log_every,
-        )
-        val_metrics = run_epoch(
-            model,
-            val_loader,
-            normalizer,
-            device,
-            args.image_size,
-            max_batches=args.max_val_batches,
-            log_every=args.log_every,
-        )
-        global_step += train_metrics["batches"]
-        print(format_metrics("  train", train_metrics))
-        print(format_metrics("  val", val_metrics))
-        history.append(
-            {
-                "epoch": epoch,
-                "global_step": global_step,
-                "train": train_metrics,
-                "val": val_metrics,
-            }
-        )
-        improved = val_metrics["loss"] < best_val_loss
-        if improved:
-            best_val_loss = val_metrics["loss"]
-        payload = checkpoint_payload(
-            args, model, optimizer, epoch, global_step, best_val_loss, history
-        )
+        tr = run_epoch(model, train_loader, normalizer, device, optimizer)
+        va = run_epoch(model, val_loader, normalizer, device)
+        improved = va["loss"] < best
+        best = min(best, va["loss"])
+        history.append({"epoch": epoch, "train": tr, "val": va})
+        payload = {"format_version": 1, "policy_type": model.policy_type,
+                   "model_config": model.get_config(), "data_config": prepared,
+                   "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
+                   "epoch": epoch, "best_val_loss": best, "history": history,
+                   "shuffle_state": generator.get_state(), "torch_rng_state": torch.get_rng_state(),
+                   "training_config": {"image_size": 128, "learning_rate": args.learning_rate,
+                                       "batch_size": args.batch_size, "seed": args.seed,
+                                       "sequence_length": args.sequence_length, "sequence_stride": args.sequence_stride}}
         save_checkpoint(args.output_dir / "latest.pt", payload)
         if improved:
             save_checkpoint(args.output_dir / "best.pt", payload)
         save_json(args.output_dir / "metrics.json", history)
-
-    print(f"Training complete. Best validation loss: {best_val_loss:.6f}")
-    print(f"Outputs: {args.output_dir}")
+        print(f"Epoch {epoch:03d}/{args.epochs}: train={tr['loss']:.5f} val={va['loss']:.5f} "
+              f"(xyz={va['xyz_mse']:.5f}, rotation={va['rotation_mse']:.5f}, gripper={va['gripper_bce']:.5f}) best={best:.5f}")
+    print(f"Best checkpoint: {args.output_dir / 'best.pt'}; val loss={best:.6f}")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from language.instruction_generator import TEMPLATES
+from environments.instructions import TEMPLATES
 from environments.entity_utils import COLOR_PALETTE
 
 
@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=Path,
-        default=Path("data/demos/pilot_v01"),
+        required=True,
         help="Dataset root containing pick/place/stack directories",
     )
     parser.add_argument(
@@ -78,9 +78,11 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results/dataset_audit/pilot_v01"),
+        help="Defaults to results/dataset_audit/<dataset-name>",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.output = args.output or Path("results/dataset_audit") / args.dataset.name
+    return args
 
 
 def read_jsonl(path):

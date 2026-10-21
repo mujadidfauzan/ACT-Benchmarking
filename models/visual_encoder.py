@@ -1,135 +1,50 @@
-"""Visual encoders for manipulation policies."""
+"""Train-from-scratch visual encoder; architecture is configured here, not by CLI."""
 
 import torch
 from torch import nn
-from torchvision.models import ResNet18_Weights, resnet18
 
 
-class ResNet18VisualEncoder(nn.Module):
-    """ImageNet-normalized ResNet18 with a 512-to-feature projection head."""
+# Each convolution is (output channels, kernel size, stride, padding).
+CONV_LAYERS = ((32, 5, 2, 2), (64, 3, 2, 1), (128, 3, 2, 1), (128, 3, 2, 1))
+POOL_SIZE = (4, 4)
+FEATURE_DIM = 256
 
-    def __init__(
-        self,
-        output_dim=256,
-        pretrained=True,
-        freeze_backbone=True,
-        dropout=0.0,
-    ):
+
+class VisualEncoder(nn.Module):
+    """Encode RGB in [0, 1] directly, without ImageNet preprocessing or weights."""
+
+    def __init__(self, *, conv_layers=None, pool_size=None, feature_dim=None):
         super().__init__()
-        if output_dim <= 0:
-            raise ValueError("output_dim must be positive")
-        if not 0.0 <= dropout < 1.0:
-            raise ValueError("dropout must be in [0, 1)")
-
-        weights = ResNet18_Weights.DEFAULT if pretrained else None
-        backbone = resnet18(weights=weights)
-        backbone.fc = nn.Identity()
-        self.backbone = backbone
-        self.output_dim = int(output_dim)
-        self.pretrained = bool(pretrained)
+        self.conv_layers = tuple(tuple(layer) for layer in (
+            CONV_LAYERS if conv_layers is None else conv_layers
+        ))
+        self.pool_size = tuple(POOL_SIZE if pool_size is None else pool_size)
+        self.output_dim = FEATURE_DIM if feature_dim is None else int(feature_dim)
+        if (not self.conv_layers or any(len(layer) != 4 for layer in self.conv_layers)
+                or any(out <= 0 or kernel <= 0 or stride <= 0 or pad < 0
+                       for out, kernel, stride, pad in self.conv_layers)):
+            raise ValueError("Invalid CNN convolution specification")
+        if len(self.pool_size) != 2 or min(self.pool_size) <= 0 or self.output_dim <= 0:
+            raise ValueError("Pool and feature dimensions must be positive")
+        layers = []
+        channels = 3
+        for output, kernel, stride, padding in self.conv_layers:
+            layers.extend((nn.Conv2d(channels, output, kernel, stride, padding), nn.ReLU()))
+            channels = output
+        self.convolutions = nn.Sequential(*layers)
         self.projection = nn.Sequential(
-            nn.Linear(512, output_dim),
-            nn.LayerNorm(output_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
+            nn.AdaptiveAvgPool2d(self.pool_size), nn.Flatten(),
+            nn.Linear(channels * self.pool_size[0] * self.pool_size[1], self.output_dim),
+            nn.ReLU(),
         )
-        self.register_buffer(
-            "image_mean",
-            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(
-                1, 3, 1, 1
-            ),
-        )
-        self.register_buffer(
-            "image_std",
-            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(
-                1, 3, 1, 1
-            ),
-        )
-        self._backbone_frozen = False
-        self._layer4_trainable = False
-        self._layer3_trainable = False
-        if freeze_backbone:
-            self.freeze_backbone()
 
-    def freeze_backbone(self):
-        for parameter in self.backbone.parameters():
-            parameter.requires_grad_(False)
-        self._backbone_frozen = True
-        self._layer4_trainable = False
-        self._layer3_trainable = False
-        self.backbone.eval()
-        return self
-
-    def unfreeze_layer4(self):
-        for parameter in self.backbone.parameters():
-            parameter.requires_grad_(False)
-        for parameter in self.backbone.layer4.parameters():
-            parameter.requires_grad_(True)
-        self._backbone_frozen = False
-        self._layer4_trainable = True
-        self._layer3_trainable = False
-        if self.training:
-            self.backbone.eval()
-            self.backbone.layer4.train()
-        return self
-
-    def unfreeze_layer3(self):
-        """Fine-tune layer3 weights while keeping all BatchNorm statistics fixed."""
-        for parameter in self.backbone.parameters():
-            parameter.requires_grad_(False)
-        for parameter in self.backbone.layer3.parameters():
-            parameter.requires_grad_(True)
-        self._backbone_frozen = False
-        self._layer3_trainable = True
-        self._layer4_trainable = False
-        self.backbone.eval()
-        return self
-
-    def unfreeze_backbone(self):
-        for parameter in self.backbone.parameters():
-            parameter.requires_grad_(True)
-        self._backbone_frozen = False
-        self._layer4_trainable = False
-        self._layer3_trainable = False
-        self.backbone.train(self.training)
-        return self
-
-    def train(self, mode=True):
-        super().train(mode)
-        if self._backbone_frozen:
-            self.backbone.eval()
-        elif self._layer3_trainable:
-            self.backbone.eval()
-        elif self._layer4_trainable:
-            self.backbone.eval()
-            if mode:
-                self.backbone.layer4.train()
-        return self
+    def get_config(self):
+        return {"conv_layers": [list(layer) for layer in self.conv_layers],
+                "pool_size": list(self.pool_size), "feature_dim": self.output_dim}
 
     def forward(self, image):
-        spatial = self.forward_spatial(image)
-        backbone_feature = torch.flatten(
-            self.backbone.avgpool(spatial), start_dim=1
-        )
-        return self.projection(backbone_feature)
-
-    def forward_spatial(self, image):
-        """Return the final ResNet feature map before global pooling."""
-
-        return self.backbone.layer4(self.forward_layer3(image))
-
-    def forward_layer3(self, image):
-        """Return the stride-16 ResNet feature map for spatial policies."""
-
         if image.ndim != 4 or image.shape[1] != 3:
             raise ValueError("image must have shape [B, 3, H, W]")
-        if not image.is_floating_point():
-            raise TypeError("image must use a floating-point dtype")
-        normalized = (image - self.image_mean) / self.image_std
-        feature = self.backbone.conv1(normalized)
-        feature = self.backbone.bn1(feature)
-        feature = self.backbone.relu(feature)
-        feature = self.backbone.maxpool(feature)
-        feature = self.backbone.layer1(feature)
-        feature = self.backbone.layer2(feature)
-        return self.backbone.layer3(feature)
+        if not torch.is_floating_point(image):
+            raise ValueError("image must be floating-point RGB in [0, 1]")
+        return self.projection(self.convolutions(image))

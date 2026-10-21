@@ -1,318 +1,73 @@
+"""Scripted Pick state machine for demonstration collection and benchmarking."""
+
 import numpy as np
-from robosuite.utils import transform_utils as T
 
-from experts.primitives import grasp_object
+from experts.grasp_expert import GraspExpert
+from environments.pick_config import ROTATION_MODES
 
 
-class PickExpert:
+class PickExpert(GraspExpert):
+    def __init__(self, controller, rotation_mode="align_yaw", **kwargs):
+        super().__init__(controller, **kwargs)
+        if rotation_mode not in ROTATION_MODES:
+            raise ValueError(f"rotation_mode must be one of {ROTATION_MODES}")
+        self.rotation_mode = rotation_mode
 
-    def __init__(
-        self,
-        controller,
-        approach_height=0.15,
-        pre_grasp_height=0.05,
-        lift_height=0.20,
-        grasp_offset=0.0,
-        target_orientation=None,
-        close_min_steps=12,
-        close_max_steps=40,
-        close_stable_steps=3,
-        close_qpos_tolerance=1e-4,
-    ):
-        self.controller = controller
-
-        self.approach_height = approach_height
-        self.pre_grasp_height = pre_grasp_height
-        self.lift_height = lift_height
-
-        self.grasp_offset = grasp_offset
-
-        self.target_orientation = target_orientation
-        self.close_min_steps = close_min_steps
-        self.close_max_steps = close_max_steps
-        self.close_stable_steps = close_stable_steps
-        self.close_qpos_tolerance = close_qpos_tolerance
-
-    # ============================================================
-    # HELPER FUNCTIONS
-    # ============================================================
-
-    def get_target_orientation(self, obs, get_object_orientation=None):
-        """
-        Keep the gripper's initial roll and pitch,
-        but align its yaw with the cube yaw.
-
-        Quaternion convention:
-        [x, y, z, w]
-        """
-
-        # --------------------------------------------------------
-        # 1. Read current EEF orientation
-        # --------------------------------------------------------
-
-        eef_quat = self.controller.get_eef_orientation(obs).copy()
-
-        # --------------------------------------------------------
-        # 2. Read cube orientation
-        # --------------------------------------------------------
-
-        orientation_getter = (
-            get_object_orientation or self.controller.get_cube_orientation
-        )
-        cube_quat = orientation_getter(obs).copy()
-
-        # --------------------------------------------------------
-        # 3. Convert both to Euler:
-        #    roll, pitch, yaw
-        # --------------------------------------------------------
-
-        eef_rotmat = T.quat2mat(eef_quat)
-        eef_euler = T.mat2euler(eef_rotmat)
-
-        cube_rotmat = T.quat2mat(cube_quat)
-        cube_euler = T.mat2euler(cube_rotmat)
-
-        # --------------------------------------------------------
-        # 4. Keep EEF roll + pitch
-        #    Use cube yaw
-        # --------------------------------------------------------
-
-        target_euler = np.array(
-            [
-                eef_euler[0],  # roll from gripper
-                eef_euler[1],  # pitch from gripper
-                cube_euler[2],  # yaw from cube
-            ],
-            dtype=np.float32,
-        )
-
-        # --------------------------------------------------------
-        # 5. Convert back to quaternion
-        # --------------------------------------------------------
-
-        target_quat = T.mat2quat(T.euler2mat(target_euler)).astype(np.float32)
-
-        print(
-            "EEF Euler [r p y]:",
-            np.round(
-                np.rad2deg(eef_euler),
-                2,
-            ),
-        )
-
-        print(
-            "Cube Euler [r p y]:",
-            np.round(
-                np.rad2deg(cube_euler),
-                2,
-            ),
-        )
-
-        print(
-            "Target Euler [r p y]:",
-            np.round(
-                np.rad2deg(target_euler),
-                2,
-            ),
-        )
-
-        return target_quat
-
-    # ============================================================
-    # MAIN EXPERT
-    # ============================================================
-
-    def run(
-        self,
-        obs,
-        render=False,
-        object_name=None,
-        get_object_position=None,
-        get_object_orientation=None,
-    ):
-
-        if object_name is None and hasattr(self.controller.env, "target_object_id"):
-            object_name = self.controller.env.target_object_id
-
-        if object_name is not None:
-            object_id = self.controller.env.resolve_object_id(object_name)
-            if get_object_position is None:
-                get_object_position = lambda current_obs: np.asarray(
-                    current_obs[f"{object_id}_pos"], dtype=np.float32
-                )
-            if get_object_orientation is None:
-                get_object_orientation = lambda current_obs: np.asarray(
-                    current_obs[f"{object_id}_quat"], dtype=np.float32
-                )
-
-        position_getter = get_object_position or self.controller.get_cube_position
-
-        # --------------------------------------------------------
-        # 1. Read initial object state
-        # --------------------------------------------------------
-
-        initial_cube_pos = position_getter(obs).copy()
-
-        print(
-            "Cube position:",
-            initial_cube_pos,
-        )
-
-        # --------------------------------------------------------
-        # 2. Determine expert orientation
-        # --------------------------------------------------------
-
-        if self.target_orientation is None:
-
-            target_orientation = self.get_target_orientation(
-                obs,
-                get_object_orientation=get_object_orientation,
+    def run(self, obs, render=False, object_name=None, **kwargs):
+        env = self.controller.env
+        object_id = env.resolve_object_id(object_name or env.target_object_id)
+        position = lambda value: np.asarray(value[f"{object_id}_pos"])
+        orientation = lambda value: np.asarray(value[f"{object_id}_quat"])
+        initial_z = float(position(obs)[2])
+        target_quat = self.get_target_orientation(obs, orientation) if self.rotation_mode == "align_yaw" else None
+        stage, stage_steps, held = "approach", 0, 0
+        grasp_offset = None
+        gains = {"approach": (8., .8), "pre_grasp": (5., .4), "descend": (4., .3),
+                 "close": (2., .15), "lift": (6., .5)}
+        for step in range(500):
+            cube = position(obs)
+            eef = self.controller.get_eef_position(obs)
+            aligned = target_quat is None or self.controller.orientation_distance(obs, target_quat) < np.deg2rad(3)
+            grip = self.controller.GRIPPER_OPEN
+            if stage == "approach":
+                target = cube + np.array([0, 0, .12])
+                if np.linalg.norm(eef - target) < .03:
+                    stage, stage_steps = "pre_grasp", 0
+            elif stage == "pre_grasp":
+                target = cube + np.array([0, 0, .08])
+                if np.linalg.norm(eef[:2] - target[:2]) < .012 and abs(eef[2] - target[2]) < .020 and aligned:
+                    stage, stage_steps = "descend", 0
+            elif stage == "descend":
+                target = cube + np.array([0, 0, .005])
+                if np.linalg.norm(eef[:2] - target[:2]) < .008 and abs(eef[2] - target[2]) < .012 and aligned:
+                    stage, stage_steps = "close", 0
+            elif stage == "close":
+                target = eef.copy()
+                grip = self.controller.GRIPPER_CLOSE
+                if stage_steps >= 15:
+                    stage, stage_steps = "lift", 0
+                    grasp_offset = float(eef[2] - cube[2])
+            if stage == "lift":
+                grip = self.controller.GRIPPER_CLOSE
+                target = np.array([cube[0], cube[1], initial_z + .20 + grasp_offset])
+            gain, limit = gains[stage]
+            action = self.controller.create_action(
+                delta_position=np.clip((target - eef) * gain, -limit, limit),
+                delta_orientation=(np.zeros(3) if target_quat is None else np.clip(
+                    self.controller.orientation_gain * self.controller.orientation_error_vector(obs, target_quat), -.5, .5)),
+                gripper=grip,
             )
-
-        else:
-
-            target_orientation = np.asarray(
-                self.target_orientation,
-                dtype=np.float32,
-            )
-
-        print(
-            "Pick orientation:",
-            target_orientation,
-        )
-
-        # --------------------------------------------------------
-        # 3. Grasp and lift
-        # --------------------------------------------------------
-
-        primitive_result = grasp_object(
-            obs=obs,
-            controller=self.controller,
-            object_position=initial_cube_pos,
-            target_orientation=target_orientation,
-            get_object_position=position_getter,
-            approach_height=self.approach_height,
-            pre_grasp_height=self.pre_grasp_height,
-            grasp_offset=self.grasp_offset,
-            lift_height=self.lift_height,
-            close_min_steps=self.close_min_steps,
-            close_max_steps=self.close_max_steps,
-            close_stable_steps=self.close_stable_steps,
-            close_qpos_tolerance=self.close_qpos_tolerance,
-            render=render,
-        )
-
-        obs = primitive_result.obs
-
-        if not primitive_result.success:
-
-            failure_labels = {
-                "approach": "approach",
-                "pre_grasp": "pre-grasp",
-                "grasp_pose": "grasp pose",
-                "lift": "lift movement",
-            }
-
-            print(
-                "PickExpert failed:",
-                failure_labels[primitive_result.stage],
-            )
-
-            return obs, self.failure_info(
-                stage=primitive_result.stage,
-                initial_cube_pos=initial_cube_pos,
-                obs=obs,
-                get_object_position=position_getter,
-            )
-
-        # --------------------------------------------------------
-        # 4. Verify grasp
-        # --------------------------------------------------------
-
-        info = self.verify_pick(
-            obs,
-            initial_cube_pos,
-            get_object_position=position_getter,
-        )
-
-        if object_name is not None:
-            info["object_name"] = object_name
-
-        return obs, info
-
-    # ============================================================
-    # SUCCESS VERIFICATION
-    # ============================================================
-
-    def verify_pick(
-        self,
-        obs,
-        initial_cube_pos,
-        get_object_position=None,
-        minimum_lift=0.08,
-        max_gripper_distance=0.10,
-    ):
-
-        position_getter = get_object_position or self.controller.get_cube_position
-        final_cube_pos = position_getter(obs).copy()
-
-        eef_pos = self.controller.get_eef_position(obs).copy()
-
-        lift_distance = final_cube_pos[2] - initial_cube_pos[2]
-
-        gripper_distance = np.linalg.norm(final_cube_pos - eef_pos)
-
-        success = (
-            lift_distance >= minimum_lift and gripper_distance <= max_gripper_distance
-        )
-
-        print(
-            "Final cube position:",
-            final_cube_pos,
-        )
-
-        print(
-            "Lift distance:",
-            lift_distance,
-        )
-
-        print(
-            "Cube-EFF distance:",
-            gripper_distance,
-        )
-
-        print(
-            "Pick success:",
-            success,
-        )
-
-        return {
-            "success": bool(success),
-            "stage": "complete",
-            "initial_cube_pos": (initial_cube_pos.copy()),
-            "final_cube_pos": (final_cube_pos.copy()),
-            "lift_distance": float(lift_distance),
-            "gripper_distance": float(gripper_distance),
-        }
-
-    # ============================================================
-    # FAILURE INFO
-    # ============================================================
-
-    def failure_info(
-        self,
-        stage,
-        initial_cube_pos,
-        obs,
-        get_object_position=None,
-    ):
-
-        position_getter = get_object_position or self.controller.get_cube_position
-        final_cube_pos = position_getter(obs).copy()
-
-        return {
-            "success": False,
-            "stage": stage,
-            "initial_cube_pos": (initial_cube_pos.copy()),
-            "final_cube_pos": (final_cube_pos.copy()),
-        }
+            self.controller.set_phase(stage)
+            obs, _, done, _ = env.step(action)
+            stage_steps += 1
+            if render:
+                env.render()
+            lift = float(position(obs)[2] - initial_z)
+            held = held + 1 if stage == "lift" and lift >= .18 and env._check_success() else 0
+            if held >= 20:
+                return obs, {"success": True, "stage": "complete", "steps": step + 1,
+                             "lift_height": lift, "object_name": object_id}
+            if done:
+                break
+        return obs, {"success": False, "stage": stage, "steps": step + 1,
+                     "lift_height": float(position(obs)[2] - initial_z), "object_name": object_id}
