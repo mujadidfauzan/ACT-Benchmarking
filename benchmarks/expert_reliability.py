@@ -64,6 +64,7 @@ def build_task(task, seed, instruction_split, render, num_objects=3,
                yaw_range_deg=DEFAULT_YAW_RANGE_DEG):
     config = load_composite_controller_config(controller="BASIC")
     config["body_parts"]["right"].update(type="OSC_POSE", input_type="delta", input_ref_frame="world", impedance_mode="fixed")
+    config["body_parts"] = {"right": config["body_parts"]["right"]}
     common = {
         "robots": "Panda",
         "controller_configs": config,

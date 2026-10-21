@@ -1,7 +1,7 @@
 # Linux: Visual Behavior Cloning
 
 Jalankan dari root repo dalam Bash. Model Visual-BC menerima RGB dan proprio
-robot untuk memprediksi satu action. Storage tetap NPZ, dan training saat ini
+robot untuk memprediksi satu action. Storage episode memakai HDF5, dan training saat ini
 khusus fixed-target Pick.
 
 ## 1. Setup
@@ -78,7 +78,7 @@ balancing task/phase saat training.
 `--num-demos` adalah target total sukses per task. Ulangi command yang sama
 untuk melengkapi recording terputus. Opsi lama `--episodes N` masih menambah N
 episode; jangan menggabungkan keduanya. Demo gagal dan frame korup ditolak.
-NPZ ditulis atomik sebelum manifest; orphan akibat interupsi perlu diperiksa
+HDF5 ditulis atomik sebelum manifest; orphan akibat interupsi perlu diperiksa
 dan dikarantina, bukan dimasukkan ke manifest secara sembarang.
 
 Collection menghasilkan episode T actions/T+1 observations di DATASET/pick,
@@ -94,6 +94,32 @@ Tidak perlu command create-splits atau compute-normalization. Minimal dua
 episode sukses dibutuhkan. Lokasi dapat diubah dengan `--training-dir PATH`.
 Data lama yang lengkap dapat dipersiapkan otomatis oleh trainer bila artifact
 belum ada, tetapi gunakan recording baru untuk mencocokkan expert/controller.
+
+### Penyimpanan HDF5 Dan Dataset Lama
+
+Satu episode disimpan dalam `episode_000000.hdf5`, dengan array `actions`,
+`phases`, `obs__...`, `metadata_json`, dan `result_json`. RGB memakai gzip level 4
+dan chunk satu frame. Loader membaca satu timestep atau window GRU, bukan semua
+RGB episode. Cache dibatasi 16 file handle per dataset/proses dan tidak dibagikan
+antar-worker. Pemeriksaan kamera memakai blok frame terbatas; statistik tetap
+train-only.
+
+NPZ lama harus dikonversi ke dataset baru sebelum training. Sumber tidak
+dimodifikasi, split/normalisasi dibuat otomatis, dan output harus belum ada:
+
+```bash
+python -m data.episode_io \
+  --source data/demos/pick_red_v01 \
+  --output data/demos/pick_red_v01_hdf5 \
+  --training-dir data/splits/pick_red_v01_hdf5_bc
+```
+
+Lalu gunakan dataset `_hdf5` untuk training di run baru. Fingerprint berbeda,
+sehingga checkpoint training lama tidak bisa di-resume pada hasil konversi.
+Checkpoint mandiri lama tetap bisa dievaluasi karena arsitektur tidak berubah.
+Jangan mencampur NPZ dan HDF5 dalam direktori collection. Command enam eksperimen
+tetap sama; file baru otomatis HDF5. Converter ini khusus schema NPZ project ini,
+bukan importer HDF5 dari repo lain.
 
 Audit opsional:
 

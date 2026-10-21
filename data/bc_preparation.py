@@ -6,6 +6,7 @@ import random
 from pathlib import Path
 
 import numpy as np
+from data.episode_io import HDF5_SUFFIXES, open_episode
 from environments.pick_config import validate_pick_settings
 
 
@@ -42,9 +43,12 @@ def dataset_entries(dataset):
     entries = []
     for task in ("pick", "place", "stack"):
         directory = dataset / task
+        if list(directory.glob("episode_*.npz")):
+            raise ValueError(f"Legacy NPZ demos in {directory}; convert with python -m data.episode_io into a new dataset")
+        disk_names = {path.name for path in directory.glob("episode_*") if path.suffix in HDF5_SUFFIXES}
         manifest = directory / "manifest.jsonl"
         if not manifest.exists():
-            if list(directory.glob("episode_*.npz")):
+            if disk_names:
                 raise ValueError(f"Unmanifested episodes in {directory}")
             continue
         names = set()
@@ -53,14 +57,14 @@ def dataset_entries(dataset):
                 continue
             value = json.loads(line)
             name = value["path"]
-            if Path(name).name != name or name in names:
+            if Path(name).name != name or Path(name).suffix not in HDF5_SUFFIXES or name in names:
                 raise ValueError(f"Invalid/duplicate episode path in {manifest}: {name}")
             names.add(name)
             path = directory / name
             if not path.is_file():
                 raise FileNotFoundError(path)
             entries.append({**value, "task": task, "path": f"{task}/{name}"})
-        orphans = {path.name for path in directory.glob("episode_*.npz")} - names
+        orphans = disk_names - names
         if orphans:
             raise ValueError(f"Unmanifested episodes in {directory}: {sorted(orphans)}")
     return sorted(entries, key=lambda value: value["path"])
@@ -103,8 +107,8 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
     orientation = set()
     environment_configs = {}
     for entry in entries:
-        with np.load(dataset / entry["path"], allow_pickle=False) as archive:
-            actions = archive["actions"]
+        with open_episode(dataset / entry["path"]) as archive:
+            actions = archive["actions"][:]
             if actions.shape != (entry["steps"], 7) or not len(actions) or not np.isfinite(actions).all():
                 raise ValueError(f"Invalid actions: {entry['path']}")
             names = tuple(name for name, key in CAMERA_KEYS.items() if key in archive)
@@ -113,8 +117,11 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
             sizes = []
             for name in names:
                 frames = archive[CAMERA_KEYS[name]]
-                if len(frames) != len(actions) + 1 or len(suspicious_camera_frames(frames)):
+                if not frames.ndim or len(frames) != len(actions) + 1:
                     raise ValueError(f"Invalid/corrupted {name} frames in {entry['path']}")
+                for start in range(0, len(frames), 32):
+                    if len(suspicious_camera_frames(frames[start:start + 32])):
+                        raise ValueError(f"Invalid/corrupted {name} frames in {entry['path']}")
                 sizes.append(tuple(frames.shape[1:3]))
             signatures.add((names, tuple(sizes)))
             declared = entry.get("metadata", {}).get("control_orientation")
@@ -139,7 +146,7 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
             state_keys = PROPRIO_KEYS
             for key in state_keys:
                 value = archive[key]
-                if value.ndim != 2 or len(value) != len(actions) + 1 or not np.isfinite(value).all():
+                if value.ndim != 2 or len(value) != len(actions) + 1 or not np.isfinite(value[:]).all():
                     raise ValueError(f"Invalid state observations for {key} in {entry['path']}")
     if len(signatures) != 1 or len(orientation) != 1:
         raise ValueError("Dataset mixes camera/resolution/orientation configurations; use separate datasets")
@@ -151,7 +158,7 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
     state_sum = state_sq = motion_sum = motion_sq = None
     count = 0
     for entry in train:
-        with np.load(dataset / entry["path"], allow_pickle=False) as archive:
+        with open_episode(dataset / entry["path"]) as archive:
             steps = int(entry["steps"])
             parts = []
             for key in keys:
@@ -186,7 +193,7 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
                   "training_timesteps": count}
     save_json(output / "normalization.json", statistics)
     target_colors = {e.get("metadata", {}).get("target_color") for e in entries if e["task"] == "pick"}
-    config = {"format_version": 1, "method": "visual_bc", "seed": seed,
+    config = {"format_version": 1, "method": "visual_bc", "storage_format": "hdf5", "seed": seed,
               "rotation_mode": "align_yaw" if predict_orientation else "none",
               "val_fraction": val_fraction, "source_digest": source_digest(dataset, entries),
               "split_hashes": {"train": train_hash, "val": val_hash},

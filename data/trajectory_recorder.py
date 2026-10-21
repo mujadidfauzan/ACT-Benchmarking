@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
+from data.episode_io import write_episode
+
 
 def _json_default(value):
     if isinstance(value, np.ndarray):
@@ -94,12 +96,7 @@ class TrajectoryRecorder:
             except ValueError:
                 continue
 
-        if path.exists():
-            raise FileExistsError(f"Episode already exists: {path}")
-        temporary = path.with_suffix(".npz.tmp")
-        with temporary.open("wb") as handle:
-            np.savez_compressed(handle, **payload)
-        temporary.replace(path)
+        write_episode(path, payload)
         return {
             "path": str(path),
             "steps": len(self.actions),

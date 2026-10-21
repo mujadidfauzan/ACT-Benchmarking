@@ -142,7 +142,7 @@ def main():
     normalizer = PolicyNormalizer.from_statistics(prepared["normalization"]).to(device)
     common = dict(dataset_root=args.dataset, proprio_keys=prepared["proprio_keys"],
                   camera_keys=[CAMERA_OBSERVATION_KEYS[name] for name in prepared["camera_names"]],
-                  cache_size=2)
+                  cache_size=16)
     dataset_class = EpisodeSequenceDataset if args.temporal else ManipulationDataset
     if args.temporal:
         common.update(sequence_length=args.sequence_length, sequence_stride=args.sequence_stride)

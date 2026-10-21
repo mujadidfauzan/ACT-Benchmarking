@@ -10,6 +10,7 @@ from robosuite.utils import RandomizationError
 
 from controllers.panda_controller import PandaController
 from data.trajectory_recorder import TrajectoryRecorder
+from data.episode_io import EPISODE_SUFFIX, HDF5_SUFFIXES
 from data.bc_preparation import dataset_entries, default_training_dir, prepare_bc_training, suspicious_camera_frames
 from environments.pick_env import PickEnv
 from environments.pick_config import add_pick_arguments, validate_pick_arguments, validate_pick_settings, yaw_range_degrees
@@ -74,6 +75,7 @@ def build_task(args, num_objects=None, num_receptacles=None, seed=None):
     config = copy.deepcopy(getattr(args, "controller_config", None) or load_composite_controller_config(controller="BASIC"))
     right = config["body_parts"]["right"]
     right.update(type="OSC_POSE", input_type="delta", input_ref_frame="world", impedance_mode="fixed")
+    config["body_parts"] = {"right": right}
     collection_controller_config = copy.deepcopy(config)
     common = {
         "robots": "Panda",
@@ -235,8 +237,8 @@ def main():
         raise ValueError("max-attempts must be positive")
     existing_indices = [
         int(path.stem.split("_")[-1])
-        for path in task_dir.glob("episode_*.npz")
-        if path.stem.split("_")[-1].isdigit()
+        for path in task_dir.glob("episode_*")
+        if path.suffix in HDF5_SUFFIXES and path.stem.split("_")[-1].isdigit()
     ]
     start_index = max(existing_indices, default=-1) + 1
     existing_attempts = 0
@@ -368,7 +370,7 @@ def main():
                 continue
 
             episode_index = start_index + saved
-            episode_path = task_dir / f"episode_{episode_index:06d}.npz"
+            episode_path = task_dir / f"episode_{episode_index:06d}{EPISODE_SUFFIX}"
             summary = recorder.save(episode_path, metadata, info)
             manifest_entry = {
                 "episode": episode_index,

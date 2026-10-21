@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
+from data.episode_io import open_episode, read_json
+
 
 SPLITS = ("train", "val", "test")
 POSITION_FIELDS = ("x", "y", "z")
@@ -57,10 +59,7 @@ def read_jsonl(path):
 
 
 def scalar_json(value, field):
-    raw = value.item()
-    if not isinstance(raw, str):
-        raise ValueError(f"{field} must contain a scalar JSON string")
-    return json.loads(raw)
+    return read_json(value, field)
 
 
 def quat_xyzw_to_euler_deg(quaternion):
@@ -97,7 +96,7 @@ def episode_rows(dataset, split, entry, include_receptacles):
     episode_path = dataset / entry["path"]
     if not episode_path.is_file():
         raise FileNotFoundError(f"Missing episode: {episode_path}")
-    with np.load(episode_path, allow_pickle=False) as data:
+    with open_episode(episode_path) as data:
         metadata = scalar_json(data["metadata_json"], "metadata_json")
         groups = [("object", metadata.get("objects", []))]
         if include_receptacles:

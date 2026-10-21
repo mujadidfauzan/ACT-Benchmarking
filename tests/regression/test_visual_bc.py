@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import h5py
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -19,6 +20,7 @@ from controllers.panda_controller import PandaController
 from data.bc_preparation import prepare_bc_training, load_bc_training, suspicious_camera_frames
 from data.manipulation_dataset import ManipulationDataset, CAMERA_OBSERVATION_KEYS
 from data.normalization import PolicyNormalizer
+from data.episode_io import open_episode, write_episode
 from experts.pick_expert import PickExpert
 from models.visual_bc import VisualBCPolicy
 from scripts import train_visual_bc as training, record_demonstrations as recording
@@ -53,8 +55,8 @@ class VisualBCTests(unittest.TestCase):
                        "obs__cube_0_quat": np.tile([0., 0., 0., 1.], (steps + 1, 1))}
             for key in CAMERA_OBSERVATION_KEYS.values():
                 payload[key] = np.full((steps + 1, 32, 32, 3), 80 + index, dtype=np.uint8)
-            name = f"episode_{index:06d}.npz"
-            np.savez(self.dataset / "pick" / name, **payload)
+            name = f"episode_{index:06d}.hdf5"
+            write_episode(self.dataset / "pick" / name, payload)
             self.entries.append({"episode": index, "task": "pick", "path": name, "steps": steps,
                                  "instruction": "Pick up the red cube.", "metadata": metadata, "num_objects": 1})
         self.manifest = self.dataset / "pick/manifest.jsonl"
@@ -98,9 +100,9 @@ class VisualBCTests(unittest.TestCase):
                                       proprio_keys=config["proprio_keys"], camera_keys=tuple(CAMERA_OBSERVATION_KEYS.values()))
         state, action = [], []
         for entry in dataset.episodes:
-            with np.load(self.dataset / entry["path"]) as archive:
+            with open_episode(self.dataset / entry["path"]) as archive:
                 state.append(np.concatenate([archive[key][:-1] for key in config["proprio_keys"]], axis=1))
-                action.append(archive["actions"])
+                action.append(archive["actions"][:])
         state, action = np.concatenate(state), np.concatenate(action)
         np.testing.assert_allclose(normalizer.proprio_mean, state.mean(0), atol=1e-6)
         np.testing.assert_allclose(normalizer.proprio_std, np.maximum(state.std(0), .001), atol=1e-6)
@@ -119,10 +121,9 @@ class VisualBCTests(unittest.TestCase):
     def test_position_only_mode_and_camera_rejection(self):
         for entry in self.entries:
             path = self.dataset / "pick" / entry["path"]
-            with np.load(path) as archive:
-                payload = {key: archive[key] for key in archive.files if key != "obs__robot0_eye_in_hand_image"}
-            payload["actions"][:, 3:6] = 0
-            np.savez(path, **payload)
+            with h5py.File(path, "r+") as archive:
+                del archive["obs__robot0_eye_in_hand_image"]
+                archive["actions"][:, 3:6] = 0
             entry["metadata"]["control_orientation"] = False
         self.manifest.write_text("".join(json.dumps(value) + "\n" for value in self.entries))
         config = self.prepare()
@@ -143,10 +144,8 @@ class VisualBCTests(unittest.TestCase):
             load_bc_training(self.dataset, self.prepared)
         split.write_bytes(original)
         path = self.dataset / "pick" / self.entries[0]["path"]
-        with np.load(path) as archive:
-            payload = {key: archive[key] for key in archive.files}
-        payload["actions"][0, 0] += .01
-        np.savez(path, **payload)
+        with h5py.File(path, "r+") as archive:
+            archive["actions"][0, 0] += .01
         with self.assertRaisesRegex(ValueError, "Dataset changed"):
             load_bc_training(self.dataset, self.prepared)
 
@@ -161,10 +160,8 @@ class VisualBCTests(unittest.TestCase):
             load_bc_training(self.dataset, self.prepared)
         stats.write_text(original)
         path = self.dataset / "pick" / self.entries[0]["path"]
-        with np.load(path) as archive:
-            payload = {key: archive[key] for key in archive.files}
-        payload["obs__agentview_image"][:] = 0
-        np.savez(path, **payload)
+        with h5py.File(path, "r+") as archive:
+            archive["obs__agentview_image"][:] = 0
         with self.assertRaisesRegex(ValueError, "corrupted"):
             self.prepare()
 

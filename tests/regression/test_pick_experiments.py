@@ -1,5 +1,6 @@
 """Offline contracts for yaw/rotation ablations and causal GRU training."""
 
+import copy
 import io
 import json
 import unittest
@@ -15,6 +16,7 @@ from controllers.panda_controller import PandaController
 from data.bc_preparation import load_bc_training
 from data.manipulation_dataset import EpisodeSequenceDataset, CAMERA_OBSERVATION_KEYS
 from data.normalization import PolicyNormalizer
+from data.episode_io import open_episode
 from environments.pick_config import validate_pick_arguments, validate_pick_settings
 from experts.pick_expert import PickExpert
 from models.visual_bc import VisualBCPolicy
@@ -41,6 +43,8 @@ class PickExperimentTests(unittest.TestCase):
             np.testing.assert_allclose(env.call_args.kwargs["yaw_range"], np.deg2rad(yaw))
             self.assertNotIn("x_range", env.call_args.kwargs)
             self.assertNotIn("y_range", env.call_args.kwargs)
+            self.assertEqual(set(env.call_args.kwargs["controller_configs"]["body_parts"]), {"right"})
+            self.assertIs(env.call_args.kwargs["hard_reset"], False)
             self.assertEqual(expert.call_args.kwargs["rotation_mode"], "none")
         for yaw in ((45, -45), (float("nan"), 0), (0, float("inf"))):
             with self.assertRaises(ValueError):
@@ -63,6 +67,22 @@ class PickExperimentTests(unittest.TestCase):
         for task in ("place", "stack", "all"):
             with self.assertRaises(ValueError):
                 validate_pick_arguments(SimpleNamespace(task=task, rotation_mode="align_yaw", random_yaw=False))
+
+    def test_collection_filters_controller_without_mutating_saved_configuration(self):
+        with patch("sys.argv", ["record", "--task", "pick"]):
+            args = recording.parse_args()
+        args.controller_config = recording.load_composite_controller_config(controller="BASIC")
+        original = copy.deepcopy(args.controller_config)
+        expected = copy.deepcopy(original)
+        right = expected["body_parts"]["right"]
+        right.update(type="OSC_POSE", input_type="delta", input_ref_frame="world", impedance_mode="fixed")
+        expected["body_parts"] = {"right": right}
+        with patch.object(recording, "PickEnv") as env, patch.object(recording, "PandaController"), patch.object(recording, "PickExpert"):
+            recording.build_task(args, 3, seed=42)
+        self.assertEqual(args.controller_config, original)
+        self.assertEqual(env.call_args.kwargs["controller_configs"], expected)
+        self.assertEqual(env.return_value.bc_controller_config, expected)
+        self.assertIn("gripper", expected["body_parts"]["right"])
 
     def test_all_six_collection_configs_and_append_guards(self):
         current = []
@@ -177,6 +197,9 @@ class PickExperimentTests(unittest.TestCase):
             np.testing.assert_allclose(env.call_args.kwargs["yaw_range"], np.deg2rad(yaw))
             self.assertNotIn("x_range", env.call_args.kwargs)
             self.assertNotIn("y_range", env.call_args.kwargs)
+            self.assertEqual(set(env.call_args.kwargs["controller_configs"]["body_parts"]), {"right"})
+            self.assertIn("gripper", env.call_args.kwargs["controller_configs"]["body_parts"]["right"])
+            self.assertIs(env.call_args.kwargs["hard_reset"], False)
             self.assertEqual(expert.call_args.kwargs["rotation_mode"], mode)
 
     def test_invalid_temporal_settings_fail_before_writing_artifacts(self):
@@ -207,8 +230,8 @@ class PickExperimentTests(unittest.TestCase):
         for index, (episode_index, start) in enumerate(dataset.windows):
             sample = dataset[index]
             entry = dataset.episodes[episode_index]
-            with np.load(self.dataset / entry["path"]) as archive:
-                actions = archive["actions"]
+            with open_episode(self.dataset / entry["path"]) as archive:
+                actions = archive["actions"][:]
             valid = min(4, len(actions) - start)
             self.assertEqual(sample["episode_path"], entry["path"])
             self.assertEqual(sample["valid_mask"].sum(), valid)

@@ -2,7 +2,7 @@
 
 Jalankan dari root repo dalam **CMD** dengan Conda aktif. Model Visual-BC menerima
 RGB dan proprio robot untuk memprediksi satu action. Environment Pick/Place/Stack
-dan format NPZ tetap dipertahankan; training saat ini khusus fixed-target Pick.
+tetap dipertahankan. Episode disimpan sebagai HDF5; training saat ini khusus fixed-target Pick.
 
 ## 1. Setup
 
@@ -80,7 +80,7 @@ Setelah collect selesai, otomatis tersedia:
 
 ```text
 data/demos/pick_red_v01/pick/
-  episode_000000.npz ...      T actions, T+1 observations
+  episode_000000.hdf5 ...     T actions, T+1 observations
   manifest.jsonl             Episode sukses
   attempts.jsonl             Semua percobaan
 data/splits/pick_red_v01_bc/
@@ -93,8 +93,35 @@ data/splits/pick_red_v01_bc/
 Tidak perlu command create-splits atau compute-normalization. Default split
 memakai seed 123, tanpa stratifikasi fase/count/task. Minimal dua demo sukses
 dibutuhkan. `--training-dir PATH` dapat mengubah lokasi artifact otomatis.
-Orphan NPZ akibat interupsi harus diperiksa dan dikarantina sebelum persiapan;
+Orphan HDF5 akibat interupsi harus diperiksa dan dikarantina sebelum persiapan;
 jangan asal menambahkan file ke manifest.
+
+### Penyimpanan HDF5 Dan Dataset Lama
+
+Satu episode = satu `.hdf5`, ditulis atomik sebelum manifest. Array tetap memakai
+nama `actions`, `phases`, `obs__...`, `metadata_json`, dan `result_json`.
+RGB memakai gzip level 4 dengan chunk satu frame; loader frame/GRU hanya membaca
+timestep/window yang diperlukan. Cache menyimpan maksimum 16 file handle per
+dataset/proses, bukan seluruh gambar episode. Handle tidak dibagikan antar-worker.
+Normalisasi tetap train-only, dan pemeriksaan kamera membaca blok frame terbatas.
+
+NPZ lama tidak dapat langsung dipakai atau dicampur dengan collection HDF5.
+Konversi opsional berikut tidak mengubah sumber dan otomatis membuat split serta
+normalisasi baru. Kedua folder output harus baru:
+
+```bat
+python -m data.episode_io ^
+  --source data/demos/pick_red_v01 ^
+  --output data/demos/pick_red_v01_hdf5 ^
+  --training-dir data/splits/pick_red_v01_hdf5_bc
+```
+
+Setelah konversi, gunakan `--dataset data/demos/pick_red_v01_hdf5` dan run training
+baru. Fingerprint berubah, jadi jangan resume checkpoint training NPZ pada data
+hasil konversi. Checkpoint mandiri lama tetap dapat dievaluasi: arsitektur model
+tidak berubah. Command enam eksperimen di bawah tetap sama, hanya format file
+yang otomatis menjadi HDF5. Konversi ini untuk schema NPZ project ini, bukan
+import bebas dari HDF5 repo lain.
 
 Opsional, audit tidak diperlukan untuk menghasilkan artifact training:
 

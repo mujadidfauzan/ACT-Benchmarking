@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+from data.episode_io import HDF5_SUFFIXES, open_episode, read_json
+
 from environments.instructions import TEMPLATES
 from environments.entity_utils import COLOR_PALETTE
 
@@ -68,7 +70,7 @@ def parse_args():
     parser.add_argument(
         "--check-duplicates",
         action="store_true",
-        help="Hash complete NPZ files to detect byte-identical episodes",
+        help="Hash complete HDF5 files to detect byte-identical episodes",
     )
     parser.add_argument(
         "--expected-pick-target-color",
@@ -102,13 +104,7 @@ def read_jsonl(path):
 
 
 def scalar_json(value, field):
-    try:
-        raw = value.item()
-    except ValueError as error:
-        raise ValueError(f"{field} must be a scalar JSON string") from error
-    if not isinstance(raw, str):
-        raise ValueError(f"{field} must contain a JSON string")
-    return json.loads(raw)
+    return read_json(value, field)
 
 
 def entity_by_id(entities, entity_id):
@@ -273,8 +269,8 @@ def audit_episode(path, task, manifest_entry, args):
     errors = []
     details = {}
     try:
-        with np.load(path, allow_pickle=False) as episode:
-            keys = set(episode.files)
+        with open_episode(path) as episode:
+            keys = set(episode.keys())
             required_camera_keys = {
                 CAMERA_KEYS[name] for name in args.camera_names
             }
@@ -296,7 +292,7 @@ def audit_episode(path, task, manifest_entry, args):
                     f"{manifest_cameras!r} != {args.camera_names!r}"
                 )
 
-            actions = episode["actions"]
+            actions = episode["actions"][:]
             metadata = scalar_json(episode["metadata_json"], "metadata_json")
             result = scalar_json(episode["result_json"], "result_json")
             observation_keys = sorted(key for key in keys if key.startswith("obs__"))
@@ -319,10 +315,8 @@ def audit_episode(path, task, manifest_entry, args):
                     errors.append(
                         f"phases has {len(phases)} labels; expected {len(actions)}"
                     )
-                elif phases.dtype.kind not in {"U", "S"}:
-                    errors.append(f"phases must contain strings, got {phases.dtype}")
                 else:
-                    phase_values = [str(value) for value in phases.tolist()]
+                    phase_values = phases.asstr()[:].tolist()
                     phase_counts = dict(sorted(Counter(phase_values).items()))
                     invalid_phases = sorted(
                         phase
@@ -334,12 +328,12 @@ def audit_episode(path, task, manifest_entry, args):
                             "invalid phase labels: " + ", ".join(invalid_phases)
                         )
             elif "phase_counts" in manifest_entry:
-                errors.append("manifest declares phase counts but NPZ has no phases")
+                errors.append("manifest declares phase counts but HDF5 has no phases")
 
             if "phase_counts" in manifest_entry:
                 expected_phase_counts = manifest_entry["phase_counts"]
                 if phase_counts != expected_phase_counts:
-                    errors.append("manifest phase counts do not match NPZ phases")
+                    errors.append("manifest phase counts do not match HDF5 phases")
 
             expected_observations = len(actions) + 1
             for key in observation_keys:
@@ -353,7 +347,7 @@ def audit_episode(path, task, manifest_entry, args):
                 value = episode[key]
                 if not np.issubdtype(value.dtype, np.number):
                     errors.append(f"{key} must be numeric, got {value.dtype}")
-                elif not np.isfinite(value).all():
+                elif not np.isfinite(value[:]).all():
                     errors.append(f"{key} contains NaN or Inf")
 
             rgb_stats = {}
@@ -386,9 +380,9 @@ def audit_episode(path, task, manifest_entry, args):
             if manifest_entry.get("steps") != len(actions):
                 errors.append("manifest steps does not match action count")
             if manifest_entry.get("instruction") != metadata.get("instruction"):
-                errors.append("manifest instruction does not match NPZ metadata")
+                errors.append("manifest instruction does not match HDF5 metadata")
             if manifest_entry.get("metadata") != metadata:
-                errors.append("manifest metadata does not match NPZ metadata")
+                errors.append("manifest metadata does not match HDF5 metadata")
             try:
                 generated = expected_instruction(metadata)
                 if generated != metadata.get("instruction"):
@@ -418,7 +412,7 @@ def audit_episode(path, task, manifest_entry, args):
                 "rgb": rgb_stats,
             }
             return errors, details, metadata
-    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
         return [f"cannot read episode: {type(error).__name__}: {error}"], details, None
 
 
@@ -529,7 +523,7 @@ def audit_task(dataset_root, task, args, digest_paths):
     orphan_files = []
     if args.limit_per_task is None:
         manifest_path_set = {path for path in manifest_paths if isinstance(path, str)}
-        disk_path_set = {path.name for path in task_dir.glob("episode_*.npz")}
+        disk_path_set = {path.name for path in task_dir.glob("episode_*") if path.suffix in HDF5_SUFFIXES or path.suffix == ".npz"}
         orphan_files = sorted(disk_path_set - manifest_path_set)
         for orphan in orphan_files:
             errors.append({"path": orphan, "error": "episode is not listed in manifest"})

@@ -31,6 +31,29 @@ No separate split/normalization command is required. Training artifacts go to
 `--num-demos` targets the total successful episodes for a task. The legacy
 `--episodes` recorder flag still means additional episodes.
 
+## HDF5 Storage
+
+Each successful episode is written atomically as `episode_000000.hdf5` before
+its manifest entry. Array names remain `actions`, `phases`, `obs__...`,
+`metadata_json`, and `result_json`. Numeric observations have T+1 frames for T
+actions; strings use UTF-8. RGB is losslessly compressed with gzip level 4 and
+one frame per chunk. Frame and GRU loaders read only the requested timestep or
+window, with up to 16 cached file handles per dataset instance/process.
+
+Old NPZ datasets are not mixed with HDF5 recordings. Optional migration creates
+a new dataset and automatically prepares its split/statistics, without changing
+the source:
+
+```bash
+python -m data.episode_io --source data/demos/pick_red_v01 \
+  --output data/demos/pick_red_v01_hdf5
+```
+
+Use the new dataset path for training and a new run directory. Migration changes
+dataset fingerprints, so an old training checkpoint cannot resume on the
+converted dataset. Existing self-contained checkpoints remain usable for
+evaluation because the model architecture and normalization are unchanged.
+
 ## Architecture And Objective
 
 - Independent trainable CNNs for agentview and optional eye-in-hand RGB.

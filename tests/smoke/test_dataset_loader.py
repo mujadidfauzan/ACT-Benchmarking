@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from data.bc_preparation import default_training_dir, load_bc_training
 from data.manipulation_dataset import CAMERA_OBSERVATION_KEYS, EpisodeSequenceDataset, ManipulationDataset
 from data.normalization import PolicyNormalizer
+from data.episode_io import open_episode
 
 
 def parse_args():
@@ -54,7 +55,7 @@ def main():
             if key in batch:
                 assert batch[key].shape[:-2] == (*prefix, 3)
                 assert 0 <= batch[key].min() and batch[key].max() <= 1
-        with np.load(args.dataset / dataset.episodes[0]["path"], allow_pickle=False) as archive:
+        with open_episode(args.dataset / dataset.episodes[0]["path"]) as archive:
             expected = archive[CAMERA_OBSERVATION_KEYS["agentview"]][0]
         frame = batch["image"][0, 0] if args.temporal else batch["image"][0]
         actual = frame.mul(255).round().byte().permute(1, 2, 0).numpy()
@@ -64,6 +65,7 @@ def main():
         torch.testing.assert_close(normalizer.denormalize_action(normalized_action), batch["action"])
         print(f"{split}: {len(dataset)} samples, {len(dataset.episodes)} episodes, {len(loader)} batches")
         print(f"  RGB: {tuple(batch['image'].shape)}, proprio: {tuple(batch['proprio'].shape)}, action: {tuple(batch['action'].shape)}")
+        dataset.close()
     print("Dataset loader smoke test: PASS")
 
 

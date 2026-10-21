@@ -1,10 +1,14 @@
 """Frame and episode-local recurrent BC datasets with RGB and robot proprioception."""
 
 import json
+import os
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+
+from data.episode_io import HDF5_SUFFIXES, open_episode
 
 try:
     import torch
@@ -60,7 +64,7 @@ class ManipulationDataset(Dataset):
         self,
         dataset_root,
         split_manifest,
-        cache_size=1,
+        cache_size=16,
         proprio_keys=DEFAULT_POLICY_PROPRIO_KEYS,
         camera_keys=DEFAULT_POLICY_CAMERA_KEYS,
     ):
@@ -86,10 +90,13 @@ class ManipulationDataset(Dataset):
         self.policy_observation_keys = (*self.camera_keys, *self.proprio_keys)
         self.episodes = read_split_manifest(self.split_manifest)
         self._cache = OrderedDict()
+        self._pid = os.getpid()
         self._sample_index = []
 
         for episode_index, entry in enumerate(self.episodes):
             path = self.dataset_root / entry["path"]
+            if path.suffix not in HDF5_SUFFIXES:
+                raise ValueError("Training requires HDF5 demos; convert NPZ with python -m data.episode_io")
             if not path.is_file():
                 raise FileNotFoundError(f"Episode does not exist: {path}")
             steps = int(entry["steps"])
@@ -104,19 +111,19 @@ class ManipulationDataset(Dataset):
 
     @property
     def proprio_dim(self):
-        episode = self._load_episode(0)
-        return int(
-            sum(episode[key].shape[-1] for key in self.proprio_keys)
-        )
+        with self._episode(0) as episode:
+            return int(sum(episode[key].shape[-1] for key in self.proprio_keys))
 
     @property
     def action_dim(self):
-        return int(self._load_episode(0)["actions"].shape[-1])
+        with self._episode(0) as episode:
+            return int(episode["actions"].shape[-1])
 
     def _read_episode(self, episode_index):
         entry = self.episodes[episode_index]
         path = self.dataset_root / entry["path"]
-        with np.load(path, allow_pickle=False) as archive:
+        archive = open_episode(path)
+        try:
             missing = [
                 key
                 for key in ("actions", *self.policy_observation_keys)
@@ -124,36 +131,55 @@ class ManipulationDataset(Dataset):
             ]
             if missing:
                 raise KeyError(f"{path} is missing policy keys: {missing}")
-            episode = {
-                "actions": np.asarray(archive["actions"], dtype=np.float32),
-            }
+            actions = archive["actions"]
+            if actions.shape != (int(entry["steps"]), 7):
+                raise ValueError(f"Action shape mismatch for {path}: {actions.shape}")
             for key in self.policy_observation_keys:
-                episode[key] = np.asarray(archive[key])
+                if not archive[key].ndim or archive[key].shape[0] != len(actions) + 1:
+                    raise ValueError(f"Observation alignment mismatch for {path}, key {key}")
+            return archive
+        except BaseException:
+            archive.close()
+            raise
 
-        steps = len(episode["actions"])
-        if steps != int(entry["steps"]):
-            raise ValueError(
-                f"Step count mismatch for {path}: split={entry['steps']}, npz={steps}"
-            )
-        for key in self.policy_observation_keys:
-            if len(episode[key]) != steps + 1:
-                raise ValueError(
-                    f"Observation alignment mismatch for {path}, key {key}"
-                )
-        return episode
-
-    def _load_episode(self, episode_index):
+    @contextmanager
+    def _episode(self, episode_index):
+        # Each DataLoader process owns its own bounded set of HDF5 handles.
+        if self._pid != os.getpid():
+            self.close()
+            self._pid = os.getpid()
+        if not self.cache_size:
+            with self._read_episode(episode_index) as episode:
+                yield episode
+            return
         if episode_index in self._cache:
             self._cache.move_to_end(episode_index)
-            return self._cache[episode_index]
-
-        episode = self._read_episode(episode_index)
-        if self.cache_size:
+            episode = self._cache[episode_index]
+        else:
+            episode = self._read_episode(episode_index)
             self._cache[episode_index] = episode
-            self._cache.move_to_end(episode_index)
             while len(self._cache) > self.cache_size:
-                self._cache.popitem(last=False)
-        return episode
+                _, previous = self._cache.popitem(last=False)
+                previous.close()
+        yield episode
+
+    def close(self):
+        for handle in getattr(self, "_cache", {}).values():
+            handle.close()
+        if hasattr(self, "_cache"):
+            self._cache.clear()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_cache"] = OrderedDict()
+        state["_pid"] = None
+        return state
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _image_tensor(self, image):
         if image.ndim != 3 or image.shape[-1] != 3:
@@ -171,23 +197,19 @@ class ManipulationDataset(Dataset):
     def __getitem__(self, index):
         episode_index, timestep = self._sample_index[index]
         entry = self.episodes[episode_index]
-        episode = self._load_episode(episode_index)
-        sample = {
-            "image": self._image_tensor(
-                episode[CAMERA_OBSERVATION_KEYS["agentview"]][timestep]
-            ),
-            "proprio": self._proprio_tensor(episode, timestep),
-            "task": entry["task"],
-            "episode_path": entry["path"],
-            "timestep": torch.tensor(timestep, dtype=torch.long),
-        }
-        eye_key = CAMERA_OBSERVATION_KEYS["robot0_eye_in_hand"]
-        if eye_key in self.camera_keys:
-            sample["eye_in_hand_image"] = self._image_tensor(
-                episode[eye_key][timestep]
-            )
-        sample["action"] = torch.from_numpy(episode["actions"][timestep].copy())
-        return sample
+        with self._episode(episode_index) as episode:
+            sample = {
+                "image": self._image_tensor(episode[CAMERA_OBSERVATION_KEYS["agentview"]][timestep]),
+                "proprio": self._proprio_tensor(episode, timestep),
+                "task": entry["task"],
+                "episode_path": entry["path"],
+                "timestep": torch.tensor(timestep, dtype=torch.long),
+            }
+            eye_key = CAMERA_OBSERVATION_KEYS["robot0_eye_in_hand"]
+            if eye_key in self.camera_keys:
+                sample["eye_in_hand_image"] = self._image_tensor(episode[eye_key][timestep])
+            sample["action"] = torch.from_numpy(np.asarray(episode["actions"][timestep], dtype=np.float32))
+            return sample
 
 
 class EpisodeSequenceDataset(ManipulationDataset):
@@ -207,7 +229,6 @@ class EpisodeSequenceDataset(ManipulationDataset):
     def __getitem__(self, index):
         episode_index, start = self.windows[index]
         entry = self.episodes[episode_index]
-        episode = self._load_episode(episode_index)
         end = min(start + self.sequence_length, int(entry["steps"]))
         valid = end - start
 
@@ -216,19 +237,21 @@ class EpisodeSequenceDataset(ManipulationDataset):
                 return value
             return torch.cat((value, value[-1:].expand(self.sequence_length - valid, *value.shape[1:])))
 
-        sample = {"task": entry["task"], "episode_path": entry["path"],
-                  "timestep": pad_last(torch.arange(start, end)),
-                  "proprio": pad_last(torch.stack([self._proprio_tensor(episode, step) for step in range(start, end)])),
-                  "action": pad_last(torch.from_numpy(episode["actions"][start:end].copy()))}
-        for name, output_key in (("agentview", "image"), ("robot0_eye_in_hand", "eye_in_hand_image")):
-            key = CAMERA_OBSERVATION_KEYS[name]
-            if key in self.camera_keys:
-                frames = np.ascontiguousarray(episode[key][start:end].transpose(0, 3, 1, 2))
-                sample[output_key] = pad_last(torch.from_numpy(frames).float().div_(255.0))
-        if start == 0:
-            previous = np.concatenate(([-1.0], episode["actions"][:end - 1, 6]))
-        else:
-            previous = episode["actions"][start - 1:end - 1, 6]
-        sample["previous_gripper"] = pad_last(torch.from_numpy(np.where(previous > 0, 1., -1.).astype(np.float32)[:, None]))
-        sample["valid_mask"] = torch.arange(self.sequence_length) < valid
-        return sample
+        with self._episode(episode_index) as episode:
+            proprio = np.concatenate([episode[key][start:end] for key in self.proprio_keys], axis=-1).astype(np.float32)
+            sample = {"task": entry["task"], "episode_path": entry["path"],
+                      "timestep": pad_last(torch.arange(start, end)),
+                      "proprio": pad_last(torch.from_numpy(proprio)),
+                      "action": pad_last(torch.from_numpy(episode["actions"][start:end].astype(np.float32)))}
+            for name, output_key in (("agentview", "image"), ("robot0_eye_in_hand", "eye_in_hand_image")):
+                key = CAMERA_OBSERVATION_KEYS[name]
+                if key in self.camera_keys:
+                    frames = np.ascontiguousarray(episode[key][start:end].transpose(0, 3, 1, 2))
+                    sample[output_key] = pad_last(torch.from_numpy(frames).float().div_(255.0))
+            if start == 0:
+                previous = np.concatenate(([-1.0], episode["actions"][:end - 1, 6]))
+            else:
+                previous = episode["actions"][start - 1:end - 1, 6]
+            sample["previous_gripper"] = pad_last(torch.from_numpy(np.where(previous > 0, 1., -1.).astype(np.float32)[:, None]))
+            sample["valid_mask"] = torch.arange(self.sequence_length) < valid
+            return sample

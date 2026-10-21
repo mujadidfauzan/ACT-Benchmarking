@@ -1,6 +1,7 @@
 # Install the CPU or CUDA build of torch first; see docs/.
 # These simulation pins match the existing dataset-generation environment.
 numpy==1.26.4
+h5py>=3.10,<4
 mujoco==3.3.7
 robosuite==1.5.2
 opencv-python==4.11.0.86
