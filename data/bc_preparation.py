@@ -6,7 +6,7 @@ import random
 from pathlib import Path
 
 import numpy as np
-from data.episode_io import HDF5_SUFFIXES, open_episode
+from data.episode_io import HDF5_SUFFIXES, open_episode, read_json
 from environments.pick_config import validate_pick_settings
 
 
@@ -106,8 +106,22 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
     signatures = set()
     orientation = set()
     environment_configs = {}
+    place_colors = set()
     for entry in entries:
         with open_episode(dataset / entry["path"]) as archive:
+            if entry["task"] == "place":
+                metadata = entry.get("metadata", {})
+                color = metadata.get("fixed_target_color")
+                objects = [v for v in metadata.get("objects", []) if v["id"] == metadata.get("target_object")]
+                trays = [v for v in metadata.get("receptacles", []) if v["id"] == metadata.get("target_receptacle")]
+                if color is None or len(objects) != 1 or len(trays) != 1 or objects[0]["color"] != color or trays[0]["color"] != color:
+                    raise ValueError("Place BC requires a fixed matching-color object/receptacle pair")
+                stored = read_json(archive["metadata_json"], "metadata_json")
+                if stored != metadata:
+                    raise ValueError("Place metadata differs between manifest and episode")
+                if sum(v["color"] == color for v in metadata["objects"]) != 1 or sum(v["color"] == color for v in metadata["receptacles"]) != 1:
+                    raise ValueError("Ambiguous fixed-color Place targets")
+                place_colors.add(color)
             actions = archive["actions"][:]
             if actions.shape != (entry["steps"], 7) or not len(actions) or not np.isfinite(actions).all():
                 raise ValueError(f"Invalid actions: {entry['path']}")
@@ -150,6 +164,8 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
                     raise ValueError(f"Invalid state observations for {key} in {entry['path']}")
     if len(signatures) != 1 or len(orientation) != 1:
         raise ValueError("Dataset mixes camera/resolution/orientation configurations; use separate datasets")
+    if len(place_colors) > 1:
+        raise ValueError("Dataset mixes fixed Place target colors")
     camera_names, camera_sizes = signatures.pop()
     if len(set(camera_sizes)) != 1 or camera_sizes[0][0] != camera_sizes[0][1]:
         raise ValueError("Demo collection expects square images of equal size for every camera")
@@ -192,7 +208,7 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
                   "action": {"mean": action_mean.tolist(), "std": action_std.tolist()},
                   "training_timesteps": count}
     save_json(output / "normalization.json", statistics)
-    target_colors = {e.get("metadata", {}).get("target_color") for e in entries if e["task"] == "pick"}
+    target_colors = {e.get("metadata", {}).get("target_color") for e in entries if e["task"] == "pick"} | place_colors
     config = {"format_version": 1, "method": "visual_bc", "storage_format": "hdf5", "seed": seed,
               "rotation_mode": "align_yaw" if predict_orientation else "none",
               "val_fraction": val_fraction, "source_digest": source_digest(dataset, entries),

@@ -2,7 +2,7 @@
 
 Jalankan dari root repo dalam Bash. Model Visual-BC menerima RGB dan proprio
 robot untuk memprediksi satu action. Storage episode memakai HDF5, dan training saat ini
-khusus fixed-target Pick.
+mendukung fixed-target Pick dan matching-color Place (bagian 7).
 
 ## 1. Setup
 
@@ -228,9 +228,17 @@ menghasilkan -1/+1. `align_yaw` belajar motion 6D, `none` hanya XYZ; output
 rotasi mode `none` tetap nol setelah denormalisasi. Proprio kedua mode sama 16D.
 
 Log memisahkan XYZ, rotation, dan gripper loss. `best.pt` dipilih dari val loss;
-`latest.pt` berisi optimizer/progress. Tidak ada rollout periodik: training
-offline lalu evaluation. Trainer ini khusus fixed-target Pick dan menolak
-dataset dengan target ambigu.
+`latest.pt` berisi optimizer/progress. Default rollout setiap 10 epoch:
+`--rollout-eval-every 10 --rollout-eval-episodes 20 --rollout-eval-num-seeds 5
+--rollout-eval-seed 1000` (100 percobaan per evaluasi dengan seed tetap).
+`best_rollout.pt` dipilih dari success rate tertinggi; nilai seri tidak mengganti
+checkpoint. Laporan ada di `rollouts/epoch_XXXX/` dan `rollout_evaluations.json`.
+Tidak merekam video otomatis. `--early-stopping-patience 7` menghentikan training
+setelah 7 epoch berturut-turut tanpa val loss lebih rendah, termasuk sebelum
+rollout pertama. Counter tersimpan saat resume; naikkan patience atau gunakan 0
+untuk melanjutkan run yang sudah early stop. `--rollout-eval-every 0` mematikan
+rollout. Gunakan seed final berbeda dari seed rollout pemilihan model.
+Trainer mendukung fixed-target Pick atau matching-color Place dan menolak target ambigu.
 
 CPU smoke: pada data kecil gunakan `--device cpu --epochs 2 --batch-size 4` dan
 RUN baru. Itu bukan pengukuran final. Tidak perlu melatih CPU lagi setelah
@@ -364,3 +372,57 @@ normalisasi dibuat otomatis saat collection, tanpa command persiapan manual.
 
 Gunakan dataset baru mengikuti alur di atas. Checkpoint model lama tidak dapat
 di-resume dengan model visual ini.
+
+## 7. Place Tanpa Language: Merah ke Merah
+
+Dataset baru: kubus merah ke tray merah, warna lain distractor, ID dan posisi
+diacak. Instruksi tersimpan sebagai metadata saja. Place memakai yaw acak
++/-45 derajat dengan action rotasi aktif, bukan flag ablation yaw/rotasi Pick.
+
+```bash
+python -m scripts.record_demonstrations \
+  --task place --num-demos 300 \
+  --num-objects 3 --num-receptacles 3 \
+  --fixed-target-color red \
+  --camera-names agentview robot0_eye_in_hand \
+  --seed 42 --max-attempts 1500 \
+  --output data/demos/place_red_v01
+
+python -m scripts.train_visual_bc \
+  --dataset data/demos/place_red_v01 \
+  --epochs 100 --batch-size 128 --learning-rate 0.0001 \
+  --rollout-eval-every 10 --rollout-eval-episodes 10 \
+  --rollout-eval-num-seeds 1 --rollout-eval-seed 1000 \
+  --early-stopping-patience 7 --device cuda \
+  --output-dir results/visual_bc/place_red_v01_frame
+
+python -m scripts.evaluate_visual_bc \
+  --checkpoint results/visual_bc/place_red_v01_frame/best_rollout.pt \
+  --episodes 20 --num-seeds 5 --seed 2000 \
+  --num-objects 3 --num-receptacles 3 \
+  --device cuda --record-video --log-rollout \
+  --output-dir results/visual_bc_evaluation/place_red_v01_final
+```
+
+Gunakan konfigurasi MUJOCO_GL yang sudah dipilih pada setup Linux di atas.
+HDF5, split train/val dan normalisasi dibuat otomatis setelah collection.
+Untuk GRU tambahkan `--temporal --sequence-length 16 --sequence-stride 8`,
+ubah batch size ke 8 dan output ke `results/visual_bc/place_red_v01_gru`.
+Resume: tambahkan `--resume results/visual_bc/place_red_v01_frame/latest.pt`
+pada training dengan output sama dan epochs total lebih besar. Jangan resume
+checkpoint Pick sebagai Place. Bila early stopping terjadi sebelum rollout
+pertama dan `best_rollout.pt` belum ada, evaluasi `best.pt`.
+
+Evaluator memilih task dari checkpoint, dengan horizon Place default 3000.
+Sukses memerlukan kubus muat dalam tray (orientasi diperhitungkan), tinggi
+sesuai tray, EEF menjauh >8 cm, action gripper open, dan distractor bergeser
+tidak lebih dari 4 cm selama 20 langkah berurutan. Expert memakai pemeriksaan
+fisik yang sama setelah release/retreat. Kegagalan dicatat di
+`place_attempts.jsonl`: no_lift, wrong_object, wrong_receptacle, not_released,
+distractor_displacement, place_timeout. Evaluasi final memakai seed berbeda
+dari rollout pemilihan model.
+
+Variasi scene: gunakan `--object-counts 1 2 3 --receptacle-counts 1 2 3` sebagai
+pengganti count tunggal saat collection. Evaluasi tiap kombinasi dengan output
+terpisah. Rollout otomatis memakai jumlah maksimum di dataset, bukan semua
+kombinasi sekaligus.

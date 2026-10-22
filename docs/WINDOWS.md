@@ -2,7 +2,8 @@
 
 Jalankan dari root repo dalam **CMD** dengan Conda aktif. Model Visual-BC menerima
 RGB dan proprio robot untuk memprediksi satu action. Environment Pick/Place/Stack
-tetap dipertahankan. Episode disimpan sebagai HDF5; training saat ini khusus fixed-target Pick.
+tetap dipertahankan. Episode disimpan sebagai HDF5; training mendukung fixed-target
+Pick dan Place dengan objek/tray target berwarna sama (bagian 7).
 
 ## 1. Setup
 
@@ -238,12 +239,21 @@ mode `none` belajar XYZ dan gripper, dengan action rotasi nol juga setelah
 denormalisasi. Proprio tetap 16D pada kedua mode, agar input tidak ikut berubah.
 
 Log mencatat loss total, XYZ, rotation, dan gripper secara terpisah. `best.pt`
-dipilih dari val loss; `latest.pt` menyimpan optimizer dan progress. Tidak ada
-evaluasi rollout otomatis di tengah training; jalankan evaluator setelah training.
+dipilih dari val loss; `latest.pt` menyimpan optimizer dan progress.
+Default rollout setiap 10 epoch: `--rollout-eval-every 10`,
+`--rollout-eval-episodes 20 --rollout-eval-num-seeds 5 --rollout-eval-seed 1000`
+(100 percobaan per evaluasi, seed tetap). `best_rollout.pt` menyimpan model dengan
+success rate tertinggi; nilai seri tidak mengganti checkpoint. Laporan ada di
+`rollouts/epoch_XXXX/` dan `rollout_evaluations.json`, tanpa video otomatis.
+`--early-stopping-patience 7` menghentikan training setelah 7 epoch berturut-turut
+tanpa val loss lebih rendah. Bisa berhenti sebelum rollout pertama.
+Counter disimpan saat resume; naikkan patience atau gunakan 0 untuk melanjutkan
+run yang sudah early stop. `--rollout-eval-every 0` mematikan rollout.
+Gunakan seed evaluasi final yang berbeda dari seed rollout pemilihan model.
 
 CPU smoke: gunakan `--device cpu --epochs 2 --batch-size 4` pada dataset kecil
 dan RUN baru. Trainer ini menolak
-dataset selain fixed-target Pick agar tidak melatih target yang ambigu.
+dataset selain fixed-target Pick atau matching-color Place agar target tidak ambigu.
 
 ### Temporal History Dengan GRU
 
@@ -357,3 +367,56 @@ Pada SSH Windows, CMD tidak memiliki tmux. Gunakan sesi desktop/Task Scheduler
 yang tetap hidup dan working directory root repo; jangan menganggap proses
 bertahan setelah SSH ditutup. WinError 1455/MemoryError memerlukan pemeriksaan
 RAM, pagefile, dan disk, bukan otomatis berarti GPU tidak kompatibel.
+
+## 7. Place Tanpa Language: Merah ke Merah
+
+Gunakan dataset/run baru, bukan resume checkpoint Pick. Kubus merah dan tray
+merah selalu ada dan menjadi target; warna lain distractor. ID dan posisi
+diacak. Deskripsi instruksi hanya metadata, bukan input model.
+Place saat ini memakai yaw acak +/-45 derajat dan action rotasi aktif;
+flag ablation yaw/rotasi Pick tidak berlaku untuk Place.
+
+```bat
+python -m scripts.record_demonstrations ^
+  --task place --num-demos 300 ^
+  --num-objects 3 --num-receptacles 3 ^
+  --fixed-target-color red ^
+  --camera-names agentview robot0_eye_in_hand ^
+  --seed 42 --max-attempts 1500 ^
+  --output data/demos/place_red_v01
+
+python -m scripts.train_visual_bc ^
+  --dataset data/demos/place_red_v01 ^
+  --epochs 100 --batch-size 128 --learning-rate 0.0001 ^
+  --rollout-eval-every 10 --rollout-eval-episodes 10 ^
+  --rollout-eval-num-seeds 1 --rollout-eval-seed 1000 ^
+  --early-stopping-patience 7 --device cuda ^
+  --output-dir results/visual_bc/place_red_v01_frame
+
+python -m scripts.evaluate_visual_bc ^
+  --checkpoint results/visual_bc/place_red_v01_frame/best_rollout.pt ^
+  --episodes 20 --num-seeds 5 --seed 2000 ^
+  --num-objects 3 --num-receptacles 3 ^
+  --device cuda --record-video --log-rollout ^
+  --output-dir results/visual_bc_evaluation/place_red_v01_final
+```
+
+HDF5, train/val split dan normalisasi dibuat otomatis setelah collection.
+Untuk GRU, tambahkan `--temporal --sequence-length 16 --sequence-stride 8`,
+ubah batch size menjadi 8, dan output menjadi `results/visual_bc/place_red_v01_gru`.
+Untuk resume tambahkan `--resume results/visual_bc/place_red_v01_frame/latest.pt`
+pada command training dengan output yang sama dan epochs total lebih besar.
+Early stopping dapat terjadi sebelum rollout pertama; bila `best_rollout.pt`
+belum ada, evaluasi `best.pt`. Seed final berbeda dari seed pemilihan model.
+
+Evaluator otomatis memilih Place dari checkpoint; horizon default 3000 langkah.
+Sukses membutuhkan kubus muat dalam tray (termasuk orientasi), tinggi sesuai
+tray, EEF menjauh lebih dari 8 cm, action gripper open, dan distractor tidak
+bergeser lebih dari 4 cm, selama 20 langkah berurutan. Kriteria fisik yang sama
+dipakai verifikasi expert (setelah release/retreat). Bukan hanya jarak XY atau lift.
+Laporan `place_attempts.jsonl` mencatat `no_lift`, `wrong_object`,
+`wrong_receptacle`, `not_released`, `distractor_displacement`, atau `place_timeout`.
+Untuk variasi jumlah scene, gunakan `--object-counts 1 2 3` dan
+`--receptacle-counts 1 2 3` sebagai pengganti count tunggal saat collection;
+evaluasi tiap kombinasi dengan output terpisah. Rollout otomatis memakai
+jumlah maksimum yang tercatat, bukan mengevaluasi semua kombinasi.

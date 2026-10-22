@@ -23,6 +23,7 @@ from robosuite.utils.placement_samplers import (
 )
 from robosuite.utils.transform_utils import (
     convert_quat,
+    quat2mat,
 )
 
 from environments.instructions import generate_instruction
@@ -315,6 +316,7 @@ class PlaceEnv(ManipulationEnv):
         initialization_noise="default",
         num_objects=3,
         num_receptacles=3,
+        fixed_target_color=None,
         instruction_split="train",
         table_full_size=(0.8, 0.8, 0.05),
         table_friction=(1.0, 0.005, 0.0001),
@@ -349,6 +351,9 @@ class PlaceEnv(ManipulationEnv):
             raise ValueError("num_receptacles must be between 1 and 4")
 
         self.num_objects = int(num_objects)
+        if fixed_target_color is not None and fixed_target_color not in COLOR_PALETTE:
+            raise ValueError(f"Unknown fixed target color: {fixed_target_color}")
+        self.fixed_target_color = fixed_target_color
         self.num_receptacles = int(num_receptacles)
         self.object_ids = [f"object_{index}" for index in range(self.num_objects)]
         self.receptacle_ids = [
@@ -540,8 +545,9 @@ class PlaceEnv(ManipulationEnv):
                 np.concatenate([np.asarray(position), np.asarray(quaternion)]),
             )
 
-        object_colors = sample_unique_colors(self.rng, self.num_objects)
-        receptacle_colors = sample_unique_colors(self.rng, self.num_receptacles)
+        fixed = getattr(self, "fixed_target_color", None)
+        object_colors = sample_unique_colors(self.rng, self.num_objects, fixed)
+        receptacle_colors = sample_unique_colors(self.rng, self.num_receptacles, fixed)
         self.object_id_to_color = dict(zip(self.object_ids, object_colors))
         self.receptacle_id_to_color = dict(
             zip(self.receptacle_ids, receptacle_colors)
@@ -553,8 +559,8 @@ class PlaceEnv(ManipulationEnv):
             color: receptacle_id
             for receptacle_id, color in self.receptacle_id_to_color.items()
         }
-        self.target_object_id = str(self.rng.choice(self.object_ids))
-        self.target_receptacle_id = str(self.rng.choice(self.receptacle_ids))
+        self.target_object_id = self.object_color_to_id[fixed] if fixed else str(self.rng.choice(self.object_ids))
+        self.target_receptacle_id = self.receptacle_color_to_id[fixed] if fixed else str(self.rng.choice(self.receptacle_ids))
         self.cube_color = self.object_id_to_color[self.target_object_id]
         self.receptacle_color = self.receptacle_id_to_color[
             self.target_receptacle_id
@@ -688,6 +694,9 @@ class PlaceEnv(ManipulationEnv):
             ],
             "target_object": self.target_object_id,
             "target_receptacle": self.target_receptacle_id,
+            "target_color": object_color,
+            "target_receptacle_color": receptacle_color,
+            "fixed_target_color": getattr(self, "fixed_target_color", None),
             "sampling_stats": self.last_sampling_stats.copy(),
             "semantic_split": semantic_split_for(
                 "place",
@@ -707,3 +716,27 @@ class PlaceEnv(ManipulationEnv):
         return bool(
             np.linalg.norm(object_position[:2] - receptacle_position[:2]) <= 0.04
         )
+
+    def placement_status(self, eef_position, initial_object_positions):
+        """Physical Place criteria shared by expert verification and policy rollouts."""
+        position = self.get_object_position()
+
+        def inside(receptacle_id):
+            rotation = quat2mat(self.get_receptacle_orientation(receptacle_id))
+            local = rotation.T @ (position - self.get_receptacle_position(receptacle_id))
+            cube_rotation = rotation.T @ quat2mat(self.get_object_orientation())
+            extent = np.abs(cube_rotation) @ np.full(3, .020)
+            # All cube corners must fit in the tray, allowing 3 mm contact tolerance.
+            fits = np.all(np.abs(local[:2]) + extent[:2] <= np.asarray([.050, .040]) + .003)
+            return bool(fits and .008 <= local[2] <= .050)
+
+        inside_target = inside(self.target_receptacle_id)
+        wrong_target = any(inside(value) for value in self.receptacle_ids if value != self.target_receptacle_id)
+        released = bool(np.linalg.norm(position - np.asarray(eef_position)) > .08)
+        distractors_stable = all(
+            np.linalg.norm(self.get_object_position(value) - initial_object_positions.get(value, self.get_object_position(value))) <= .04
+            for value in self.object_ids if value != self.target_object_id
+        )
+        return {"success": inside_target and released and not wrong_target and distractors_stable,
+                "inside_target": inside_target, "released": released, "wrong_target": wrong_target,
+                "distractors_stable": distractors_stable}

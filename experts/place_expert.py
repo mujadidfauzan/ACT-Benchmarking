@@ -191,6 +191,13 @@ class PlaceExpert:
         inside_target = xy_error <= self.xy_tolerance
         released = gripper_distance > 0.08
         success = inside_target and released and not wrong_target and distractors_stable
+        if hasattr(self.env, "placement_status"):
+            initial_positions = dict(initial_distractor_positions or {})
+            initial_positions.setdefault(object_id, object_position)
+            physical = self.env.placement_status(eef_position, initial_positions)
+            inside_target, released = physical["inside_target"], physical["released"]
+            wrong_target, distractors_stable = physical["wrong_target"], physical["distractors_stable"]
+            success = physical["success"]
 
         print("Place verification:")
         print("  XY error:", xy_error)

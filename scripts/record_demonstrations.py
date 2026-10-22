@@ -41,7 +41,7 @@ def parse_args():
     target.add_argument(
         "--fixed-target-color",
         choices=tuple(PickEnv.COLOR_PALETTE),
-        help="Fixed Pick target (default: red); object ID stays random",
+        help="Fixed Pick target or matching-color Place pair (default: red); IDs stay random",
     )
     target.add_argument("--random-target", action="store_true", help="Pick only: vary target colors for collection; not supported by fixed-target BC")
     parser.add_argument("--render", action="store_true")
@@ -110,7 +110,8 @@ def build_task(args, num_objects=None, num_receptacles=None, seed=None):
         )
     elif args.task == "place":
         env = PlaceEnv(num_objects=num_objects, num_receptacles=num_receptacles,
-                       horizon=3000, **common)
+                       fixed_target_color=getattr(args, "fixed_target_color", None),
+                       horizon=getattr(args, "max_steps", 3000), **common)
     else:
         env = StackEnv(num_cubes=num_objects, horizon=6000, **common)
 
@@ -190,7 +191,7 @@ def failure_reason(info):
 def main():
     args = parse_args()
     args.yaw_range_deg = validate_pick_arguments(args)
-    if args.task == "pick" and args.fixed_target_color is None and not args.random_target:
+    if args.task in ("pick", "place") and args.fixed_target_color is None and not args.random_target:
         args.fixed_target_color = "red"
     if args.random_target and args.task != "pick":
         raise ValueError("--random-target is only valid for Pick")
@@ -201,8 +202,8 @@ def main():
             raise ValueError("Episode quotas must be positive")
     if not args.camera_obs and args.camera_names != ["agentview"]:
         raise ValueError("--camera-names requires --camera-obs")
-    if args.fixed_target_color is not None and args.task != "pick":
-        raise ValueError("--fixed-target-color is only valid for --task pick")
+    if args.fixed_target_color is not None and args.task not in ("pick", "place"):
+        raise ValueError("--fixed-target-color requires Pick or Place")
     object_counts, receptacle_counts = count_options(args.task, args)
     task_dir = args.output / args.task
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -311,7 +312,7 @@ def main():
                 "fixed_target_color": args.fixed_target_color,
                 "controller_config": getattr(env, "bc_controller_config", None),
                 "environment_kwargs": {key: np.asarray(getattr(env, key)).tolist() for key in
-                    ("x_range", "y_range", "yaw_range", "minimum_object_distance", "cube_half_size", "table_full_size", "table_friction")
+                    ("x_range", "y_range", "yaw_range", "minimum_object_distance", "minimum_object_receptacle_distance", "minimum_receptacle_distance", "cube_half_size", "table_full_size", "table_friction")
                     if hasattr(env, key)}}
             initial_scene = snapshot_scene(observation)
             recorder = TrajectoryRecorder(

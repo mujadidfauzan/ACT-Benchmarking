@@ -15,10 +15,16 @@ COLOR_PALETTE = {
 }
 
 
-def sample_unique_colors(rng, count):
+def sample_unique_colors(rng, count, fixed_color=None):
     if count > len(COLOR_PALETTE):
         raise ValueError("Not enough unique colors in COLOR_PALETTE")
     names = np.asarray(list(COLOR_PALETTE), dtype=object)
+    if fixed_color is not None:
+        if fixed_color not in COLOR_PALETTE:
+            raise ValueError(f"Unknown fixed color: {fixed_color}")
+        colors = [fixed_color, *rng.choice(names[names != fixed_color], size=count - 1, replace=False)]
+        rng.shuffle(colors)
+        return [str(value) for value in colors]
     return [str(value) for value in rng.choice(names, size=count, replace=False)]
 
 

@@ -50,6 +50,7 @@ def metadata(task, num_objects, num_receptacles=None):
                                     "type": "tray", "is_target": i == 0}
                                    for i in range(num_receptacles)]
             value["target_receptacle"] = "receptacle_0"
+            value.update(fixed_target_color="red", target_color="red", target_receptacle_color="red")
             attributes.update(object_color="red", target_color="red")
     value.update(generate_instruction(task, np.random.default_rng(7), **attributes))
     return value
@@ -191,6 +192,7 @@ class VariableCountTests(unittest.TestCase):
             self.assertEqual(len(seeds), len(set(seeds)))
             manifests = [json.loads(line) for line in (root / "place/manifest.jsonl").read_text().splitlines()]
             self.assertEqual(len(manifests), 18)
+            self.assertTrue(all(entry["metadata"]["collection_config"]["fixed_target_color"] == "red" for entry in manifests))
             self.assertEqual(Counter(metadata_counts(entry["metadata"]) for entry in manifests),
                              Counter({(o, r): 2 for o in (1, 2, 3) for r in (1, 2, 3)}))
             self.assertEqual(manifests[-1]["episode"], 17)

@@ -68,7 +68,10 @@ evaluation because the model architecture and normalization are unchanged.
 
 Widths/depth live in `models/visual_bc.py`, not CLI. `VisualBCPolicy` uses
 `VisualEncoder` from `models/visual_encoder.py`. Training deliberately requires
-fixed-target Pick, so each scene has one unambiguous target.
+fixed-target Pick or matching-color Place, so each scene has one unambiguous target.
+For Place, collection uses a fixed object/tray color (default red to red), with
+randomized IDs and positions. Training, frame/GRU evaluation, and periodic
+rollouts select the task from the checkpoint. See section 7 of either platform guide.
 
 The scene geometry, variable counts, stable object IDs, and instruction metadata
 remain project-specific. Pick collection uses a state machine and world-frame
@@ -110,7 +113,7 @@ Language-conditioned models, embedding caches, ResNet/spatial-softmax variants,
 legacy history models, custom training samplers, and manual split/statistics commands have been
 removed. Environment task descriptions remain metadata only; they are not model
 inputs. Pick/Place/Stack environments and collection experts are still available,
-but the current model trainer is for fixed-target Pick.
+but the current model trainer supports only fixed-target Pick and matching-color Place, not Stack.
 
 Generated demos, splits, reports, and checkpoints are local artifacts ignored by
 Git. Start by collecting a new dataset; no historical pilot data is needed by

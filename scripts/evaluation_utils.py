@@ -161,9 +161,12 @@ def compose_camera_frame(observation, camera_names):
 
 
 def entity_positions(env):
-    return {
+    positions = {
         "objects": {
             object_id: env.get_object_position(object_id)
             for object_id in env.object_ids
         }
     }
+    if hasattr(env, "receptacle_ids"):
+        positions["receptacles"] = {value: env.get_receptacle_position(value) for value in env.receptacle_ids}
+    return positions

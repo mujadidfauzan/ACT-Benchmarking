@@ -85,6 +85,42 @@ class VisualBCTests(unittest.TestCase):
         return ["train", "--dataset", str(self.dataset), "--training-dir", str(self.prepared),
                 "--output-dir", str(self.output), "--epochs", "1", "--device", "cpu", *extra]
 
+    def test_periodic_rollout_and_early_stopping_resume(self):
+        stats = dict(loss=1., xyz_mse=1., rotation_mse=0., gripper_bce=0.)
+        result = dict(epoch=2, success_rate=.5, summary="mock-summary.json")
+        command = self.command("--epochs", "10", "--rollout-eval-every", "2",
+                               "--early-stopping-patience", "2")
+        with patch("sys.argv", command), patch.object(training, "run_epoch", return_value=stats), \
+                patch.object(training, "run_rollout", return_value=result) as rollout, redirect_stdout(io.StringIO()):
+            training.main()
+        rollout.assert_called_once()
+        latest = torch.load(self.output / "latest.pt", map_location="cpu", weights_only=False)
+        best_rollout = torch.load(self.output / "best_rollout.pt", map_location="cpu", weights_only=False)
+        self.assertEqual(latest["epoch"], 3)
+        self.assertEqual(latest["epochs_without_improvement"], 2)
+        self.assertEqual(latest["best_rollout_success_rate"], .5)
+        self.assertEqual(best_rollout["epoch"], 2)
+        self.assertEqual(latest["rollout_history"], [result])
+        with patch("sys.argv", command + ["--resume", str(self.output / "latest.pt")]), \
+                patch.object(training, "run_epoch") as run, redirect_stdout(io.StringIO()):
+            training.main()
+        run.assert_not_called()
+
+    def test_rollout_subprocess_arguments_and_summary(self):
+        with patch("sys.argv", self.command("--rollout-eval-num-seeds", "5", "--rollout-eval-episodes", "20")):
+            args = training.parse_args()
+        output = self.output / "rollouts" / "epoch_0010"
+        output.mkdir(parents=True)
+        (output / "summary.json").write_text(json.dumps({"overall_success_rate": .25}), encoding="utf-8")
+        with patch.object(training.subprocess, "run") as execute:
+            result = training.run_rollout(args, 10, torch.device("cpu"))
+        command = execute.call_args.args[0]
+        self.assertEqual(command[command.index("--num-seeds") + 1], "5")
+        self.assertEqual(command[command.index("--episodes") + 1], "20")
+        self.assertEqual(command[command.index("--seed") + 1], "1000")
+        self.assertTrue(execute.call_args.kwargs["check"])
+        self.assertEqual(result["success_rate"], .25)
+
     def test_independent_encoders_and_policy_head(self):
         model = VisualBCPolicy(16, ("agentview", "robot0_eye_in_hand"))
         self.assertEqual([module.out_features for module in model.head if isinstance(module, nn.Linear)], [256, 128, 7])
