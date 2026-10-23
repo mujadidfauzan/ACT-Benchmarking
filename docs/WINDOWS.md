@@ -17,7 +17,7 @@ cd ACT-Benchmarking
 conda create -n sim-mt-act python=3.10 -y
 conda activate sim-mt-act
 python -m pip install --upgrade pip
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r requirements.txt
 set MUJOCO_GL=wgl
 python -m pip check
@@ -257,6 +257,11 @@ sebagai alternatif pool rata-rata 4x4, tetap dengan fitur 256D per kamera.
 Gunakan run baru untuk arsitektur ini. Pooling dan horizon dipulihkan saat resume;
 mengubahnya pada checkpoint yang sama ditolak. Lihat eksperimen B di panduan Linux
 untuk konfigurasi perbandingan yang setara.
+Eksperimen C memakai `--visual-backbone resnet18 --visual-pooling spatial_softmax`
+dengan ResNet18 torchvision dari nol, output 256D per kamera. Gunakan run baru.
+`--batch-size 8 --gradient-accumulation-steps 8` memberi 64 window per full
+optimizer update; statistik BatchNorm tetap mengikuti batch fisik 8.
+Backbone dan akumulasi juga tersimpan dalam checkpoint.
 
 CPU smoke: gunakan `--device cpu --epochs 2 --batch-size 4` pada dataset kecil
 dan RUN baru. Trainer ini menolak
@@ -361,7 +366,7 @@ Camera export berada di `results/diagnostics/cameras/`. Tests offline tidak
 mengunduh bobot atau menjalankan simulator nyata. Smoke loader membaca artifact
 otomatis dan memeriksa input train/val tanpa training.
 
-Model language, embedding, ResNet, dan sampler training lama
+Model language, embedding, dan sampler training lama
 sudah dihapus. History yang didukung adalah GRU pada `VisualBCPolicy`, bukan
 model history lama. Deskripsi instruksi tetap tersimpan sebagai metadata di
 `environments/instructions.py`, bukan input policy. Split dan normalisasi hanya

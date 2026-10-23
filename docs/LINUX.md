@@ -16,7 +16,7 @@ cd ACT-Benchmarking
 python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r requirements.txt
 export MUJOCO_GL=egl
 python -m pip check
@@ -331,6 +331,50 @@ otomatis dari checkpoint saat resume dan evaluasi. Untuk perbandingan A/B,
 latih baseline dari awal dengan budget yang sama, `--visual-pooling avg`, dan
 output terpisah. `summary.json` mencatat `max_steps` agar horizon bisa diperiksa.
 
+### Eksperimen C: ResNet18 Dengan Spatial Softmax
+
+Gunakan dataset dan split eksperimen B. `--visual-backbone resnet18` mengganti
+empat convolution layer dengan feature backbone ResNet18 torchvision, tanpa
+global average pooling dan classifier. Ada 512 channel sehingga Spatial Softmax
+menghasilkan 1024 koordinat, diproyeksikan ke 256 fitur per kamera. Setiap kamera
+mempunyai encoder independen. RGB tetap 128x128 dalam [0, 1]. ResNet dilatih
+dari nol (`weights=None`), tanpa unduhan pretrained atau normalisasi ImageNet.
+Lihat [API ResNet18 torchvision](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.resnet18.html).
+
+Pasang pasangan torch dan torchvision dari index CPU/CUDA yang sama, seperti
+setup di atas. ResNet18 lebih berat daripada CNN A/B. Contoh memakai batch fisik
+8 dan `--gradient-accumulation-steps 8`: 64 window per full optimizer update.
+Gradien dirata-ratakan berdasarkan valid timestep, termasuk padding GRU dan
+grup terakhir yang lebih kecil. BatchNorm tetap memakai batch fisik 8 sehingga
+ini tidak identik dengan batch fisik 64. Metrik `batches` menghitung batch fisik;
+`optimizer_steps` mencatat jumlah update aktual.
+
+```bash
+python -m scripts.train_visual_bc \
+  --dataset data/demos/place_red_1cube_1tray_v01 \
+  --visual-backbone resnet18 --visual-pooling spatial_softmax \
+  --temporal --sequence-length 16 --sequence-stride 8 \
+  --epochs 100 --batch-size 8 --gradient-accumulation-steps 8 \
+  --learning-rate 0.0001 --seed 123 --device cuda \
+  --early-stopping-patience 15 \
+  --rollout-eval-every 10 --rollout-eval-episodes 10 \
+  --rollout-eval-num-seeds 1 --rollout-eval-seed 1000 \
+  --rollout-eval-max-steps 300 \
+  --output-dir results/visual_bc/place_red_1cube_1tray_v01_gru_resnet18
+
+python -m scripts.evaluate_visual_bc \
+  --checkpoint results/visual_bc/place_red_1cube_1tray_v01_gru_resnet18/best_rollout.pt \
+  --num-objects 1 --num-receptacles 1 \
+  --episodes 20 --num-seeds 5 --seed 2000 \
+  --max-steps 300 --device cuda \
+  --output-dir results/visual_bc_evaluation/place_red_1cube_1tray_v01_gru_resnet18_h300
+```
+
+Mulai run baru; checkpoint CNN tidak dapat di-resume menjadi ResNet18. Backbone
+dan pooling dipulihkan dari checkpoint pada resume/evaluasi. Akumulasi gradien
+dipulihkan saat resume; cantumkan batch fisik yang dipakai run tersebut.
+Jika batch fisik 8 kehabisan VRAM, gunakan batch 4 dengan akumulasi 16.
+
 ### Resume
 
 ```bash
@@ -406,7 +450,7 @@ python -m tests
 ```
 
 Smoke loader membaca artifact otomatis dan memeriksa input train/val tanpa
-training. Model language, embedding, ResNet, dan sampler
+training. Model language, embedding, dan sampler
 training lama sudah dihapus. History aktif sekarang adalah GRU di
 `VisualBCPolicy`, bukan model history lama. Deskripsi instruksi tetap tersimpan sebagai
 metadata di `environments/instructions.py`, bukan input policy. Split dan

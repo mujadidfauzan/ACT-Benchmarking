@@ -1,6 +1,7 @@
 """Visual-BC contract tests; synthetic episodes and no real simulator execution."""
 
 import io
+import copy
 import hashlib
 import json
 import math
@@ -149,6 +150,69 @@ class VisualBCTests(unittest.TestCase):
         restored.load_state_dict(encoder.state_dict(), strict=True)
         image = torch.rand(1, 3, 32, 32)
         torch.testing.assert_close(encoder(image), restored(image), rtol=0, atol=0)
+
+    def test_resnet_spatial_encoder_gradients_and_config(self):
+        model = VisualBCPolicy(16, ("agentview", "robot0_eye_in_hand"), temporal=True,
+                               encoder_config={"backbone": "resnet18", "pooling": "spatial_softmax"})
+        self.assertEqual(model.vision.get_config()["backbone"], "resnet18")
+        self.assertEqual(model.vision.projection[2].in_features, 1024)
+        self.assertEqual(model.vision.output_dim, 256)
+        self.assertFalse(any(isinstance(layer, nn.AdaptiveAvgPool2d) for layer in model.vision.convolutions.modules()))
+        self.assertIsNot(model.vision.convolutions[0].weight, model.eye_vision.convolutions[0].weight)
+        values = dict(image=torch.rand(1, 2, 3, 64, 64), eye_in_hand_image=torch.rand(1, 2, 3, 64, 64),
+                      proprio=torch.randn(1, 2, 16), previous_gripper=-torch.ones(1, 2, 1))
+        output = model(**values)
+        self.assertEqual(output["action"].shape, (1, 2, 7))
+        (output["motion"].square().mean() + output["gripper_logit"].square().mean()).backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
+        config = model.get_config()
+        restored = VisualBCPolicy.from_config(config)
+        restored.load_state_dict(model.state_dict(), strict=True)
+        model.eval()
+        restored.eval()
+        with torch.no_grad():
+            torch.testing.assert_close(model(**values)["motion"], restored(**values)["motion"], rtol=0, atol=0)
+
+    def test_gradient_accumulation_matches_valid_timestep_weighted_batches_and_tail(self):
+        normalizer = PolicyNormalizer.from_statistics(self.prepare()["normalization"])
+
+        class SmallPolicy(nn.Module):
+            predict_orientation = True
+
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Linear(16, 7)
+
+            def forward(self, image, proprio):
+                values = self.head(proprio)
+                return {"motion": values[..., :6], "gripper_logit": values[..., 6:]}
+
+        full = {"image": torch.rand(5, 3, 3, 32, 32), "proprio": torch.randn(5, 3, 16),
+                "action": torch.randn(5, 3, 7),
+                "valid_mask": torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 1, 0]], dtype=torch.bool)}
+        full["proprio"] = full["proprio"] * normalizer.proprio_std + normalizer.proprio_mean
+        full["action"] = full["action"] * normalizer.action_std + normalizer.action_mean
+
+        def sliced(start, stop):
+            return {key: value[start:stop] for key, value in full.items()}
+
+        actual = SmallPolicy()
+        expected = copy.deepcopy(actual)
+        actual_optimizer = torch.optim.SGD(actual.parameters(), lr=.001)
+        expected_optimizer = torch.optim.SGD(expected.parameters(), lr=.001)
+        with patch.object(actual_optimizer, "step", wraps=actual_optimizer.step) as step:
+            stats = training.run_epoch(actual, [sliced(0, 2), sliced(2, 4), sliced(4, 5)], normalizer,
+                                       self.device, actual_optimizer, gradient_accumulation_steps=2)
+        reference = training.run_epoch(expected, [sliced(0, 4), sliced(4, 5)], normalizer,
+                                       self.device, expected_optimizer)
+        self.assertEqual(step.call_count, 2)
+        self.assertEqual(stats["optimizer_steps"], 2)
+        self.assertEqual(stats["samples"], 11)
+        self.assertAlmostEqual(stats["loss"], reference["loss"], places=5)
+        for left, right in zip(actual.parameters(), expected.parameters()):
+            torch.testing.assert_close(left, right, atol=1e-6, rtol=1e-5)
+        with self.assertRaisesRegex(ValueError, "accumulation"):
+            training.run_epoch(actual, [], normalizer, self.device, gradient_accumulation_steps=0)
 
     def test_independent_encoders_and_policy_head(self):
         model = VisualBCPolicy(16, ("agentview", "robot0_eye_in_hand"))

@@ -38,6 +38,10 @@ def parse_args():
         help="Frames per batch (default 128), or temporal windows (default 8)",
     )
     parser.add_argument(
+        "--gradient-accumulation-steps", type=int,
+        help="Physical batches per optimizer update (default 1; restored on resume)",
+    )
+    parser.add_argument(
         "--temporal",
         action="store_true",
         help="Use a GRU with RGB/proprio history and previous gripper input",
@@ -51,6 +55,10 @@ def parse_args():
     parser.add_argument(
         "--visual-pooling", choices=("avg", "spatial_softmax"),
         help="CNN pooling (default avg; restored from checkpoint on resume)",
+    )
+    parser.add_argument(
+        "--visual-backbone", choices=("cnn", "resnet18"),
+        help="Vision backbone trained from scratch (default cnn; restored on resume)",
     )
     parser.add_argument(
         "--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-4
@@ -126,11 +134,25 @@ def prepare_batch(batch, normalizer, device):
     return inputs, normalizer.normalize_action(action), (action[..., 6:7] > 0).float()
 
 
-def run_epoch(model, loader, normalizer, device, optimizer=None):
+def run_epoch(model, loader, normalizer, device, optimizer=None, gradient_accumulation_steps=1):
+    if gradient_accumulation_steps < 1:
+        raise ValueError("Gradient accumulation steps must be positive")
     model.train(optimizer is not None)
     totals = np.zeros(4, dtype=np.float64)
     count = 0
     batches = 0
+    accumulated_samples = 0
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
+
+    def update():
+        # Normalize by valid timesteps, including padded GRU windows and the tail group.
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.div_(accumulated_samples)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
     with torch.set_grad_enabled(optimizer is not None):
         for batch in loader:
             inputs, action, grip = prepare_batch(batch, normalizer, device)
@@ -168,15 +190,25 @@ def run_epoch(model, loader, normalizer, device, optimizer=None):
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite BC loss")
             if optimizer is not None:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                if gradient_accumulation_steps == 1:
+                    # Preserve the original numerical path for baseline runs.
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                else:
+                    (loss * size).backward()
+                    accumulated_samples += size
+                    if (batches + 1) % gradient_accumulation_steps == 0:
+                        update()
+                        accumulated_samples = 0
             totals += (
                 np.asarray([x.detach().item() for x in (loss, xyz, rotation, gripper)])
                 * size
             )
             count += size
             batches += 1
+        if optimizer is not None and accumulated_samples:
+            update()
     if not count:
         raise ValueError("DataLoader contains no samples")
     return {
@@ -188,6 +220,8 @@ def run_epoch(model, loader, normalizer, device, optimizer=None):
         ),
         "samples": count,
         "batches": batches,
+        "optimizer_steps": ((batches + gradient_accumulation_steps - 1) // gradient_accumulation_steps
+                            if optimizer is not None else 0),
     }
 
 
@@ -241,6 +275,12 @@ def main():
     )
     saved_config = checkpoint.get("model_config", {}) if checkpoint else {}
     encoder_config = dict(saved_config.get("encoder_config", ENCODER_CONFIG))
+    saved_backbone = encoder_config.get("backbone", "cnn")
+    if checkpoint and args.visual_backbone is not None and args.visual_backbone != saved_backbone:
+        raise ValueError("--visual-backbone differs from checkpoint; start a new run")
+    args.visual_backbone = args.visual_backbone or saved_backbone
+    if args.visual_backbone != "cnn":
+        encoder_config["backbone"] = args.visual_backbone
     saved_pooling = encoder_config.get("pooling", "avg")
     if checkpoint and args.visual_pooling is not None and args.visual_pooling != saved_pooling:
         raise ValueError("--visual-pooling differs from checkpoint; start a new run")
@@ -251,6 +291,10 @@ def main():
         raise ValueError("--temporal does not match the checkpoint architecture")
     args.temporal = args.temporal or saved_config.get("temporal", False)
     saved_training = checkpoint.get("training_config", {}) if checkpoint else {}
+    if args.gradient_accumulation_steps is None:
+        args.gradient_accumulation_steps = saved_training.get("gradient_accumulation_steps", 1)
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("Gradient accumulation steps must be positive")
     if args.temporal:
         for name, default in (("sequence_length", 16), ("sequence_stride", 8)):
             value = getattr(args, name)
@@ -378,7 +422,7 @@ def main():
     print(
         f"Proprio: {model.proprio_dim}D; orientation: {model.predict_orientation}; head: {model.hidden_dims}"
     )
-    print(f"Visual pooling: {model.vision.pooling}; rollout max steps: {args.rollout_eval_max_steps}")
+    print(f"Visual backbone: {model.vision.backbone}; pooling: {model.vision.pooling}; rollout max steps: {args.rollout_eval_max_steps}")
     unit = "windows" if args.temporal else "frames"
     print(
         f"Train: {len(train.episodes)} episodes/{len(train)} {unit}; val: {len(val.episodes)} episodes/{len(val)} {unit}"
@@ -390,6 +434,7 @@ def main():
     print(
         f"Batch size: {args.batch_size}; complete shuffled epochs; AdamW LR={args.learning_rate}, weight_decay=0.01"
     )
+    print(f"Gradient accumulation: {args.gradient_accumulation_steps}; windows/frames per full update: {args.batch_size * args.gradient_accumulation_steps}")
     for epoch in range(start_epoch, args.epochs + 1):
         if (
             args.early_stopping_patience
@@ -399,7 +444,8 @@ def main():
                 "Early stopping patience already reached; increase patience or set it to 0 to continue"
             )
             break
-        tr = run_epoch(model, train_loader, normalizer, device, optimizer)
+        tr = run_epoch(model, train_loader, normalizer, device, optimizer,
+                       gradient_accumulation_steps=args.gradient_accumulation_steps)
         va = run_epoch(model, val_loader, normalizer, device)
         improved = va["loss"] < best
         best = min(best, va["loss"])
@@ -424,6 +470,8 @@ def main():
                 "image_size": 128,
                 "learning_rate": args.learning_rate,
                 "batch_size": args.batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "visual_backbone": args.visual_backbone,
                 "visual_pooling": args.visual_pooling,
                 "seed": args.seed,
                 "sequence_length": args.sequence_length,

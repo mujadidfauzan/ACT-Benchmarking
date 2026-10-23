@@ -71,7 +71,13 @@ Widths/depth live in `models/visual_bc.py`, not CLI. `VisualBCPolicy` uses
 selects experimental per-channel spatial coordinates instead of the default
 4x4 average pool; both project to 256D per camera. `--rollout-eval-max-steps 300`
 sets a shared rollout budget for checkpoint selection; final evaluation must use
-the same `--max-steps 300`. Pooling and rollout horizon are restored on resume.
+the same `--max-steps 300`. `--visual-backbone resnet18` selects a torchvision
+ResNet18 feature backbone trained from scratch, with 256D output per camera.
+`--gradient-accumulation-steps 8 --batch-size 8` processes 64 windows per full
+optimizer update with temporal models; gradients are weighted by valid timesteps.
+ResNet BatchNorm uses each physical batch, so accumulation does not reproduce
+the BatchNorm statistics of a physical batch of 64.
+Backbone, pooling, accumulation and rollout horizon are restored on resume.
 Training deliberately requires
 fixed-target Pick or matching-color Place, so each scene has one unambiguous target.
 For Place, collection uses a fixed object/tray color (default red to red), with
@@ -114,7 +120,7 @@ The maintained entry points are `scripts.record_demonstrations`,
 `scripts.train_visual_bc`, and `scripts.evaluate_visual_bc`. Splits and statistics
 are generated automatically during collection; audit tools remain optional.
 
-Language-conditioned models, embedding caches, ResNet variants,
+Language-conditioned models, embedding caches,
 legacy history models, custom training samplers, and manual split/statistics commands have been
 removed. Environment task descriptions remain metadata only; they are not model
 inputs. Pick/Place/Stack environments and collection experts are still available,

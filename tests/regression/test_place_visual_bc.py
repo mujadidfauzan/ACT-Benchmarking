@@ -116,6 +116,30 @@ class PlaceVisualBCTests(unittest.TestCase):
                 training.main()
             self.assertEqual((self.output / "config.json").read_bytes(), before)
 
+    def test_resnet_checkpoint_resume_restores_backbone_and_accumulation(self):
+        command = ["train", "--dataset", str(self.dataset), "--training-dir", str(self.prepared),
+                   "--output-dir", str(self.output), "--epochs", "1", "--device", "cpu", "--temporal",
+                   "--visual-backbone", "resnet18", "--visual-pooling", "spatial_softmax",
+                   "--gradient-accumulation-steps", "8", "--rollout-eval-max-steps", "300"]
+        stats = dict(loss=1., xyz_mse=.5, rotation_mse=.4, gripper_bce=.5)
+        # Exercise real model/checkpoint construction without a full ResNet training job.
+        with patch("sys.argv", command), patch.object(training, "run_epoch", return_value=stats), redirect_stdout(io.StringIO()):
+            training.main()
+        args = SimpleNamespace(checkpoint=self.output / "latest.pt", normalization=None, image_size=None)
+        model, _, checkpoint, _, _ = evaluation.load_policy(args, self.device)
+        self.assertEqual(model.vision.backbone, "resnet18")
+        self.assertEqual(model.vision.pooling, "spatial_softmax")
+        self.assertEqual(checkpoint["training_config"]["gradient_accumulation_steps"], 8)
+        del model, checkpoint
+        resumed = command[:command.index("--visual-backbone")] + ["--resume", str(self.output / "latest.pt"), "--epochs", "2"]
+        with patch("sys.argv", resumed), patch.object(training, "run_epoch", return_value=stats) as run, redirect_stdout(io.StringIO()):
+            training.main()
+        self.assertEqual(run.call_args_list[0].kwargs["gradient_accumulation_steps"], 8)
+        before = (self.output / "config.json").read_bytes()
+        with patch("sys.argv", resumed + ["--visual-backbone", "cnn"]), self.assertRaisesRegex(ValueError, "visual-backbone differs"):
+            training.main()
+        self.assertEqual((self.output / "config.json").read_bytes(), before)
+
     def test_place_geometry_release_wrong_tray_and_distractor(self):
         position = np.array([0., 0., .824])
         trays = {"tray": np.array([0., 0., .8]), "other": np.array([.2, 0., .8])}

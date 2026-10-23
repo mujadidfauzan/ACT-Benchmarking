@@ -7,3 +7,4 @@ robosuite==1.5.2
 opencv-python==4.11.0.86
 matplotlib==3.10.9
 torch
+torchvision
