@@ -400,6 +400,7 @@ def evaluate_policy(args, model, normalizer, checkpoint, device):
                "yaw_range_deg": prepared.get("environment_configs", {}).get("pick", {}).get("yaw_range_deg"),
                "image_convention": "opencv", "vertical_flip": False, "image_size": 128,
                "episodes_per_seed": args.episodes, "seeds": seeds, "seed_results": seed_results,
+               "max_steps": args.max_steps,
                "lift_threshold_m": .18 if task == "pick" else None, "success_hold_steps": 20,
                "num_receptacles": (prepared.get("evaluation_num_receptacles") or max(value[1] for value in prepared["scene_counts"])) if task == "place" else None,
                "success_criterion": "lift_0.18m" if task == "pick" else "inside_tray_released_distractors_stable",

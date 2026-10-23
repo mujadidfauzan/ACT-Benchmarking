@@ -24,6 +24,7 @@ from data.normalization import PolicyNormalizer
 from data.episode_io import open_episode, write_episode
 from experts.pick_expert import PickExpert
 from models.visual_bc import VisualBCPolicy
+from models.visual_encoder import SpatialSoftmax, VisualEncoder
 from scripts import train_visual_bc as training, record_demonstrations as recording
 from tests.regression.test_variable_scene_counts import FakeEnv
 
@@ -107,7 +108,8 @@ class VisualBCTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_rollout_subprocess_arguments_and_summary(self):
-        with patch("sys.argv", self.command("--rollout-eval-num-seeds", "5", "--rollout-eval-episodes", "20")):
+        with patch("sys.argv", self.command("--rollout-eval-num-seeds", "5", "--rollout-eval-episodes", "20",
+                                             "--rollout-eval-max-steps", "300")):
             args = training.parse_args()
         output = self.output / "rollouts" / "epoch_0010"
         output.mkdir(parents=True)
@@ -118,8 +120,35 @@ class VisualBCTests(unittest.TestCase):
         self.assertEqual(command[command.index("--num-seeds") + 1], "5")
         self.assertEqual(command[command.index("--episodes") + 1], "20")
         self.assertEqual(command[command.index("--seed") + 1], "1000")
+        self.assertEqual(command[command.index("--max-steps") + 1], "300")
         self.assertTrue(execute.call_args.kwargs["check"])
         self.assertEqual(result["success_rate"], .25)
+
+    def test_spatial_softmax_coordinates_and_gradients(self):
+        pool = SpatialSoftmax()
+        torch.testing.assert_close(pool(torch.zeros(1, 2, 3, 5)), torch.zeros(1, 4), atol=1e-7, rtol=0)
+        peaks = torch.full((1, 2, 3, 5), -50.)
+        peaks[0, 0, 0, 4] = 50.
+        peaks[0, 1, 2, 0] = 50.
+        torch.testing.assert_close(pool(peaks), torch.tensor([[1., -1., -1., 1.]]))
+        features = torch.randn(2, 3, 4, 6, requires_grad=True)
+        pool(features).square().sum().backward()
+        self.assertTrue(torch.isfinite(features.grad).all())
+        self.assertGreater(features.grad.abs().sum().item(), 0)
+        for temperature in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                SpatialSoftmax(temperature)
+
+    def test_legacy_average_encoder_config_and_state_dict_remain_compatible(self):
+        legacy = {"conv_layers": [[32, 5, 2, 2], [64, 3, 2, 1], [128, 3, 2, 1], [128, 3, 2, 1]],
+                  "pool_size": [4, 4], "feature_dim": 256}
+        encoder = VisualEncoder(**legacy)
+        self.assertEqual(encoder.get_config(), legacy)
+        self.assertEqual(encoder.state_dict()["projection.2.weight"].shape, (256, 128 * 4 * 4))
+        restored = VisualEncoder(**encoder.get_config())
+        restored.load_state_dict(encoder.state_dict(), strict=True)
+        image = torch.rand(1, 3, 32, 32)
+        torch.testing.assert_close(encoder(image), restored(image), rtol=0, atol=0)
 
     def test_independent_encoders_and_policy_head(self):
         model = VisualBCPolicy(16, ("agentview", "robot0_eye_in_hand"))

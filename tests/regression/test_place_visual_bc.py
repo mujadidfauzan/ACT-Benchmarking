@@ -82,6 +82,40 @@ class PlaceVisualBCTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "matching-color"):
             prepare_bc_training(self.dataset, self.prepared)
 
+    def test_spatial_gru_training_resume_and_evaluation_load(self):
+        command = ["train", "--dataset", str(self.dataset), "--training-dir", str(self.prepared),
+                   "--output-dir", str(self.output), "--epochs", "1", "--device", "cpu",
+                   "--temporal", "--sequence-length", "3", "--sequence-stride", "2", "--batch-size", "4",
+                   "--visual-pooling", "spatial_softmax", "--rollout-eval-max-steps", "300"]
+        with patch("sys.argv", command), redirect_stdout(io.StringIO()):
+            training.main()
+        args = SimpleNamespace(checkpoint=self.output / "latest.pt", normalization=None, image_size=None)
+        model, _, checkpoint, _, _ = evaluation.load_policy(args, self.device)
+        self.assertTrue(model.temporal)
+        self.assertEqual(model.vision.pooling, "spatial_softmax")
+        self.assertEqual(model.eye_vision.pooling, "spatial_softmax")
+        self.assertEqual(model.vision.output_dim, 256)
+        values = dict(image=torch.rand(1, 2, 3, 32, 32), eye_in_hand_image=torch.rand(1, 2, 3, 32, 32),
+                      proprio=torch.zeros(1, 2, 16), previous_gripper=-torch.ones(1, 2, 1))
+        prediction = model(**values)["action"]
+        self.assertTrue(torch.isfinite(prediction).all())
+        for encoder in (model.vision, model.eye_vision):
+            self.assertTrue(all(parameter.requires_grad for parameter in encoder.parameters()))
+        self.assertEqual(checkpoint["training_config"]["rollout_eval_max_steps"], 300)
+        # Omitted experiment flags are restored, including pooling and horizon.
+        resumed = command[:-4] + ["--resume", str(self.output / "latest.pt"), "--epochs", "2"]
+        with patch("sys.argv", resumed), redirect_stdout(io.StringIO()):
+            training.main()
+        loaded, _, checkpoint, _, _ = evaluation.load_policy(args, self.device)
+        self.assertEqual(checkpoint["epoch"], 2)
+        self.assertEqual(loaded.vision.pooling, "spatial_softmax")
+        self.assertEqual(checkpoint["training_config"]["rollout_eval_max_steps"], 300)
+        before = (self.output / "config.json").read_bytes()
+        for flag, value in (("--visual-pooling", "avg"), ("--rollout-eval-max-steps", "400")):
+            with self.subTest(flag=flag), patch("sys.argv", resumed + [flag, value]), self.assertRaisesRegex(ValueError, "differs from checkpoint"):
+                training.main()
+            self.assertEqual((self.output / "config.json").read_bytes(), before)
+
     def test_place_geometry_release_wrong_tray_and_distractor(self):
         position = np.array([0., 0., .824])
         trays = {"tray": np.array([0., 0., .8]), "other": np.array([.2, 0., .8])}
@@ -121,6 +155,7 @@ class PlaceVisualBCTests(unittest.TestCase):
         self.assertEqual(summary["tasks"][0]["task"], "place")
         self.assertEqual(summary["overall_success_rate"], 1.)
         self.assertEqual(args.max_steps, 3000)
+        self.assertEqual(summary["max_steps"], 3000)
         self.assertTrue((self.output / "place_attempts.jsonl").is_file())
 
     def test_place_episode_requires_release_not_pick_lift(self):

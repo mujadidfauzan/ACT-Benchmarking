@@ -67,7 +67,12 @@ evaluation because the model architecture and normalization are unchanged.
 - AdamW, LR 0.0001, batch size 128, no scheduler/clipping/dropout/LayerNorm.
 
 Widths/depth live in `models/visual_bc.py`, not CLI. `VisualBCPolicy` uses
-`VisualEncoder` from `models/visual_encoder.py`. Training deliberately requires
+`VisualEncoder` from `models/visual_encoder.py`. `--visual-pooling spatial_softmax`
+selects experimental per-channel spatial coordinates instead of the default
+4x4 average pool; both project to 256D per camera. `--rollout-eval-max-steps 300`
+sets a shared rollout budget for checkpoint selection; final evaluation must use
+the same `--max-steps 300`. Pooling and rollout horizon are restored on resume.
+Training deliberately requires
 fixed-target Pick or matching-color Place, so each scene has one unambiguous target.
 For Place, collection uses a fixed object/tray color (default red to red), with
 randomized IDs and positions. Training, frame/GRU evaluation, and periodic
@@ -109,7 +114,7 @@ The maintained entry points are `scripts.record_demonstrations`,
 `scripts.train_visual_bc`, and `scripts.evaluate_visual_bc`. Splits and statistics
 are generated automatically during collection; audit tools remain optional.
 
-Language-conditioned models, embedding caches, ResNet/spatial-softmax variants,
+Language-conditioned models, embedding caches, ResNet variants,
 legacy history models, custom training samplers, and manual split/statistics commands have been
 removed. Environment task descriptions remain metadata only; they are not model
 inputs. Pick/Place/Stack environments and collection experts are still available,

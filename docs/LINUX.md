@@ -229,8 +229,8 @@ rotasi mode `none` tetap nol setelah denormalisasi. Proprio kedua mode sama 16D.
 
 Log memisahkan XYZ, rotation, dan gripper loss. `best.pt` dipilih dari val loss;
 `latest.pt` berisi optimizer/progress. Default rollout setiap 10 epoch:
-`--rollout-eval-every 10 --rollout-eval-episodes 20 --rollout-eval-num-seeds 5
---rollout-eval-seed 1000` (100 percobaan per evaluasi dengan seed tetap).
+`--rollout-eval-every 10 --rollout-eval-episodes 10 --rollout-eval-num-seeds 1
+--rollout-eval-seed 1000` (10 percobaan per evaluasi dengan seed tetap).
 `best_rollout.pt` dipilih dari success rate tertinggi; nilai seri tidak mengganti
 checkpoint. Laporan ada di `rollouts/epoch_XXXX/` dan `rollout_evaluations.json`.
 Tidak merekam video otomatis. `--early-stopping-patience 7` menghentikan training
@@ -239,6 +239,10 @@ rollout pertama. Counter tersimpan saat resume; naikkan patience atau gunakan 0
 untuk melanjutkan run yang sudah early stop. `--rollout-eval-every 0` mematikan
 rollout. Gunakan seed final berbeda dari seed rollout pemilihan model.
 Trainer mendukung fixed-target Pick atau matching-color Place dan menolak target ambigu.
+`--rollout-eval-max-steps N` mengatur batas episode rollout; default Pick 500,
+Place 3000. Gunakan batas yang sama pada evaluasi final dengan `--max-steps N`.
+Batas tersimpan di checkpoint dan dipulihkan saat resume; menggantinya memerlukan
+run baru agar success rate pemilihan checkpoint tetap sebanding.
 
 CPU smoke: pada data kecil gunakan `--device cpu --epochs 2 --batch-size 4` dan
 RUN baru. Itu bukan pengukuran final. Tidak perlu melatih CPU lagi setelah
@@ -288,6 +292,44 @@ Frame dan GRU harus memakai output berbeda. Window 16/stride 8 bertumpuk, jadi
 jumlah sample/optimizer update per epoch tidak identik dengan frame. Catat
 budget training dan bandingkan success rate pada seed/count/horizon yang sama.
 Loss total `none` dan `align_yaw` tidak langsung sebanding karena rotation loss.
+
+### Eksperimen B: CNN Dengan Spatial Softmax
+
+Gunakan dataset dan split yang sama, tanpa recording ulang. Opsi
+`--visual-pooling spatial_softmax` mempertahankan empat convolution layer,
+tetapi mengganti pool 4x4 dengan expected koordinat (x, y) per channel pada
+rentang [-1, 1], temperature tetap 1.0. Ada 128 channel sehingga pooling
+menghasilkan 256 koordinat, diproyeksikan kembali ke 256 fitur per kamera.
+GRU, proprio, action, dan objective tetap sama. Baseline memakai
+`--visual-pooling avg` (default).
+
+Contoh Place 1 kubus merah dan 1 tray merah, history 16, batch 64 dari awal,
+dengan batas rollout dan evaluasi 300 langkah:
+
+```bash
+python -m scripts.train_visual_bc \
+  --dataset data/demos/place_red_1cube_1tray_v01 \
+  --temporal --sequence-length 16 --sequence-stride 8 \
+  --visual-pooling spatial_softmax \
+  --epochs 100 --batch-size 64 --learning-rate 0.0001 \
+  --seed 123 --device cuda --early-stopping-patience 15 \
+  --rollout-eval-every 10 --rollout-eval-episodes 10 \
+  --rollout-eval-num-seeds 1 --rollout-eval-seed 1000 \
+  --rollout-eval-max-steps 300 \
+  --output-dir results/visual_bc/place_red_1cube_1tray_v01_gru_spatial
+
+python -m scripts.evaluate_visual_bc \
+  --checkpoint results/visual_bc/place_red_1cube_1tray_v01_gru_spatial/best_rollout.pt \
+  --num-objects 1 --num-receptacles 1 \
+  --episodes 20 --num-seeds 5 --seed 2000 \
+  --max-steps 300 --device cuda \
+  --output-dir results/visual_bc_evaluation/place_red_1cube_1tray_v01_gru_spatial_h300
+```
+
+Gunakan output baru, tanpa resume checkpoint average pooling. Pooling dipulihkan
+otomatis dari checkpoint saat resume dan evaluasi. Untuk perbandingan A/B,
+latih baseline dari awal dengan budget yang sama, `--visual-pooling avg`, dan
+output terpisah. `summary.json` mencatat `max_steps` agar horizon bisa diperiksa.
 
 ### Resume
 
@@ -364,7 +406,7 @@ python -m tests
 ```
 
 Smoke loader membaca artifact otomatis dan memeriksa input train/val tanpa
-training. Model language, embedding, ResNet, spatial softmax, dan sampler
+training. Model language, embedding, ResNet, dan sampler
 training lama sudah dihapus. History aktif sekarang adalah GRU di
 `VisualBCPolicy`, bukan model history lama. Deskripsi instruksi tetap tersimpan sebagai
 metadata di `environments/instructions.py`, bukan input policy. Split dan

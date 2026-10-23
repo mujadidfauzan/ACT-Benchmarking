@@ -19,7 +19,7 @@ from data.manipulation_dataset import (
     ManipulationDataset,
 )
 from data.normalization import PolicyNormalizer
-from models.visual_bc import VisualBCPolicy
+from models.visual_bc import ENCODER_CONFIG, VisualBCPolicy
 
 
 def parse_args():
@@ -49,6 +49,10 @@ def parse_args():
         "--sequence-stride", type=int, help="Temporal window stride (default 8)"
     )
     parser.add_argument(
+        "--visual-pooling", choices=("avg", "spatial_softmax"),
+        help="CNN pooling (default avg; restored from checkpoint on resume)",
+    )
+    parser.add_argument(
         "--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-4
     )
     parser.add_argument("--seed", type=int, default=123)
@@ -68,6 +72,10 @@ def parse_args():
     )
     parser.add_argument("--rollout-eval-num-seeds", type=int, default=1)
     parser.add_argument("--rollout-eval-seed", type=int, default=1000)
+    parser.add_argument(
+        "--rollout-eval-max-steps", type=int,
+        help="Rollout horizon (default: Pick 500, Place 3000; restored on resume)",
+    )
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
@@ -209,6 +217,8 @@ def run_rollout(args, epoch, device):
         "--output-dir",
         str(output),
     ]
+    if args.rollout_eval_max_steps is not None:
+        command.extend(("--max-steps", str(args.rollout_eval_max_steps)))
     subprocess.run(command, check=True)
     with (output / "summary.json").open(encoding="utf-8") as handle:
         summary = json.load(handle)
@@ -230,6 +240,13 @@ def main():
         else None
     )
     saved_config = checkpoint.get("model_config", {}) if checkpoint else {}
+    encoder_config = dict(saved_config.get("encoder_config", ENCODER_CONFIG))
+    saved_pooling = encoder_config.get("pooling", "avg")
+    if checkpoint and args.visual_pooling is not None and args.visual_pooling != saved_pooling:
+        raise ValueError("--visual-pooling differs from checkpoint; start a new run")
+    args.visual_pooling = args.visual_pooling or saved_pooling
+    if args.visual_pooling != "avg":
+        encoder_config["pooling"] = args.visual_pooling
     if checkpoint and args.temporal and not saved_config.get("temporal", False):
         raise ValueError("--temporal does not match the checkpoint architecture")
     args.temporal = args.temporal or saved_config.get("temporal", False)
@@ -258,6 +275,8 @@ def main():
         )
     if min(args.rollout_eval_episodes, args.rollout_eval_num_seeds) <= 0:
         raise ValueError("Rollout episodes and seeds must be positive")
+    if args.rollout_eval_max_steps is not None and args.rollout_eval_max_steps <= 0:
+        raise ValueError("Rollout max steps must be positive")
     if args.resume and args.output_dir.resolve() != args.resume.resolve().parent:
         raise ValueError("--output-dir must be the directory containing --resume")
     set_seed(args.seed)
@@ -274,6 +293,12 @@ def main():
         raise ValueError(
             "Visual-BC requires one fixed-target Pick or matching-color Place dataset"
         )
+    default_horizon = 3000 if prepared["tasks"] == ["place"] else 500
+    saved_horizon = saved_training.get("rollout_eval_max_steps") or default_horizon
+    if checkpoint and args.rollout_eval_max_steps is not None and args.rollout_eval_max_steps != saved_horizon:
+        raise ValueError("--rollout-eval-max-steps differs from checkpoint; start a new run")
+    if args.rollout_eval_max_steps is None:
+        args.rollout_eval_max_steps = saved_horizon
     normalizer = PolicyNormalizer.from_statistics(prepared["normalization"]).to(device)
     common = dict(
         dataset_root=args.dataset,
@@ -306,6 +331,7 @@ def main():
         normalizer.proprio_dim,
         prepared["camera_names"],
         prepared["predict_orientation"],
+        encoder_config=encoder_config,
         temporal=args.temporal,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -352,6 +378,7 @@ def main():
     print(
         f"Proprio: {model.proprio_dim}D; orientation: {model.predict_orientation}; head: {model.hidden_dims}"
     )
+    print(f"Visual pooling: {model.vision.pooling}; rollout max steps: {args.rollout_eval_max_steps}")
     unit = "windows" if args.temporal else "frames"
     print(
         f"Train: {len(train.episodes)} episodes/{len(train)} {unit}; val: {len(val.episodes)} episodes/{len(val)} {unit}"
@@ -397,6 +424,7 @@ def main():
                 "image_size": 128,
                 "learning_rate": args.learning_rate,
                 "batch_size": args.batch_size,
+                "visual_pooling": args.visual_pooling,
                 "seed": args.seed,
                 "sequence_length": args.sequence_length,
                 "sequence_stride": args.sequence_stride,

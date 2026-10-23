@@ -241,8 +241,8 @@ denormalisasi. Proprio tetap 16D pada kedua mode, agar input tidak ikut berubah.
 Log mencatat loss total, XYZ, rotation, dan gripper secara terpisah. `best.pt`
 dipilih dari val loss; `latest.pt` menyimpan optimizer dan progress.
 Default rollout setiap 10 epoch: `--rollout-eval-every 10`,
-`--rollout-eval-episodes 20 --rollout-eval-num-seeds 5 --rollout-eval-seed 1000`
-(100 percobaan per evaluasi, seed tetap). `best_rollout.pt` menyimpan model dengan
+`--rollout-eval-episodes 10 --rollout-eval-num-seeds 1 --rollout-eval-seed 1000`
+(10 percobaan per evaluasi, seed tetap). `best_rollout.pt` menyimpan model dengan
 success rate tertinggi; nilai seri tidak mengganti checkpoint. Laporan ada di
 `rollouts/epoch_XXXX/` dan `rollout_evaluations.json`, tanpa video otomatis.
 `--early-stopping-patience 7` menghentikan training setelah 7 epoch berturut-turut
@@ -250,6 +250,13 @@ tanpa val loss lebih rendah. Bisa berhenti sebelum rollout pertama.
 Counter disimpan saat resume; naikkan patience atau gunakan 0 untuk melanjutkan
 run yang sudah early stop. `--rollout-eval-every 0` mematikan rollout.
 Gunakan seed evaluasi final yang berbeda dari seed rollout pemilihan model.
+`--rollout-eval-max-steps N` mengatur horizon rollout (default Pick 500,
+Place 3000); evaluasi final memakai `--max-steps N` yang sama.
+`--visual-pooling spatial_softmax` memilih pooling koordinat per channel
+sebagai alternatif pool rata-rata 4x4, tetap dengan fitur 256D per kamera.
+Gunakan run baru untuk arsitektur ini. Pooling dan horizon dipulihkan saat resume;
+mengubahnya pada checkpoint yang sama ditolak. Lihat eksperimen B di panduan Linux
+untuk konfigurasi perbandingan yang setara.
 
 CPU smoke: gunakan `--device cpu --epochs 2 --batch-size 4` pada dataset kecil
 dan RUN baru. Trainer ini menolak
@@ -354,7 +361,7 @@ Camera export berada di `results/diagnostics/cameras/`. Tests offline tidak
 mengunduh bobot atau menjalankan simulator nyata. Smoke loader membaca artifact
 otomatis dan memeriksa input train/val tanpa training.
 
-Model language, embedding, ResNet, spatial softmax, dan sampler training lama
+Model language, embedding, ResNet, dan sampler training lama
 sudah dihapus. History yang didukung adalah GRU pada `VisualBCPolicy`, bukan
 model history lama. Deskripsi instruksi tetap tersimpan sebagai metadata di
 `environments/instructions.py`, bukan input policy. Split dan normalisasi hanya
