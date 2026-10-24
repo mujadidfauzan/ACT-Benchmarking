@@ -276,6 +276,32 @@ bukan action t. Pada awal episode previous gripper = -1/open. Evaluasi membawa
 hidden antar-langkah dan memakai gripper yang benar-benar dieksekusi pada
 langkah sebelumnya, lalu me-reset keduanya setiap episode.
 
+Untuk menguji pengaruh panjang memori pada checkpoint yang sudah ada, tambahkan
+`--rnn-reset-interval 16` saat evaluasi. Hidden state dikosongkan sebelum action
+1, 17, 33, dan seterusnya, sementara previous gripper tetap berisi command yang
+benar-benar dieksekusi pada langkah sebelumnya. Default `0` mempertahankan
+memori sepanjang episode. Opsi ini hanya menerima checkpoint GRU dan tidak
+mengubah bobot atau melatih ulang model.
+
+Contoh checkpoint A, dengan scene dan horizon yang sama dengan evaluasi lama:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.evaluate_visual_bc \
+  --checkpoint results/visual_bc/place_red_1cube_1tray_v01_gru/best_rollout.pt \
+  --num-objects 1 --num-receptacles 1 \
+  --episodes 20 --num-seeds 5 --seed 2000 \
+  --max-steps 300 --rnn-reset-interval 16 --device cuda \
+  --record-video --log-rollout \
+  --output-dir results/visual_bc_evaluation/place_red_1cube_1tray_v01_gru_reset16_h300
+```
+
+`summary.json` dan setiap attempt mencatat `rnn_reset_interval`. Dengan
+`--log-rollout`, setiap langkah juga mencatat `hidden_state_reset`,
+`previous_gripper_input`, dan `gripper_logit` sebelum threshold. Bandingkan
+dengan hasil default pada seed, jumlah objek/tray, dan horizon yang identik;
+reset berkala merupakan hipotesis eksperimen, belum tentu meningkatkan success.
+Rollout otomatis selama training tetap memakai default memori sepanjang episode.
+
 Untuk menjalankan semua eksperimen berurutan:
 
 ```bash
@@ -392,6 +418,27 @@ Untuk GRU, arahkan RUN ke `_gru`. Resume otomatis membaca mode temporal dan
 panjang/stride window checkpoint. Tanpa `--batch-size`, default-nya 128 frame
 atau 8 window; beri flag itu bila run awal memakai nilai lain. Mengubah window
 atau melanjutkan frame sebagai GRU ditolak.
+
+### Baseline baru: deterministic BC-RNN ala robomimic
+
+Baseline ini membaca dataset HDF5 dan split yang sama secara langsung, tanpa
+konversi. Entry point terpisah adalah `scripts.train_robomimic_bc_rnn` dan
+`scripts.evaluate_robomimic_bc_rnn`. ResNet18 + learned keypoints + LSTM,
+continuous 7D action MSE, dan Adam mengikuti resep rujukan; batch default 8
+menyesuaikan hardware. Lihat [arsitektur, protokol, dan command train + eval](../models/robomimic_bc_rnn/README.md).
+
+```bash
+python -m scripts.train_robomimic_bc_rnn \
+  --dataset data/demos/place_red_1cube_1tray_v01 \
+  --batch-size 8 --max-updates 60000 --device cuda \
+  --output-dir results/robomimic_bc_rnn/place_red_1cube_1tray_v01
+python -m scripts.evaluate_robomimic_bc_rnn \
+  --checkpoint results/robomimic_bc_rnn/place_red_1cube_1tray_v01/best_rollout.pt \
+  --num-objects 1 --num-receptacles 1 \
+  --episodes 20 --num-seeds 5 --seed 2000 --max-steps 300 --device cuda \
+  --record-video --log-rollout \
+  --output-dir results/robomimic_bc_rnn_evaluation/place_red_1cube_1tray_v01_h300
+```
 
 ## 5. Evaluate
 

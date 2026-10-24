@@ -469,6 +469,92 @@ class VisualBCTests(unittest.TestCase):
         self.assertEqual(summary["tasks"][0]["failure_counts"], {"no_lift": 1, "exception": 1})
         self.assertEqual(len((args.output_dir / "pick_attempts.jsonl").read_text().splitlines()), 4)
         self.assertTrue(all(env.closed for env in environments))
+        self.assertEqual(summary["rnn_reset_interval"], 0)
+
+    def test_periodic_rnn_reset_preserves_gripper_and_episode_boundaries(self):
+        from scripts import evaluate_visual_bc as evaluation
+
+        config = self.prepare()
+        normalizer = PolicyNormalizer.from_statistics(config["normalization"])
+        model = VisualBCPolicy(16, config["camera_names"], temporal=True)
+        action = normalizer.normalize_action(torch.tensor([[0., 0., 0., 0., 0., 0., 1.]]))
+
+        class Env:
+            object_ids = ("cube_0",)
+            action_spec = (np.full(7, -1), np.full(7, 1))
+
+            def reset(self):
+                return {"agentview_image": np.zeros((32, 32, 3), np.uint8),
+                        "robot0_eye_in_hand_image": np.zeros((32, 32, 3), np.uint8),
+                        "robot0_joint_pos": np.zeros(7), "robot0_eef_pos": np.array([0., 0., 1.]),
+                        "robot0_gripper_qpos": np.zeros(2), "robot0_eef_quat": np.array([0., 0., 0., 1.])}
+
+            def get_task_metadata(self):
+                return {"target_object": "cube_0", "target_color": "red"}
+
+            def get_object_position(self, identifier):
+                return np.array([0., 0., .83])
+
+            def step(self, action):
+                return self.reset(), 0, False, {}
+
+            def _check_success(self):
+                return False
+
+        # Hidden state counts actions since the last reset. Always closing the
+        # gripper exposes accidental gripper resets at steps 17 and 33.
+        def predict(**kwargs):
+            hidden = kwargs["hidden"]
+            return {"action": action, "hidden": 1 if hidden is None else hidden + 1,
+                    "gripper_logit": torch.tensor([[.75]])}
+
+        for interval in (0, 1, 16):
+            with self.subTest(interval=interval), patch.object(model, "step", side_effect=predict) as step:
+                for episode in range(2):
+                    path = self.root / f"rollout_{interval}_{episode}.jsonl"
+                    result = evaluation.evaluate_episode(
+                        Env(), model, normalizer, 128, self.device, 35, 20,
+                        False, episode, None, 20., "red", path, rnn_reset_interval=interval,
+                    )
+                    self.assertEqual(result["steps"], 35)
+                    records = [json.loads(line) for line in path.read_text().splitlines()]
+                    self.assertEqual(records[0]["rnn_reset_interval"], interval)
+                    for index, record in enumerate(records[1:]):
+                        call = step.call_args_list[episode * 35 + index].kwargs
+                        expected_hidden = None if index == 0 or (interval and index % interval == 0) else (
+                            index % interval if interval else index)
+                        self.assertEqual(call["hidden"], expected_hidden)
+                        self.assertEqual(record["hidden_state_reset"], expected_hidden is None)
+                        self.assertEqual(call["previous_gripper"], -1. if index == 0 else 1.)
+                        self.assertEqual(record["previous_gripper_input"], call["previous_gripper"])
+                        self.assertEqual(record["gripper_logit"], .75)
+
+    def test_rnn_reset_cli_validation_and_summary(self):
+        from scripts import evaluate_visual_bc as evaluation
+
+        config = self.prepare()
+        model = SimpleNamespace(policy_type="visual_bc", camera_names=["agentview"],
+                                temporal=True, predict_orientation=True)
+        command = ["evaluate", "--checkpoint", "model.pt", "--output-dir", str(self.output),
+                   "--rnn-reset-interval", "16", "--max-steps", "300", "--episodes", "1", "--num-seeds", "1"]
+        with patch("sys.argv", command):
+            args = evaluation.parse_args()
+        env = SimpleNamespace(close=lambda: None)
+        checkpoint = dict(data_config=config, epoch=1, best_val_loss=.1)
+        with patch.object(evaluation, "build_environment", return_value=env), patch.object(
+            evaluation, "evaluate_episode", return_value=dict(success=False, failure_reason="no_lift", steps=300)
+        ) as episode, redirect_stdout(io.StringIO()):
+            summary = evaluation.evaluate_policy(args, model, None, checkpoint, self.device)
+        self.assertEqual(episode.call_args.kwargs["rnn_reset_interval"], 16)
+        self.assertEqual(summary["rnn_reset_interval"], 16)
+        attempt = json.loads((self.output / "pick_attempts.jsonl").read_text())
+        self.assertEqual(attempt["rnn_reset_interval"], 16)
+        for interval, temporal, message in ((-1, True, "nonnegative"), (16, False, "temporal")):
+            args.rnn_reset_interval, model.temporal = interval, temporal
+            with self.subTest(interval=interval), patch.object(evaluation, "build_environment") as build:
+                with self.assertRaisesRegex(ValueError, message):
+                    evaluation.evaluate_policy(args, model, None, checkpoint, self.device)
+                build.assert_not_called()
 
     def test_pick_state_machine_without_physics(self):
         class Env:

@@ -188,7 +188,7 @@ class PlaceVisualBCTests(unittest.TestCase):
 
         normalizer = PolicyNormalizer.from_statistics(prepared["normalization"])
         action = normalizer.normalize_action(torch.tensor([[0., 0., 0., 0., 0., 0., -1.]]))
-        model = SimpleNamespace(camera_names=["agentview"], step=lambda **kwargs: {"action": action})
+        model = SimpleNamespace(camera_names=["agentview"], temporal=False, step=lambda **kwargs: {"action": action})
         for expected in (None, "not_released", "wrong_receptacle"):
             env = FakeEnv("place", 1, 1, 7)
             env.object_ids = ["object_0"]

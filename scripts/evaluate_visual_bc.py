@@ -42,6 +42,11 @@ def parse_args():
     parser.add_argument("--image-size", type=int)
     parser.add_argument("--num-receptacles", type=int, choices=(1, 2, 3, 4))
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--rnn-reset-interval", type=int, default=0,
+        help="Reset GRU hidden state every N actions; 0 keeps episode-long memory. "
+             "Previous executed gripper command is retained across resets.",
+    )
     parser.add_argument("--success-hold-steps", type=int)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--render", action="store_true")
@@ -102,7 +107,9 @@ def evaluate_episode(
     video_fps,
     target_color,
     rollout_path=None,
+    rnn_reset_interval=0,
 ):
+    validate_rnn_reset_interval(model, rnn_reset_interval)
     observation = env.reset()
     metadata = env.get_task_metadata()
     task = metadata.get("task", "pick")
@@ -134,6 +141,7 @@ def evaluate_episode(
                 "target_id": target_id,
                 "target_color": target_color,
                 "metadata": metadata,
+                "rnn_reset_interval": rnn_reset_interval,
             },
         )
 
@@ -151,6 +159,14 @@ def evaluate_episode(
     placement = None
     try:
         for step in range(1, max_steps + 1):
+            # Match independent training windows when requested. Action history
+            # (especially the gripper command) still belongs to this episode.
+            hidden_state_reset = model.temporal and (
+                step == 1 or (rnn_reset_interval > 0 and (step - 1) % rnn_reset_interval == 0)
+            )
+            if hidden_state_reset:
+                hidden = None
+            previous_gripper_input = previous_gripper
             eef_before = np.asarray(
                 observation["robot0_eef_pos"], dtype=np.float32
             ).copy()
@@ -206,6 +222,9 @@ def evaluate_episode(
                     {
                         "event": "step",
                         "step": step,
+                        "hidden_state_reset": hidden_state_reset,
+                        "previous_gripper_input": previous_gripper_input if getattr(model, "uses_previous_gripper", model.temporal) else None,
+                        "gripper_logit": float(output["gripper_logit"].item()) if "gripper_logit" in output else None,
                         "eef_position_before": eef_before,
                         "target_position_before": target_before,
                         "eef_target_delta_before": target_delta_before,
@@ -311,6 +330,13 @@ def evaluate_episode(
     }
 
 
+def validate_rnn_reset_interval(model, interval):
+    if interval < 0:
+        raise ValueError("--rnn-reset-interval must be nonnegative (0 disables periodic resets)")
+    if interval and not model.temporal:
+        raise ValueError("--rnn-reset-interval requires a temporal (GRU) checkpoint")
+
+
 def build_environment(seed, num_objects, render, model, prepared, max_steps):
     # Use the same factory/controller/reset settings as collection, not an eval-only scene.
     from scripts.record_demonstrations import build_task
@@ -333,6 +359,8 @@ def build_environment(seed, num_objects, render, model, prepared, max_steps):
 
 
 def evaluate_policy(args, model, normalizer, checkpoint, device):
+    rnn_reset_interval = getattr(args, "rnn_reset_interval", 0)
+    validate_rnn_reset_interval(model, rnn_reset_interval)
     prepared = checkpoint["data_config"]
     task = prepared.get("tasks", ["pick"])[0]
     if task not in ("pick", "place"):
@@ -370,13 +398,15 @@ def evaluate_policy(args, model, normalizer, checkpoint, device):
                 rollout_path = ((args.rollout_dir or args.output_dir / "rollouts") / f"{task}_seed{seed}_episode{episode:03d}.jsonl"
                                 if args.log_rollout else None)
                 try:
-                    result = evaluate_episode(env, model, normalizer, 128, device, args.max_steps, 20,
+                    result = evaluate_episode(env, model, normalizer, getattr(model, "observation_image_size", 128), device, args.max_steps, 20,
                                               args.render, global_episode, video_path, args.video_fps,
-                                              prepared["fixed_target_color"], rollout_path)
+                                              prepared["fixed_target_color"], rollout_path,
+                                              rnn_reset_interval=rnn_reset_interval)
                 except Exception as error:
                     result = {"success": False, "failure_reason": "scene_sampling_failure" if isinstance(error, RandomizationError) else "exception",
                               "steps": 0, "error_type": type(error).__name__, "error_message": str(error)}
-                result.update(seed=seed, episode=episode, global_episode=global_episode, task=task, num_objects=num_objects)
+                result.update(seed=seed, episode=episode, global_episode=global_episode, task=task,
+                              num_objects=num_objects, rnn_reset_interval=rnn_reset_interval)
                 if task == "place":
                     result["num_receptacles"] = env.num_receptacles
                 append_jsonl(attempts_path, result)
@@ -396,6 +426,7 @@ def evaluate_policy(args, model, normalizer, checkpoint, device):
                "checkpoint_epoch": checkpoint["epoch"], "checkpoint_best_val_loss": checkpoint["best_val_loss"],
                "device": str(device), "camera_names": list(model.camera_names), "num_objects": num_objects,
                "temporal": model.temporal, "predict_orientation": model.predict_orientation,
+               "rnn_reset_interval": rnn_reset_interval,
                "rotation_mode": prepared.get("rotation_mode", "align_yaw" if model.predict_orientation else "none"),
                "yaw_range_deg": prepared.get("environment_configs", {}).get("pick", {}).get("yaw_range_deg"),
                "image_convention": "opencv", "vertical_flip": False, "image_size": 128,
