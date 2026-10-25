@@ -1,6 +1,7 @@
 """Audit recorded manipulation demonstrations without modifying the dataset."""
 
 import argparse
+import csv
 import hashlib
 import json
 from collections import Counter, defaultdict
@@ -9,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from data.episode_io import HDF5_SUFFIXES, open_episode, read_json
+from data.bc_preparation import default_training_dir
 
 from environments.instructions import TEMPLATES
 from environments.entity_utils import COLOR_PALETTE
@@ -82,6 +84,14 @@ def parse_args():
         type=Path,
         help="Defaults to results/dataset_audit/<dataset-name>",
     )
+    parser.add_argument("--split-dir", type=Path,
+                        help="Split manifests; automatically uses the dataset's default training directory when available")
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Batch size for update estimates only (default: 8)")
+    parser.add_argument("--sequence-stride", type=int, default=8,
+                        help="A/B/C window stride for estimates only (default: 8); BC-RNN uses stride 1")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="A/B/C batches per update for estimates only (default: 1)")
     args = parser.parse_args()
     args.output = args.output or Path("results/dataset_audit") / args.dataset.name
     return args
@@ -427,6 +437,17 @@ def serializable_semantics(stats):
     }
 
 
+def trajectory_statistics(lengths):
+    return {
+        "count": len(lengths), "total": int(sum(lengths)),
+        "mean": float(np.mean(lengths)) if lengths else None,
+        "median": float(np.median(lengths)) if lengths else None,
+        "min": min(lengths) if lengths else None,
+        "max": max(lengths) if lengths else None,
+        "p95": float(np.percentile(lengths, 95)) if lengths else None,
+    }
+
+
 def audit_task(dataset_root, task, args, digest_paths):
     task_dir = dataset_root / task
     manifest_entries, manifest_errors = read_jsonl(task_dir / "manifest.jsonl")
@@ -437,6 +458,7 @@ def audit_task(dataset_root, task, args, digest_paths):
     errors = [{"path": "manifest.jsonl", "error": error} for error in manifest_errors]
     semantics = new_semantic_stats()
     lengths = []
+    episode_lengths = []
     action_min = None
     action_max = None
     phase_counts = Counter()
@@ -451,6 +473,9 @@ def audit_task(dataset_root, task, args, digest_paths):
 
     for index, entry in enumerate(manifest_entries):
         relative_path = entry.get("path")
+        length_row = {"task": task, "episode": entry.get("episode"),
+                      "path": relative_path, "manifest_steps": entry.get("steps"), "steps": None}
+        episode_lengths.append(length_row)
         if not isinstance(relative_path, str):
             errors.append({"path": f"manifest[{index}]", "error": "missing path"})
             continue
@@ -466,6 +491,7 @@ def audit_task(dataset_root, task, args, digest_paths):
         )
         if details:
             lengths.append(details["steps"])
+            length_row["steps"] = details["steps"]
             phase_counts.update(details["phase_counts"])
             if details["action_min"] is not None:
                 current_min = np.asarray(details["action_min"], dtype=np.float64)
@@ -528,25 +554,91 @@ def audit_task(dataset_root, task, args, digest_paths):
         for orphan in orphan_files:
             errors.append({"path": orphan, "error": "episode is not listed in manifest"})
 
-    trajectory = {
-        "count": len(lengths),
-        "mean": float(np.mean(lengths)) if lengths else None,
-        "min": min(lengths) if lengths else None,
-        "max": max(lengths) if lengths else None,
-    }
+    error_paths = {item["path"] for item in errors}
+    for row in episode_lengths:
+        row["valid"] = row["steps"] is not None and isinstance(row["path"], str) and row["path"] not in error_paths
     return {
         "manifest_entries": len(all_entries),
         "audited_entries": len(manifest_entries),
         "valid_episodes": len(manifest_entries) - len({item["path"] for item in errors}),
         "error_count": len(errors),
         "errors": errors,
-        "trajectory_steps": trajectory,
+        "trajectory_steps": trajectory_statistics(lengths),
+        "episode_lengths": episode_lengths,
         "action_min": action_min.tolist() if action_min is not None else None,
         "action_max": action_max.tolist() if action_max is not None else None,
         "phase_counts": dict(sorted(phase_counts.items())),
         "semantics": serializable_semantics(semantics),
         "orphan_files": orphan_files,
     }
+
+
+def audit_split_lengths(args, task_results):
+    """Count native action timesteps, checking split membership and step metadata.
+
+    Reads only action shapes for episodes outside a limited audit; never scans
+    RGB twice. All estimates are training updates, not observation frame counts.
+    """
+    directory = args.split_dir or default_training_dir(args.dataset)
+    result = {"directory": str(directory), "status": "unavailable", "errors": [], "splits": {},
+              "assumptions": {"batch_size": args.batch_size, "visual_bc_sequence_stride": args.sequence_stride,
+                              "visual_bc_gradient_accumulation_steps": args.gradient_accumulation_steps,
+                              "bcrnn_sequence_stride": 1, "bcrnn_drop_last": True}}
+    if not directory.exists() and args.split_dir is None:
+        return result
+    known = set()
+    for task in task_results:
+        entries, _ = read_jsonl(args.dataset / task / "manifest.jsonl")
+        known.update(f"{task}/{entry['path']}" for entry in entries if isinstance(entry.get("path"), str))
+    cached = {f"{task}/{row['path']}": row["steps"] for task, value in task_results.items()
+              for row in value["episode_lengths"] if row["steps"] is not None}
+    seen = set()
+    for split in ("train", "val", "test"):
+        path = directory / f"{split}.jsonl"
+        if split == "test" and not path.exists():
+            continue
+        entries, errors = read_jsonl(path)
+        result["errors"].extend(errors)
+        lengths = []
+        for entry in entries:
+            if entry.get("task") not in task_results:
+                continue
+            name = entry.get("path")
+            if not isinstance(name, str) or name not in known:
+                result["errors"].append(f"{split}: path is not in dataset manifests: {name}")
+                continue
+            if name in seen:
+                result["errors"].append(f"{split}: duplicate/overlapping split episode: {name}")
+                continue
+            seen.add(name)
+            try:
+                if name not in cached:
+                    with open_episode(args.dataset / name) as episode:
+                        shape = episode["actions"].shape
+                        if len(shape) != 2 or shape[1] != 7 or shape[0] <= 0:
+                            raise ValueError(f"Invalid action shape: {shape}")
+                        cached[name] = int(shape[0])
+                steps = cached[name]
+                if entry.get("steps") != steps:
+                    result["errors"].append(f"{split}/{name}: split steps differ from HDF5 action count")
+                lengths.append(steps)
+            except (OSError, KeyError, ValueError, TypeError) as error:
+                result["errors"].append(f"{split}/{name}: {error}")
+        values = {"trajectory_steps": trajectory_statistics(lengths)}
+        if split == "train" and lengths:
+            windows = sum((n + args.sequence_stride - 1) // args.sequence_stride for n in lengths)
+            batches = (windows + args.batch_size - 1) // args.batch_size
+            updates = (batches + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps
+            values["training_budget"] = {"visual_bc_windows": windows, "visual_bc_batches_per_epoch": batches,
+                "visual_bc_updates_per_epoch": updates, "visual_bc_updates_in_100_epochs": 100 * updates,
+                "bcrnn_windows": sum(lengths), "bcrnn_updates_per_full_pass": sum(lengths) // args.batch_size,
+                "bcrnn_updates_in_100_full_passes": 100 * (sum(lengths) // args.batch_size)}
+        result["splits"][split] = values
+    missing = known - seen
+    if missing:
+        result["errors"].append(f"{len(missing)} dataset episodes are not assigned to a split")
+    result["status"] = "fail" if result["errors"] else "pass"
+    return result
 
 
 def markdown_report(report):
@@ -559,18 +651,36 @@ def markdown_report(report):
         "",
         "## Trajectory Summary",
         "",
-        "| Task | Audited | Valid | Mean T | Min T | Max T | Errors |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "Step counts are action counts T, not T+1 observations. Statistics cover readable audited episodes.",
+        "",
+        "| Task | Audited | Valid | Total T | Mean T | Median T | Min T | Max T | P95 T | Errors |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for task, result in report["tasks"].items():
         trajectory = result["trajectory_steps"]
         mean = f"{trajectory['mean']:.1f}" if trajectory["mean"] is not None else "-"
         lines.append(
             f"| {task.title()} | {result['audited_entries']} | "
-            f"{result['valid_episodes']} | {mean} | "
+            f"{result['valid_episodes']} | {trajectory['total']} | {mean} | {trajectory['median']} | "
             f"{trajectory['min'] or '-'} | {trajectory['max'] or '-'} | "
-            f"{result['error_count']} |"
+            f"{trajectory['p95']} | {result['error_count']} |"
         )
+
+    lines += ["", f"- Combined audited total: {report['trajectory_steps']['total']} action steps.",
+              "- Per-episode lengths: `episode_lengths.csv`.", "", "## Split Lengths and Training Budget", ""]
+    split_report = report["split_summary"]
+    lines.append(f"- Split directory: `{split_report['directory']}`; status: {split_report['status']}.")
+    lines.append(f"- Estimate assumptions: `{json.dumps(split_report['assumptions'], sort_keys=True)}`.")
+    for split, values in split_report["splits"].items():
+        stats = values["trajectory_steps"]
+        lines.append(f"- **{split}**: {stats['count']} episodes, {stats['total']} action steps, mean {stats['mean']}.")
+        if "training_budget" in values:
+            budget = values["training_budget"]
+            lines.extend([
+                f"  - A/B/C: {budget['visual_bc_updates_per_epoch']} updates per full epoch; {budget['visual_bc_updates_in_100_epochs']} in 100 epochs.",
+                f"  - BC-RNN: {budget['bcrnn_updates_per_full_pass']} updates per full dataset pass; {budget['bcrnn_updates_in_100_full_passes']} in 100 passes.",
+                "  - BC-RNN currently uses --max-updates; full passes are a budget estimate, not an --epochs option.",
+            ])
 
     lines += ["", "## Semantic Distributions", ""]
     for task, result in report["tasks"].items():
@@ -599,6 +709,9 @@ def markdown_report(report):
     for group in report["duplicate_files"]:
         any_errors = True
         lines.append(f"- Duplicate files: {', '.join(f'`{path}`' for path in group)}")
+    for error in split_report["errors"]:
+        any_errors = True
+        lines.append(f"- Split: {error}")
     if not any_errors:
         lines.append("No errors found.")
     lines.append("")
@@ -615,6 +728,8 @@ def main():
         raise ValueError("--limit-per-task must be positive")
     if args.rgb_samples <= 0:
         raise ValueError("--rgb-samples must be positive")
+    if min(args.batch_size, args.sequence_stride, args.gradient_accumulation_steps) <= 0:
+        raise ValueError("Batch size, sequence stride, and accumulation steps must be positive")
     if not args.dataset.is_dir():
         raise FileNotFoundError(f"Dataset directory does not exist: {args.dataset}")
 
@@ -625,8 +740,11 @@ def main():
         task_results[task] = audit_task(args.dataset, task, args, digest_paths)
 
     duplicates = [paths for paths in digest_paths.values() if len(paths) > 1]
+    split_summary = audit_split_lengths(args, task_results)
     error_count = sum(result["error_count"] for result in task_results.values())
     error_count += len(duplicates)
+    error_count += len(split_summary["errors"])
+    length_rows = [row for value in task_results.values() for row in value["episode_lengths"]]
     report = {
         "dataset": str(args.dataset),
         "mode": args.mode,
@@ -636,6 +754,8 @@ def main():
         "error_count": error_count,
         "tasks": task_results,
         "duplicate_files": duplicates,
+        "trajectory_steps": trajectory_statistics([row["steps"] for row in length_rows if row["steps"] is not None]),
+        "split_summary": split_summary,
     }
 
     args.output.mkdir(parents=True, exist_ok=True)
@@ -643,10 +763,32 @@ def main():
     markdown_path = args.output / "audit_report.md"
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     markdown_path.write_text(markdown_report(report), encoding="utf-8")
+    csv_path = args.output / "episode_lengths.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("task", "episode", "path", "manifest_steps", "steps", "valid"))
+        writer.writeheader()
+        writer.writerows(length_rows)
 
     print(f"Audit status: {report['status'].upper()} ({error_count} errors)")
+    for task, value in task_results.items():
+        stats = value["trajectory_steps"]
+        print(f"{task}: {stats['count']} readable episodes; total={stats['total']} action steps; "
+              f"min={stats['min']} mean={stats['mean']} median={stats['median']} max={stats['max']} p95={stats['p95']}")
+    if split_summary["status"] == "unavailable":
+        print("Split manifests unavailable; use --split-dir to obtain training update estimates")
+    for split, values in split_summary["splits"].items():
+        stats = values["trajectory_steps"]
+        print(f"{split}: {stats['count']} episodes; {stats['total']} action steps")
+        if "training_budget" in values:
+            budget = values["training_budget"]
+            print(f"  A/B/C updates/full epoch: {budget['visual_bc_updates_per_epoch']}; "
+                  f"100 epochs: {budget['visual_bc_updates_in_100_epochs']}")
+            print(f"  BC-RNN updates/full dataset pass: {budget['bcrnn_updates_per_full_pass']}; "
+                  f"100 passes: {budget['bcrnn_updates_in_100_full_passes']}")
+    print(f"Update estimate assumptions: {split_summary['assumptions']}")
     print(f"JSON report: {json_path}")
     print(f"Markdown report: {markdown_path}")
+    print(f"Per-episode CSV: {csv_path}")
     raise SystemExit(0 if error_count == 0 else 1)
 
 

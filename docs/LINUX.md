@@ -136,6 +136,17 @@ python -m scripts.audit_pose_distribution \
 Audit pose menerima train/val bila tidak ada test. Baseline ini memang 90/10,
 bukan 80/10/10. Evaluasi final membuat scene baru, bukan replay episode val.
 
+`audit_dataset` juga mencetak total action step (T, bukan T+1 observation),
+mean/median/min/max/P95 panjang episode, dan menghasilkan `episode_lengths.csv`.
+Jika split default tersedia, laporan menyertakan jumlah episode/step train-val
+dan estimasi update per putaran dataset untuk A/B/C serta BC-RNN. Untuk split
+khusus gunakan `--split-dir <direktori>`. Asumsi estimasi default adalah batch 8,
+stride A/B/C 8, accumulation 1; ubah dengan `--batch-size`, `--sequence-stride`,
+dan `--gradient-accumulation-steps`. BC-RNN memakai stride 1 dan drop-last,
+sehingga estimasi jumlah updatenya berbeda. Flag ini hanya menghitung estimasi;
+tidak mengubah data atau konfigurasi training. Dengan `--limit-per-task`, total
+audit hanya mencakup subset tersebut, sedangkan ringkasan split tetap penuh.
+
 ### Enam Eksperimen Kamera Dan Orientasi
 
 Posisi sampling tetap x `[-0.10, 0.10]` m, y `[-0.20, 0.20]` m. Yaw memakai
