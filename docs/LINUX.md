@@ -570,3 +570,12 @@ Variasi scene: gunakan `--object-counts 1 2 3 --receptacle-counts 1 2 3` sebagai
 pengganti count tunggal saat collection. Evaluasi tiap kombinasi dengan output
 terpisah. Rollout otomatis memakai jumlah maksimum di dataset, bukan semua
 kombinasi sekaligus.
+
+## 8. Baseline Low-Dim BC-RNN
+
+Untuk diagnosis persepsi pada Place satu kubus / satu tray, gunakan
+[panduan low-dim BC-RNN](../models/low_dim_bc_rnn/README.md). Model memakai state
+robot, kubus dan tray (23D) dari HDF5 yang sama, tanpa input gambar. Script baru
+`scripts.train_low_dim_bc_rnn` dan `scripts.evaluate_low_dim_bc_rnn` memakai
+split yang sudah tersedia, dengan direktori hasil terpisah. Panduan mencakup
+command train lalu eval, resume, dan konfigurasi perbandingan dengan vision.

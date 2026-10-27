@@ -6,9 +6,9 @@ import random
 from pathlib import Path
 
 import numpy as np
+
 from data.episode_io import HDF5_SUFFIXES, open_episode, read_json
 from environments.pick_config import validate_pick_settings
-
 
 STATE_KEYS = ("obs__robot0_joint_pos", "obs__robot0_eef_pos", "obs__robot0_gripper_qpos")
 PROPRIO_KEYS = STATE_KEYS + ("obs__robot0_eef_quat",)

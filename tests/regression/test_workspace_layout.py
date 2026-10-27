@@ -65,6 +65,7 @@ class WorkspaceLayoutTests(unittest.TestCase):
         self.assertEqual({path.name for path in (ROOT / "scripts").glob("*.py")},
                          {"__init__.py", "record_demonstrations.py", "train_visual_bc.py",
                           "train_robomimic_bc_rnn.py", "evaluate_robomimic_bc_rnn.py",
+                          "train_low_dim_bc_rnn.py", "evaluate_low_dim_bc_rnn.py",
                           "evaluate_visual_bc.py", "evaluation_utils.py", "audit_dataset.py",
                           "audit_pose_distribution.py"})
 

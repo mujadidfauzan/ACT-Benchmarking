@@ -118,12 +118,14 @@ def evaluate_episode(
         raise RuntimeError("Environment target color does not match checkpoint")
     if task == "place" and metadata.get("target_receptacle_color") != target_color:
         raise RuntimeError("Environment receptacle color does not match checkpoint")
-    label = f"Vision-only target: {target_color} cube"
+    state_inputs = getattr(model, "observation_inputs", None)
+    video_cameras = getattr(model, "video_camera_names", model.camera_names)
+    label = f"{'State' if state_inputs is not None else 'Vision-only'} target: {target_color} cube"
     if task == "place":
         label += f" into {target_color} tray"
     video = None
     if video_path is not None:
-        frame = compose_camera_frame(observation, model.camera_names)
+        frame = compose_camera_frame(observation, video_cameras)
         video = EvaluationVideoRecorder(
             video_path, frame, label, task, episode_index, video_fps
         )
@@ -175,17 +177,19 @@ def evaluate_episode(
             ).copy()
             target_before = env.get_object_position(target_id).copy()
             target_delta_before = target_before - eef_before
-            camera_inputs, proprio = policy_observation(
-                observation,
-                image_size,
-                device,
-                normalizer.proprio_keys,
-                model.camera_names,
-            )
-            policy_inputs = {"proprio": normalizer.normalize_proprio(proprio)}
+            if state_inputs is not None:
+                policy_inputs = state_inputs(observation, device)
+            else:
+                camera_inputs, proprio = policy_observation(
+                    observation,
+                    image_size,
+                    device,
+                    normalizer.proprio_keys,
+                    model.camera_names,
+                )
+                policy_inputs = {**camera_inputs, "proprio": normalizer.normalize_proprio(proprio)}
             with torch.inference_mode():
                 output = model.step(
-                    **camera_inputs,
                     **policy_inputs,
                     previous_gripper=previous_gripper,
                     hidden=hidden,
@@ -201,7 +205,7 @@ def evaluate_episode(
             action_values += action.size
             observation, _, done, _ = env.step(action)
             if video is not None:
-                video.write(compose_camera_frame(observation, model.camera_names), step)
+                video.write(compose_camera_frame(observation, video_cameras), step)
             if render:
                 env.render()
 
@@ -346,7 +350,9 @@ def build_environment(seed, num_objects, render, model, prepared, max_steps):
     collection = prepared.get("environment_configs", {}).get(task, {})
     args = SimpleNamespace(task=task, num_cubes=num_objects, fixed_target_color=prepared["fixed_target_color"],
                            num_receptacles=prepared.get("evaluation_num_receptacles") or max(value[1] for value in prepared["scene_counts"]) or 3,
-                           camera_names=list(model.camera_names), camera_obs=True, render=render,
+                           camera_names=list(model.camera_names or getattr(model, "video_camera_names", ())),
+                           camera_obs=bool(model.camera_names) or getattr(model, "render_observation_cameras", False),
+                           render=render,
                            instruction_split="train", image_size=size, seed=seed,
                            max_steps=max_steps,
                            environment_kwargs=collection.get("environment_kwargs", {}),
