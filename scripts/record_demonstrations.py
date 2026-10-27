@@ -36,6 +36,8 @@ def parse_args():
     parser.add_argument("--output", type=Path, default=Path("data/demos"))
     parser.add_argument("--seed", type=int, default=7)
     add_count_arguments(parser)
+    parser.add_argument("--placement-layout", choices=PlaceEnv.PLACEMENT_LAYOUTS, default="uniform",
+                        help="Place initial layout: uniform, or objects/trays on opposite robot Y sides")
     add_pick_arguments(parser)
     target = parser.add_mutually_exclusive_group()
     target.add_argument(
@@ -109,6 +111,7 @@ def build_task(args, num_objects=None, num_receptacles=None, seed=None):
             **common,
         )
     elif args.task == "place":
+        common.setdefault("placement_layout", getattr(args, "placement_layout", "uniform"))
         env = PlaceEnv(num_objects=num_objects, num_receptacles=num_receptacles,
                        fixed_target_color=getattr(args, "fixed_target_color", None),
                        horizon=getattr(args, "max_steps", 3000), **common)
@@ -191,6 +194,8 @@ def failure_reason(info):
 def main():
     args = parse_args()
     args.yaw_range_deg = validate_pick_arguments(args)
+    if args.task != "place" and args.placement_layout != "uniform":
+        raise ValueError("--placement-layout opposite_sides requires --task place")
     if args.task in ("pick", "place") and args.fixed_target_color is None and not args.random_target:
         args.fixed_target_color = "red"
     if args.random_target and args.task != "pick":
@@ -217,6 +222,8 @@ def main():
             raise ValueError("Existing collection uses another/unknown camera or control setup; choose a new dataset directory")
         if config.get("fixed_target_color") != args.fixed_target_color:
             raise ValueError("Existing collection uses another target configuration; choose a new dataset directory")
+        if config.get("environment_kwargs", {}).get("placement_layout", "uniform") != args.placement_layout:
+            raise ValueError("Existing collection uses another placement layout; choose a new dataset directory")
         if "rotation_mode" not in config or "yaw_range_deg" not in config:
             raise ValueError("Existing collection is missing yaw/rotation metadata; choose a new dataset directory")
         if args.task == "pick":
@@ -312,8 +319,8 @@ def main():
                 "fixed_target_color": args.fixed_target_color,
                 "controller_config": getattr(env, "bc_controller_config", None),
                 "environment_kwargs": {key: np.asarray(getattr(env, key)).tolist() for key in
-                    ("x_range", "y_range", "yaw_range", "minimum_object_distance", "minimum_object_receptacle_distance", "minimum_receptacle_distance", "cube_half_size", "table_full_size", "table_friction")
-                    if hasattr(env, key)}}
+                    ("x_range", "y_range", "yaw_range", "minimum_object_distance", "minimum_object_receptacle_distance", "minimum_receptacle_distance", "cube_half_size", "table_full_size", "table_friction", "placement_layout")
+                    if hasattr(env, key) and (key != "placement_layout" or env.placement_layout != "uniform")}}
             initial_scene = snapshot_scene(observation)
             recorder = TrajectoryRecorder(
                 env,

@@ -436,7 +436,8 @@ Baseline ini membaca dataset HDF5 dan split yang sama secara langsung, tanpa
 konversi. Entry point terpisah adalah `scripts.train_robomimic_bc_rnn` dan
 `scripts.evaluate_robomimic_bc_rnn`. ResNet18 + learned keypoints + LSTM,
 continuous 7D action MSE, dan Adam mengikuti resep rujukan; batch default 8
-menyesuaikan hardware. Lihat [arsitektur, protokol, dan command train + eval](../models/robomimic_bc_rnn/README.md).
+menyesuaikan hardware. Lihat [implementasi arsitektur](../models/robomimic_bc_rnn/policy.py)
+dan command train + eval di bawah.
 
 ```bash
 python -m scripts.train_robomimic_bc_rnn \
@@ -571,11 +572,43 @@ pengganti count tunggal saat collection. Evaluasi tiap kombinasi dengan output
 terpisah. Rollout otomatis memakai jumlah maksimum di dataset, bukan semua
 kombinasi sekaligus.
 
+### Place dengan kubus dan tray di sisi berlawanan
+
+Gunakan `--placement-layout opposite_sides` saat collection untuk mengacak dua
+arah: kubus di Y negatif dan tray di Y positif, atau sebaliknya. Kanan/kiri
+di sini relatif robot (sumbu Y dunia); robot menghadap +X. Aturan berlaku pada
+posisi awal setiap episode. X tetap diacak dalam rentang -0,16 sampai +0,16 m,
+dan tiap entitas mendapatkan yaw independen dalam rentang -45 sampai +45 derajat.
+Sampler mempertimbangkan ukuran benda agar seluruh benda berada di setengah
+meja masing-masing, serta tetap memeriksa jarak minimum dan overlap. Posisi
+kubus dan tray diacak secara independen; keduanya tidak dipasang sebagai pose
+cermin. Untuk scene multiobjek, semua kubus berada di satu sisi dan semua tray
+di sisi lain.
+
+```bash
+python -m scripts.record_demonstrations \
+  --task place --num-demos 1000 \
+  --num-objects 1 --num-receptacles 1 --fixed-target-color red \
+  --placement-layout opposite_sides \
+  --camera-names agentview robot0_eye_in_hand --image-size 128 \
+  --seed 42 --max-attempts 5000 \
+  --output data/demos/place_red_1cube_1tray_opposite_v01
+```
+
+Pola tersimpan dalam `collection_config.environment_kwargs.placement_layout`.
+Train memakai dataset baru ini; evaluator otomatis memulihkan layout dari
+checkpoint, termasuk untuk visual BC, image BC-RNN dan low-dim BC-RNN. Summary
+evaluasi mencatat `placement_layout`. Dataset lama tanpa field tersebut tetap
+memakai layout `uniform`. Collection menolak append dengan layout berbeda
+ke folder dataset yang sama. Expert, durasi fase dan kriteria sukses tetap
+mengikuti konfigurasi sebelumnya. Pemilihan arah acak per reset tidak menjamin
+jumlah demo sukses persis 50:50 pada kedua arah.
+
 ## 8. Baseline Low-Dim BC-RNN
 
 Untuk diagnosis persepsi pada Place satu kubus / satu tray, gunakan
-[panduan low-dim BC-RNN](../models/low_dim_bc_rnn/README.md). Model memakai state
+[implementasi low-dim BC-RNN](../models/low_dim_bc_rnn/policy.py). Model memakai state
 robot, kubus dan tray (23D) dari HDF5 yang sama, tanpa input gambar. Script baru
 `scripts.train_low_dim_bc_rnn` dan `scripts.evaluate_low_dim_bc_rnn` memakai
-split yang sudah tersedia, dengan direktori hasil terpisah. Panduan mencakup
-command train lalu eval, resume, dan konfigurasi perbandingan dengan vision.
+split yang sudah tersedia, dengan direktori hasil terpisah. Parameter train,
+eval dan resume tersedia melalui `--help` pada masing-masing script.

@@ -27,6 +27,7 @@ from robosuite.utils.transform_utils import (
 )
 
 from environments.instructions import generate_instruction
+from environments.place_layout import PLACEMENT_LAYOUTS, OppositeSidesSampler
 
 from environments.entity_utils import (
     COLOR_PALETTE,
@@ -305,6 +306,7 @@ class PlaceEnv(ManipulationEnv):
     """Multi-object, multi-receptacle semantic pick-and-place task."""
 
     COLOR_PALETTE = COLOR_PALETTE
+    PLACEMENT_LAYOUTS = PLACEMENT_LAYOUTS
 
     def __init__(
         self,
@@ -323,6 +325,7 @@ class PlaceEnv(ManipulationEnv):
         minimum_object_distance=0.10,
         minimum_object_receptacle_distance=0.12,
         minimum_receptacle_distance=0.14,
+        placement_layout="uniform",
         use_camera_obs=False,
         use_object_obs=True,
         has_renderer=True,
@@ -349,6 +352,9 @@ class PlaceEnv(ManipulationEnv):
             raise ValueError("num_objects must be between 1 and 4")
         if num_receptacles not in (1, 2, 3, 4):
             raise ValueError("num_receptacles must be between 1 and 4")
+        if placement_layout not in PLACEMENT_LAYOUTS:
+            raise ValueError(f"placement_layout must be one of {PLACEMENT_LAYOUTS}")
+        self.placement_layout = placement_layout
 
         self.num_objects = int(num_objects)
         if fixed_target_color is not None and fixed_target_color not in COLOR_PALETTE:
@@ -462,19 +468,24 @@ class PlaceEnv(ManipulationEnv):
 
         self.cube = self.objects[0]
         self.receptacle = self.receptacles[0]
-        self.placement_initializer = UniformRandomSampler(
-            name="PlaceEntitySampler",
-            mujoco_objects=self.objects + self.receptacles,
-            x_range=(-0.16, 0.16),
-            y_range=(-0.30, 0.30),
-            rotation=(-np.pi / 4, np.pi / 4),
-            rotation_axis="z",
-            ensure_object_boundary_in_range=True,
-            ensure_valid_placement=True,
-            reference_pos=self.table_offset,
-            z_offset=0.01,
-            rng=self.rng,
-        )
+        if self.placement_layout == "opposite_sides":
+            self.placement_initializer = OppositeSidesSampler(
+                self.objects, self.receptacles, self.table_offset, self.rng,
+            )
+        else:
+            self.placement_initializer = UniformRandomSampler(
+                name="PlaceEntitySampler",
+                mujoco_objects=self.objects + self.receptacles,
+                x_range=(-0.16, 0.16),
+                y_range=(-0.30, 0.30),
+                rotation=(-np.pi / 4, np.pi / 4),
+                rotation_axis="z",
+                ensure_object_boundary_in_range=True,
+                ensure_valid_placement=True,
+                reference_pos=self.table_offset,
+                z_offset=0.01,
+                rng=self.rng,
+            )
         self.model = ManipulationTask(
             mujoco_arena=arena,
             mujoco_robots=[robot.robot_model for robot in self.robots],
@@ -697,6 +708,8 @@ class PlaceEnv(ManipulationEnv):
             "target_color": object_color,
             "target_receptacle_color": receptacle_color,
             "fixed_target_color": getattr(self, "fixed_target_color", None),
+            **({"placement_layout": self.placement_layout}
+               if getattr(self, "placement_layout", "uniform") != "uniform" else {}),
             "sampling_stats": self.last_sampling_stats.copy(),
             "semantic_split": semantic_split_for(
                 "place",
