@@ -448,8 +448,10 @@ def evaluate_policy(args, model, normalizer, checkpoint, device):
                           "failed": global_episode - successes, "success_rate": successes / global_episode,
                           "failure_counts": dict(failures), "mean_steps": total_steps / global_episode}]}
     if task == "place":
-        summary["placement_layout"] = prepared.get("environment_configs", {}).get("place", {}).get(
-            "environment_kwargs", {}).get("placement_layout", "uniform")
+        environment_kwargs = prepared.get("environment_configs", {}).get("place", {}).get("environment_kwargs", {})
+        summary["placement_layout"] = environment_kwargs.get("placement_layout", "uniform")
+        if environment_kwargs.get("maximum_object_receptacle_distance") is not None:
+            summary["maximum_object_receptacle_distance"] = environment_kwargs["maximum_object_receptacle_distance"]
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"Evaluation: {successes}/{global_episode} ({successes / global_episode:.1%}), "
           f"seed mean={rates.mean():.1%}, sample SD={summary['std_seed_success_rate_sample']:.1%}")

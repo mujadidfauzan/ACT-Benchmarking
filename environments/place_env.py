@@ -326,6 +326,7 @@ class PlaceEnv(ManipulationEnv):
         minimum_object_receptacle_distance=0.12,
         minimum_receptacle_distance=0.14,
         placement_layout="uniform",
+        maximum_object_receptacle_distance=None,
         use_camera_obs=False,
         use_object_obs=True,
         has_renderer=True,
@@ -380,6 +381,15 @@ class PlaceEnv(ManipulationEnv):
         )
         if self.minimum_entity_distance < 0.0:
             raise ValueError("Entity clearances must be non-negative")
+        self.maximum_object_receptacle_distance = (
+            None if maximum_object_receptacle_distance is None
+            else float(maximum_object_receptacle_distance)
+        )
+        if self.maximum_object_receptacle_distance is not None and (
+            not np.isfinite(self.maximum_object_receptacle_distance)
+            or self.maximum_object_receptacle_distance <= self.minimum_object_receptacle_distance
+        ):
+            raise ValueError("maximum_object_receptacle_distance must be finite and greater than minimum_object_receptacle_distance")
         self.use_object_obs = use_object_obs
 
         self.object_id_to_color = {}
@@ -587,11 +597,14 @@ class PlaceEnv(ManipulationEnv):
 
     def _sample_safe_placements(self):
         entity_ids = self.object_ids + self.receptacle_ids
+        maximum_distance = getattr(self, "maximum_object_receptacle_distance", None)
         stats = {
             "attempts": 0,
             "sampler_errors": 0,
             "clearance_rejections": 0,
         }
+        if maximum_distance is not None:
+            stats["maximum_distance_rejections"] = 0
         for _ in range(500):
             stats["attempts"] += 1
             try:
@@ -604,16 +617,25 @@ class PlaceEnv(ManipulationEnv):
                 entity_id: np.asarray(placements[entity_id][0])
                 for entity_id in entity_ids
             }
-            if all(
+            if not all(
                 np.linalg.norm(positions[first][:2] - positions[second][:2])
                 >= self.required_clearance(first, second)
                 for index, first in enumerate(entity_ids)
                 for second in entity_ids[index + 1 :]
             ):
-                self.last_sampling_stats = stats
-                return placements
+                stats["clearance_rejections"] += 1
+                continue
 
-            stats["clearance_rejections"] += 1
+            # Bound every object/tray center distance in XY. Keep the default
+            # sampling path unchanged for existing datasets and checkpoints.
+            if maximum_distance is not None and any(
+                np.linalg.norm(positions[obj][:2] - positions[tray][:2]) > maximum_distance
+                for obj in self.object_ids for tray in self.receptacle_ids
+            ):
+                stats["maximum_distance_rejections"] += 1
+                continue
+            self.last_sampling_stats = stats
+            return placements
 
         self.last_sampling_stats = stats
         raise RandomizationError(
@@ -710,6 +732,8 @@ class PlaceEnv(ManipulationEnv):
             "fixed_target_color": getattr(self, "fixed_target_color", None),
             **({"placement_layout": self.placement_layout}
                if getattr(self, "placement_layout", "uniform") != "uniform" else {}),
+            **({"maximum_object_receptacle_distance": self.maximum_object_receptacle_distance}
+               if getattr(self, "maximum_object_receptacle_distance", None) is not None else {}),
             "sampling_stats": self.last_sampling_stats.copy(),
             "semantic_split": semantic_split_for(
                 "place",

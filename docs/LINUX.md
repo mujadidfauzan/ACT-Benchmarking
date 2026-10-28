@@ -604,6 +604,30 @@ ke folder dataset yang sama. Expert, durasi fase dan kriteria sukses tetap
 mengikuti konfigurasi sebelumnya. Pemilihan arah acak per reset tidak menjamin
 jumlah demo sukses persis 50:50 pada kedua arah.
 
+Untuk membatasi jarak awal antarpusat kubus dan tray di bidang XY, tambahkan
+`--max-object-receptacle-distance 0.30`. Dengan minimum default, jaraknya
+menjadi 0,12–0,30 m. Batas maksimum berlaku pada setiap pasangan kubus/tray;
+sampling mengulang hingga batas minimum, maksimum, dan layout terpenuhi.
+Posisi dan yaw tetap acak, tetapi batas jarak menghubungkan pilihan kedua pose.
+Ini tidak menjamin episode selesai dalam 300 step.
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.record_demonstrations \
+  --task place --num-demos 1000 \
+  --num-objects 1 --num-receptacles 1 --fixed-target-color red \
+  --placement-layout opposite_sides --max-object-receptacle-distance 0.30 \
+  --camera-names agentview robot0_eye_in_hand --image-size 128 \
+  --seed 42 --max-attempts 5000 \
+  --output data/demos/place_red_1cube_1tray_opposite_d30_v01 \
+  --training-dir data/splits/place_red_1cube_1tray_opposite_d30_v01_bc
+```
+
+Batas disimpan sebagai `maximum_object_receptacle_distance` dalam
+`collection_config.environment_kwargs`, otomatis dipulihkan semua evaluator,
+dan dicatat dalam summary evaluasi. Collection menolak append jika batasnya
+berbeda. Tanpa opsi tersebut, dataset dan checkpoint lama tetap tanpa batas
+maksimum. Gunakan folder dataset baru untuk eksperimen jarak ini.
+
 ## 8. Baseline Low-Dim BC-RNN
 
 Untuk diagnosis persepsi pada Place satu kubus / satu tray, gunakan
