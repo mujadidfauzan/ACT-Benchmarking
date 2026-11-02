@@ -628,6 +628,75 @@ dan dicatat dalam summary evaluasi. Collection menolak append jika batasnya
 berbeda. Tanpa opsi tersebut, dataset dan checkpoint lama tetap tanpa batas
 maksimum. Gunakan folder dataset baru untuk eksperimen jarak ini.
 
+### Rollout scene validation untuk membandingkan A/B/C/D
+
+Script [evaluate_visual_bc_validation.py](../scripts/evaluate_visual_bc_validation.py)
+membaca split yang sudah disiapkan, merekonstruksi observasi awal dari HDF5,
+dan menjalankan policy pada simulator. Tanpa `--episodes`, seluruh episode
+validation dievaluasi. Semua checkpoint harus berasal dari dataset/split yang
+sama. Model dijalankan bergantian, dengan hash state awal yang wajib identik
+antar-model untuk tiap episode. Kriteria sukses tetap 20 step berturut-turut.
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.evaluate_visual_bc_validation \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --checkpoints \
+    A=results/visual_bc/place_red_1000_d20_A_avg_gru_s123/best_rollout.pt \
+    B=results/visual_bc/place_red_1000_d20_B_spatial_gru_s123/best_rollout.pt \
+    C=results/visual_bc/place_red_1000_d20_C_resnet18_gru_s123/best_rollout.pt \
+    D=results/robomimic_bc_rnn/place_red_1000_d20_D_bcrnn_s123/best_rollout.pt \
+  --output-dir results/visual_bc_validation/place_red_1000_d20_ABCD \
+  --max-steps 300 --rnn-reset-interval 0 --device cuda
+```
+
+Setiap `<model>/episode_<id>/` berisi `rollout.mp4` (dua kamera, joint dan
+command gripper), `trajectory.png`, `joints.png`, `initial_comparison.png`,
+`trajectory.csv`, `trajectory.jsonl`, `trajectory.npz`,
+`gripper_events.jsonl`, dan `summary.json`. Joint posisi dalam radian,
+kecepatan dalam rad/s, koordinat/gripper dalam meter, waktu dari simulator.
+CSV mencatat state awal pada step 0; row step N adalah state setelah action N.
+Event command mencatat waktu/state sebelum dan sesudah action, terpisah dari
+indikator kontak kedua fingerpad. Kontak ini tidak menjamin grasp stabil.
+NPZ menyimpan state penuh qpos/qvel/ctrl/act pada setiap frame; `model.xml`
+disimpan per model. `comparison.csv/json/png` membandingkan hasil berpasangan.
+
+`episode_summary.md`, `episode_summary.csv`, dan `episode_summary.json`
+menampilkan outcome tiap model pada setiap episode: `SUCCESS`, `FAILURE`
+dengan failure reason, atau `PENDING`. Ringkasan ini diperbarui setiap episode;
+tiap folder model juga memiliki `episode_summary.csv` yang lebih ringkas.
+D otomatis memakai proprioception/action mentah, resize/crop dari model,
+dan reset LSTM setiap `sequence_length` dari checkpoint (default 10).
+`--rnn-reset-interval` hanya mengatur A/B/C. D tidak memiliki gripper logit;
+kolom CSV kosong dan array NPZ memakai NaN. `predicted_actions` pada D adalah
+action controller mentah, sedangkan A/B/C juga memiliki `normalized_actions`.
+
+Jika hasil A/B/C sudah lengkap, jalankan D saja dan gunakan hasil lama tanpa
+mengulang rollout ketiganya:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.evaluate_visual_bc_validation \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --checkpoints D=results/robomimic_bc_rnn/place_red_1000_d20_D_bcrnn_s123/best_rollout.pt \
+  --reuse-results results/visual_bc_validation/place_red_1000_d20_ABC \
+  --output-dir results/visual_bc_validation/place_red_1000_d20_ABCD \
+  --max-steps 300 --device cuda
+```
+
+Reuse memeriksa daftar episode, konfigurasi collection, protokol evaluasi,
+dan hash state awal. Folder baru berisi ringkasan A/B/C yang menunjuk hasil
+aslinya; video/trajectory lama tidak disalin atau diubah. Nama model baru
+harus berbeda dari model yang dipakai ulang.
+
+Gunakan `--episodes 2` untuk pemeriksaan singkat, atau `--episode-ids 5 17`
+untuk ID yang benar-benar terdapat pada split tersebut. Output harus kosong;
+script tidak menimpa evaluasi sebelumnya. Pose awal diperiksa terhadap HDF5.
+Kecepatan robot dipulihkan bila tersedia; kecepatan yang tidak direkam dibuat
+nol. Ini adalah scene hasil rekonstruksi, bukan replay fisika asli yang persis.
+Garis expert pada PNG hanya referensi, tanpa penyelarasan fase atau suplai
+action demonstrator ke policy.
+
 ## 8. Baseline Low-Dim BC-RNN
 
 Untuk diagnosis persepsi pada Place satu kubus / satu tray, gunakan
