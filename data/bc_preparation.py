@@ -72,7 +72,10 @@ def dataset_entries(dataset):
 
 def source_digest(dataset, entries):
     values = []
-    for entry in entries:
+    total = len(entries)
+    for i, entry in enumerate(entries, 1):
+        if i == 1 or i % 100 == 0 or i == total:
+            print(f"  Hashing episodes {i}/{total} ...", flush=True)
         digest = hashlib.sha256()
         with (Path(dataset) / entry["path"]).open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -92,6 +95,7 @@ def write_split(path, entries):
 def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
     dataset = Path(dataset)
     output = default_training_dir(dataset) if output is None else Path(output)
+    print(f"  Scanning episodes in {dataset} ...", flush=True)
     entries = dataset_entries(dataset)
     if len(entries) < 2:
         raise ValueError("At least two successful demonstrations are needed for train/validation")
