@@ -757,6 +757,19 @@ dan setiap `--log-every`; validation/checkpoint mengikuti `--checkpoint-every`.
 
 Resume memakai konfigurasi, optimizer, sampler, serta RNG dari checkpoint:
 
+ACT memakai attention softmax eksplisit untuk menghindari ketergantungan pada
+kernel fused SDPA saat backward. Bentuk parameter tidak berubah, sehingga
+checkpoint dari implementasi sebelumnya tetap dapat di-resume. Hasil numerik
+dan urutan RNG dropout dapat berbeda dari backend lama.
+
+Jika norm gradien float32 overflow tetapi seluruh komponen gradien masih finite,
+norm dihitung ulang dalam float64 sebelum clipping. Gradien NaN/Inf tetap
+menghentikan training sebelum `optimizer.step()`; jangan menonaktifkan guard ini.
+File `diagnostics/nonfinite_update_<update>.json` mencatat loss, nama parameter
+dengan gradien rusak, path episode/start timestep sampel batch, dan versi Torch/CUDA.
+Laporan ini membedakan masalah backward dari norm overflow; traceback saja tidak
+cukup untuk menentukan parameter atau kernel yang memicunya.
+
 ```bash
 MUJOCO_GL=egl python -u -m scripts.train_act \
   --dataset data/demos/place_red_1cube_1tray \

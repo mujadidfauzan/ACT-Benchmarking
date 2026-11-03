@@ -57,10 +57,13 @@ class AttentionBlock(nn.Module):
 
     def forward(self, value, position, *, padding=None, memory=None, memory_position=None):
         query = value + position
-        attention = self.self_attention(query, query, value, key_padding_mask=padding, need_weights=False)[0]
+        # need_weights=True selects explicit bmm -> softmax -> bmm instead of
+        # fused SDPA kernels. Keep this reference path for ACT numerical
+        # debugging across CUDA / PyTorch builds; parameter shapes stay intact.
+        attention = self.self_attention(query, query, value, key_padding_mask=padding, need_weights=True)[0]
         value = self.norms[0](value + self.dropout(attention))
         if self.cross_attention is not None:
-            attention = self.cross_attention(value + position, memory + memory_position, memory, need_weights=False)[0]
+            attention = self.cross_attention(value + position, memory + memory_position, memory, need_weights=True)[0]
             value = self.norms[1](value + self.dropout(attention))
         return self.norms[-1](value + self.dropout(self.feedforward(value)))
 

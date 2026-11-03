@@ -108,6 +108,57 @@ def action_losses(prediction, target, is_pad, mu=None, logvar=None, kl_weight=10
     )
 
 
+def clip_act_gradients(model, max_norm):
+    """Fail on invalid gradients; recover only float32 norm-reduction overflow."""
+    parameters = [p for p in model.parameters() if p.grad is not None]
+    try:
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=True)
+    except RuntimeError as error:
+        if "non-finite" not in str(error) and "nonfinite" not in str(error):
+            raise
+        bad = [name for name, p in model.named_parameters()
+               if p.grad is not None and not torch.isfinite(p.grad).all()]
+        if bad:
+            raise FloatingPointError("Nonfinite ACT gradients in: " + ", ".join(bad)) from None
+        # Individual gradients can be finite while their squared sum
+        # overflows float32. Recompute the same global L2 norm in float64.
+        if not parameters:
+            raise
+        norms = torch.stack([p.grad.detach().double().norm(2) for p in parameters])
+        norm = norms.norm(2)
+        if not torch.isfinite(norm):
+            raise FloatingPointError("ACT global gradient norm is nonfinite even in float64") from None
+        coefficient = (max_norm / (norm + 1e-6)).clamp(max=1.)
+        with torch.no_grad():
+            for p in parameters:
+                p.grad.mul_(coefficient.to(device=p.grad.device, dtype=p.grad.dtype))
+        return norm
+
+
+def save_numerical_failure(directory, model, dataset, indices, update, losses, error):
+    if directory is None:
+        return None
+    gradients = []
+    for name, parameter in model.named_parameters():
+        gradient = parameter.grad
+        if gradient is not None and not torch.isfinite(gradient).all():
+            gradients.append(dict(parameter=name, nan_count=int(torch.isnan(gradient).sum()),
+                                  inf_count=int(torch.isinf(gradient).sum())))
+    samples = []
+    for index in indices:
+        episode, start = dataset._sample_index[index]
+        samples.append(dict(index=int(index), episode_path=dataset.episodes[episode]["path"],
+                            start=int(start), steps=int(dataset.episodes[episode]["steps"])))
+    values = {key: float(value.detach()) for key, value in losses.items()}
+    path = Path(directory) / f"nonfinite_update_{update:07d}.json"
+    save_json(path, dict(update=update, error=str(error), torch_version=str(torch.__version__),
+                        cuda_version=torch.version.cuda, device=str(next(model.parameters()).device),
+                        attention_implementation="explicit_softmax", samples=samples,
+                        losses={k: v if math.isfinite(v) else str(v) for k, v in values.items()},
+                        nonfinite_gradients=gradients, optimizer_step_executed=False))
+    return path
+
+
 def run_batches(
     model,
     normalizer,
@@ -121,6 +172,7 @@ def run_batches(
     log_every=0,
     start_update=0,
     max_updates=None,
+    failure_dir=None,
 ):
     training = optimizer is not None
     model.train(training)
@@ -128,6 +180,7 @@ def run_batches(
     context = torch.enable_grad() if training else torch.inference_mode()
     with context:
         for batch_index, indices in enumerate(batches, 1):
+            update = start_update + batch_index
             batch = read_batch(dataset, indices, device)
             target = normalizer.normalize_action(batch.pop("action"))
             padding = batch.pop("is_pad")
@@ -144,7 +197,9 @@ def run_batches(
                 kl_weight,
             )
             if not all(torch.isfinite(value) for value in losses.values()):
-                raise FloatingPointError("Nonfinite ACT reconstruction/KL loss")
+                error = FloatingPointError("Nonfinite ACT reconstruction/KL loss")
+                path = save_numerical_failure(failure_dir, model, dataset, indices, update, losses, error)
+                raise FloatingPointError(f"{error}; update={update}; diagnostic={path}")
             count = len(indices)
             # L1 statistics are weighted by real target timesteps, KL by samples.
             valid = int((~padding).sum())
@@ -156,9 +211,12 @@ def run_batches(
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 losses["loss"].backward()
-                norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), gradient_clip, error_if_nonfinite=True
-                )
+                try:
+                    norm = clip_act_gradients(model, gradient_clip)
+                except FloatingPointError as error:
+                    path = save_numerical_failure(failure_dir, model, dataset, indices, update, losses, error)
+                    optimizer.zero_grad(set_to_none=True)
+                    raise FloatingPointError(f"{error}; update={update}; diagnostic={path}") from error
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 values["gradient_norm"] = float(norm)
@@ -430,6 +488,8 @@ def main():
                 else str(args.backbone_weights) if args.backbone_weights else "scratch"
             ),
             batch_norm="frozen_statistics",
+            attention_implementation="explicit_softmax",
+            gradient_clipping="global_L2_nonfinite_guard_float64_norm_overflow_fallback",
             shared_camera_backbone=True,
             window_stride=1,
             observation_history=1,
@@ -490,6 +550,7 @@ def main():
                 log_every=args.log_every,
                 start_update=updates,
                 max_updates=args.max_updates,
+                failure_dir=args.output_dir / "diagnostics",
             )
             updates = target
             va = run_batches(

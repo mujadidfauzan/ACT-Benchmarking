@@ -16,6 +16,7 @@ from torch import nn
 
 from data.normalization import PolicyNormalizer
 from models.act import ACTPolicy
+from models.act.policy import AttentionBlock
 from models.act.dataset import ACTDataset
 from models.act.temporal_ensemble import ChunkState
 from scripts import train_act as training, evaluate_act as evaluation
@@ -94,6 +95,61 @@ class ACTTests(unittest.TestCase):
         self.assertAlmostEqual(prediction.grad[~padding].sum().item(), -1., places=6)
         with self.assertRaisesRegex(ValueError, "No valid"):
             training.action_losses(prediction, target, torch.ones_like(padding))
+
+    def test_explicit_attention_matches_sdpa_with_heavy_padding_and_finite_backward(self):
+        block = AttentionBlock(32, 4, 64, 0.)
+        value = torch.randn(2, 34, 32, requires_grad=True)
+        position = torch.randn(1, 34, 32)
+        padding = torch.ones(2, 34, dtype=torch.bool)
+        padding[:, :3] = False  # CLS + proprio + one real action.
+        query = value + position
+        attention = block.self_attention(query, query, value, key_padding_mask=padding,
+                                         need_weights=False)[0]
+        expected = block.norms[0](value + attention)
+        expected = block.norms[-1](expected + block.feedforward(expected))
+        with patch("torch.nn.functional.scaled_dot_product_attention",
+                   side_effect=AssertionError("Fused SDPA must not run")):
+            actual = block(value, position, padding=padding)
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+            actual.square().mean().backward()
+        self.assertTrue(torch.isfinite(value.grad).all())
+
+    def test_clipping_recovers_norm_overflow_but_rejects_invalid_components(self):
+        layer = nn.Linear(2, 1, bias=False)
+        layer.weight.grad = torch.full_like(layer.weight, 1e20)
+        norm = training.clip_act_gradients(layer, 1.)
+        self.assertTrue(torch.isfinite(norm))
+        self.assertGreater(norm.item(), 1e20)
+        self.assertAlmostEqual(layer.weight.grad.double().norm().item(), 1., places=5)
+        for bad in (float("nan"), float("inf")):
+            layer.weight.grad = torch.full_like(layer.weight, bad)
+            with self.assertRaisesRegex(FloatingPointError, "weight"):
+                training.clip_act_gradients(layer, 1.)
+
+    def test_nonfinite_backward_writes_batch_diagnostic_without_optimizer_step(self):
+        prepared = self.prepare()
+        normalizer = PolicyNormalizer.from_statistics(prepared["normalization"])
+        dataset = ACTDataset(self.dataset, self.prepared / "train.jsonl", prepared["camera_names"],
+                             normalizer.proprio_keys, chunk_size=3)
+        self.addCleanup(dataset.close)
+        with patch("models.act.policy.VisualBackbone", TinyBackbone):
+            model = self.policy()
+        original = copy.deepcopy(model.state_dict())
+        optimizer = torch.optim.AdamW(model.parameters())
+        hook = model.action_head.weight.register_hook(lambda gradient: torch.full_like(gradient, float("nan")))
+        self.addCleanup(hook.remove)
+        with self.assertRaisesRegex(FloatingPointError, "action_head.weight.*update=1051"):
+            training.run_batches(model, normalizer, dataset, [[0, 1]], self.device,
+                                 kl_weight=10., optimizer=optimizer, start_update=1050,
+                                 failure_dir=self.output / "diagnostics")
+        report = json.loads((self.output / "diagnostics/nonfinite_update_0001051.json").read_text())
+        self.assertEqual(report["nonfinite_gradients"][0]["parameter"], "action_head.weight")
+        self.assertFalse(report["optimizer_step_executed"])
+        self.assertEqual([s["index"] for s in report["samples"]], [0, 1])
+        self.assertTrue(math.isfinite(report["losses"]["loss"]))
+        self.assertFalse(optimizer.state)
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(original[key], value, atol=0, rtol=0)
 
     def test_real_resnet_transformer_cvae_backward_and_zero_prior(self):
         model = self.policy().eval()
