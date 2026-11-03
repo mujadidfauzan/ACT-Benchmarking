@@ -705,3 +705,102 @@ robot, kubus dan tray (23D) dari HDF5 yang sama, tanpa input gambar. Script baru
 `scripts.train_low_dim_bc_rnn` dan `scripts.evaluate_low_dim_bc_rnn` memakai
 split yang sudah tersedia, dengan direktori hasil terpisah. Parameter train,
 eval dan resume tersedia melalui `--help` pada masing-masing script.
+
+## 9. ACT pada dataset Place yang sama
+
+Implementasi [ACT](../models/act/policy.py) memakai ResNet18 bersama untuk kedua
+kamera, Transformer encoder/decoder, CVAE saat training, dan latent `z=0` saat
+rollout. Dataset HDF5 tetap digunakan langsung: satu observasi pada waktu `t`
+menjadi input untuk target 32 action berikutnya. Padding di akhir episode
+dikeluarkan dari attention posterior dan dari loss. Input robot adalah 16D
+proprioception yang sama dengan A/B/C; target tetap action OSC tujuh dimensi,
+termasuk gripper kontinu. Normalisasi diambil dari train split yang sudah ada.
+
+Default model: hidden 512, 8 attention heads, 4 encoder layers untuk masing-masing
+encoder visual dan CVAE, 7 decoder layers, feedforward 3200, latent 32. Backbone
+dilatih dari awal dengan statistik BatchNorm beku; tidak ada download bobot.
+`--backbone-weights /path/to/resnet18-state-dict.pth` dapat digunakan untuk
+inisialisasi dari bobot torchvision lokal. Ini merupakan adaptasi ACT untuk
+controller dan resolusi dataset kita, bukan reproduksi eksperimen ALOHA.
+
+Training dan evaluasi final dalam satu command, setelah kode disalin ke PC remote:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.train_act \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --output-dir results/act/place_red_1000_d20_ACT_s123 \
+  --batch-size 8 --chunk-size 32 --seed 123 \
+  --max-updates 324700 --checkpoint-every 500 --log-every 50 \
+  --rollout-eval-every 32470 --rollout-eval-episodes 10 \
+  --rollout-eval-num-seeds 1 --rollout-eval-seed 1000 \
+  --rollout-eval-max-steps 300 --device cuda \
+&& MUJOCO_GL=egl python -u -m scripts.evaluate_act \
+  --checkpoint results/act/place_red_1000_d20_ACT_s123/best_rollout.pt \
+  --output-dir results/act_evaluation/place_red_1000_d20_ACT_s123_h300 \
+  --episodes 20 --num-seeds 5 --seed 2000 --max-steps 300 \
+  --device cuda --record-video --log-rollout
+```
+
+Budget 324700 adalah jumlah optimizer update, bukan 100 epoch ACT. Satu window
+ACT dimulai pada setiap action (stride 1), berbeda dari stride 8 A/B/C. Interval
+32470 hanya menyamakan jumlah update dengan 10 epoch A/B/C pada dataset ini;
+biaya komputasi dan jumlah target action yang dilatih tetap berbeda. GPU remote
+perlu diperiksa langsung untuk penggunaan memorinya.
+
+Loss training adalah L1 pada elemen target valid ditambah `10 * KL`. Log
+validation memisahkan posterior reconstruction memakai mean latent dan prior
+prediction memakai `z=0`; `best.pt` dipilih dari prior L1, `best_rollout.pt` dari
+success rate, dan `latest.pt` untuk resume. Nilai L1 ini tidak dapat dibandingkan
+langsung dengan MSE/BCE A/B/C atau MSE D. Progress dicetak setelah update pertama
+dan setiap `--log-every`; validation/checkpoint mengikuti `--checkpoint-every`.
+
+Resume memakai konfigurasi, optimizer, sampler, serta RNG dari checkpoint:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.train_act \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --output-dir results/act/place_red_1000_d20_ACT_s123 \
+  --resume results/act/place_red_1000_d20_ACT_s123/latest.pt \
+  --max-updates 324700 --device cuda
+```
+
+Jika rollout terputus setelah checkpoint tersimpan, resume mengulang rollout
+yang tertunda sebelum menambah update. Output parsial dipertahankan dan percobaan
+baru memakai suffix `_retryNN`. Jika belum ada `latest.pt`, gunakan direktori
+output baru; jangan menimpa run yang sudah berisi artifact.
+
+Default inference merencanakan ulang setiap step dan menjalankan action pertama.
+Gunakan `--execution-steps N` pada evaluasi untuk menjalankan N action sebelum
+merencanakan ulang. Untuk uji temporal ensembling pada checkpoint yang sama:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.evaluate_act \
+  --checkpoint results/act/place_red_1000_d20_ACT_s123/best_rollout.pt \
+  --output-dir results/act_evaluation/place_red_1000_d20_ACT_s123_ensemble_h300 \
+  --episodes 20 --num-seeds 5 --seed 2000 --max-steps 300 \
+  --execution-steps 1 --temporal-ensemble --ensemble-decay 0.01 \
+  --device cuda --record-video --log-rollout
+```
+
+Bobot ensemble adalah `exp(-decay * umur_prediksi)`, sehingga prediksi terbaru
+mendapat bobot lebih besar. Seluruh tujuh action, termasuk gripper, digabungkan
+sebelum denormalisasi dan clipping; tidak ada threshold gripper tambahan.
+Kedua mode harus dievaluasi terpisah untuk mengetahui efek penggabungan ini.
+
+Evaluator scene validation juga menerima checkpoint ACT, dengan video, PNG,
+joint trajectories, event gripper, dan summary episode seperti A/B/C/D:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.evaluate_visual_bc_validation \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --checkpoints ACT=results/act/place_red_1000_d20_ACT_s123/best_rollout.pt \
+  --output-dir results/visual_bc_validation/place_red_1000_d20_ACT \
+  --max-steps 300 --device cuda
+```
+
+Mode inference pada evaluator validation mengikuti checkpoint; state chunk
+direset antar-episode, tanpa reset periodik RNN. NPZ menyimpan prediksi ACT dalam
+`normalized_actions`; gripper logit kosong karena head ACT kontinu.

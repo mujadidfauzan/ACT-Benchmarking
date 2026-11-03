@@ -6,6 +6,7 @@ import json
 import math
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import h5py
@@ -207,6 +208,51 @@ class ACTTests(unittest.TestCase):
         self.assertEqual(best["updates"], 2)
         self.assertEqual(latest["best_rollout_success_rate"], .8)
         self.assertEqual(len(latest["rollout_history"]), 2)
+
+    def test_resume_recovers_failed_final_rollout_without_retraining(self):
+        self.prepare()
+        with patch("models.act.policy.VisualBackbone", TinyBackbone), redirect_stdout(io.StringIO()):
+            with patch.object(training, "run_rollout", side_effect=RuntimeError("injected evaluator failure")), \
+                    patch("sys.argv", self.command(None, "--max-updates", "2", "--rollout-eval-every", "2")), \
+                    self.assertRaisesRegex(RuntimeError, "injected evaluator"):
+                training.main()
+            before = torch.load(self.output / "latest.pt", weights_only=False)
+            self.assertEqual(before["updates"], 2)
+            self.assertEqual(before["rollout_history"], [])
+            self.assertTrue((self.output / "best.pt").is_file())
+            resume = ["resume", "--dataset", str(self.dataset), "--training-dir", str(self.prepared),
+                      "--output-dir", str(self.output), "--resume", str(self.output / "latest.pt"),
+                      "--max-updates", "2", "--device", "cpu"]
+            with patch("sys.argv", resume), patch.object(training, "run_rollout", return_value=
+                    dict(updates=2, success_rate=.6, summary="recovered")) as rollout:
+                training.main()
+            rollout.assert_called_once()
+        after = torch.load(self.output / "latest.pt", weights_only=False)
+        self.assertEqual(before["history"], after["history"])
+        self.assertEqual(after["best_rollout_success_rate"], .6)
+        self.assertEqual(after["rollout_history"], [dict(updates=2, success_rate=.6, summary="recovered")])
+        for key in before["model_state"]:
+            torch.testing.assert_close(before["model_state"][key], after["model_state"][key], rtol=0, atol=0)
+
+    def test_rollout_retry_preserves_partial_artifacts(self):
+        partial = self.output / "rollouts/update_0000002/place_attempts.jsonl"
+        partial.parent.mkdir(parents=True)
+        partial.write_text("original partial output\n")
+        args = SimpleNamespace(output_dir=self.output, rollout_eval_episodes=10,
+                               rollout_eval_num_seeds=1, rollout_eval_seed=1000, rollout_eval_max_steps=300)
+
+        def evaluate(command, **kwargs):
+            directory = self.root / "run/rollouts/update_0000002_retry01"
+            self.assertEqual(command[command.index("--output-dir") + 1], str(directory))
+            directory.mkdir()
+            (directory / "summary.json").write_text(json.dumps(
+                dict(overall_success_rate=.7, tasks=[dict(failure_counts={})])))
+
+        with patch.object(training.subprocess, "run", side_effect=evaluate):
+            result = training.run_rollout(args, 2, self.device)
+        self.assertEqual(result["success_rate"], .7)
+        self.assertIn("retry01", result["summary"])
+        self.assertEqual(partial.read_text(), "original partial output\n")
 
     def test_eval_uses_shared_physics_normalization_and_continuous_gripper(self):
         self.prepare()

@@ -60,6 +60,8 @@ def parse_args():
         help="Total optimizer updates, including updates before resume",
     )
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--log-every", type=int, default=50,
+                        help="Print training progress every N updates (also the first); 0 disables")
     parser.add_argument(
         "--backbone-weights",
         type=Path,
@@ -116,13 +118,16 @@ def run_batches(
     kl_weight,
     optimizer=None,
     gradient_clip=1.0,
+    log_every=0,
+    start_update=0,
+    max_updates=None,
 ):
     training = optimizer is not None
     model.train(training)
     totals, examples, valid_steps = {}, 0, 0
     context = torch.enable_grad() if training else torch.inference_mode()
     with context:
-        for indices in batches:
+        for batch_index, indices in enumerate(batches, 1):
             batch = read_batch(dataset, indices, device)
             target = normalizer.normalize_action(batch.pop("action"))
             padding = batch.pop("is_pad")
@@ -157,9 +162,15 @@ def run_batches(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 values["gradient_norm"] = float(norm)
+                update = start_update + batch_index
+                if log_every and (batch_index == 1 or update % log_every == 0):
+                    print(f"Training update {update:07d}/{max_updates or '?'}: "
+                          f"L1={values['l1']:.6f} KL={values['kl']:.6f}", flush=True)
             else:
                 # Deployment diagnostic: no demonstration actions enter the model.
                 prior = action_losses(model(**batch)["action"], target, padding)
+                if not all(torch.isfinite(value) for value in prior.values()):
+                    raise FloatingPointError("Nonfinite ACT validation loss with z=0")
                 values.update(
                     {
                         "prior_" + k: v.item()
@@ -188,6 +199,13 @@ def run_batches(
 
 def run_rollout(args, updates, device):
     output = args.output_dir / "rollouts" / f"update_{updates:07d}"
+    # An interrupted evaluator may have written partial artifacts. Keep them
+    # for inspection and give a retried evaluation a fresh output directory.
+    attempt = 0
+    base = output
+    while output.exists() and any(output.iterdir()):
+        attempt += 1
+        output = base.with_name(f"{base.name}_retry{attempt:02d}")
     command = [
         sys.executable,
         "-m",
@@ -222,6 +240,19 @@ def run_rollout(args, updates, device):
     return dict(
         updates=updates, success_rate=rate, summary=str(output / "summary.json")
     )
+
+
+def save_rollout(args, payload, device):
+    """Persist a completed rollout, including when recovering a pending one."""
+    result = run_rollout(args, payload["updates"], device)
+    payload["rollout_history"].append(result)
+    improved = result["success_rate"] > payload["best_rollout_success_rate"]
+    payload["best_rollout_success_rate"] = max(payload["best_rollout_success_rate"], result["success_rate"])
+    if improved:
+        save_checkpoint(args.output_dir / "best_rollout.pt", payload)
+    save_checkpoint(args.output_dir / "latest.pt", payload)
+    save_json(args.output_dir / "rollout_evaluations.json", payload["rollout_history"])
+    print(f"Rollout={result['success_rate']:.1%}; best={payload['best_rollout_success_rate']:.1%}", flush=True)
 
 
 def main():
@@ -269,9 +300,9 @@ def main():
         raise ValueError(
             "KL, weight decay, and ensemble decay must be finite and nonnegative"
         )
-    if min(args.validation_batches, args.rollout_eval_every) < 0:
+    if min(args.validation_batches, args.rollout_eval_every, args.log_every) < 0:
         raise ValueError(
-            "Validation batch limit and rollout interval must be nonnegative"
+            "Validation batch limit, rollout interval, and log interval must be nonnegative"
         )
     if args.resume and (
         args.resume.resolve().parent != args.output_dir.resolve()
@@ -378,7 +409,10 @@ def main():
                 torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
             np.random.set_state(checkpoint["numpy_rng_state"])
             random.setstate(checkpoint["python_rng_state"])
-        if updates >= args.max_updates:
+        pending_rollout = bool(checkpoint and args.rollout_eval_every and updates > 0
+                               and updates % args.rollout_eval_every == 0
+                               and not any(r["updates"] == updates for r in rollout_history))
+        if updates > args.max_updates or (updates == args.max_updates and not pending_rollout):
             raise ValueError("--max-updates must exceed checkpoint updates")
         args.output_dir.mkdir(parents=True, exist_ok=True)
         training_config = {
@@ -430,6 +464,10 @@ def main():
             f"{len(train) // args.batch_size} updates/pass; target={args.max_updates}; best.pt uses z=0 prior L1",
             flush=True,
         )
+        if pending_rollout:
+            print(f"Resuming pending rollout at update {updates}", flush=True)
+            save_rollout(args, checkpoint, device)
+            best_rollout = checkpoint["best_rollout_success_rate"]
         while updates < args.max_updates:
             target = min(
                 args.max_updates,
@@ -449,6 +487,9 @@ def main():
                 kl_weight=args.kl_weight,
                 optimizer=optimizer,
                 gradient_clip=args.gradient_clip,
+                log_every=args.log_every,
+                start_update=updates,
+                max_updates=args.max_updates,
             )
             updates = target
             va = run_batches(
@@ -490,22 +531,13 @@ def main():
             )
             save_checkpoint(args.output_dir / "latest.pt", payload)
             save_json(args.output_dir / "metrics.json", history)
-            if args.rollout_eval_every and updates % args.rollout_eval_every == 0:
-                result = run_rollout(args, updates, device)
-                rollout_history.append(result)
-                rollout_improved = result["success_rate"] > best_rollout
-                best_rollout = max(best_rollout, result["success_rate"])
-                payload.update(best_rollout_success_rate=best_rollout)
-                if rollout_improved:
-                    save_checkpoint(args.output_dir / "best_rollout.pt", payload)
-                save_checkpoint(args.output_dir / "latest.pt", payload)
-                save_json(args.output_dir / "rollout_evaluations.json", rollout_history)
-                print(
-                    f"Rollout={result['success_rate']:.1%}; best={best_rollout:.1%}",
-                    flush=True,
-                )
+            # Preserve the validation winner even if the following rollout
+            # fails before it can produce a rollout-selected checkpoint.
             if improved:
                 save_checkpoint(args.output_dir / "best.pt", payload)
+            if args.rollout_eval_every and updates % args.rollout_eval_every == 0:
+                save_rollout(args, payload, device)
+                best_rollout = payload["best_rollout_success_rate"]
             print(
                 f"Update {updates:07d}/{args.max_updates}: train L1={tr['l1']:.6f} KL={tr['kl']:.6f} "
                 f"val posterior L1={va['l1']:.6f} prior(z=0) L1={va['prior_l1']:.6f} "

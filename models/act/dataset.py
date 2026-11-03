@@ -23,10 +23,12 @@ class ACTDataset(ManipulationDataset):
             action = np.zeros((self.chunk_size, 7), dtype=np.float32)
             action[:end - start] = episode["actions"][start:end]
             if not np.isfinite(action).all() or (np.abs(action) > 1.000001).any():
-                raise ValueError("ACT requires finite controller actions in [-1,1]")
+                path = self.dataset_root / self.episodes[episode_index]["path"]
+                raise ValueError(f"{path}, actions[{start}:{end}]: ACT requires finite controller actions in [-1,1]")
             proprio = np.concatenate([episode[k][start] for k in self.proprio_keys]).astype(np.float32)
             if not np.isfinite(proprio).all():
-                raise ValueError("ACT requires finite robot proprioception")
+                path = self.dataset_root / self.episodes[episode_index]["path"]
+                raise ValueError(f"{path}, observation {start}: ACT requires finite robot proprioception")
             sample = dict(proprio=torch.from_numpy(proprio), action=torch.from_numpy(action),
                           is_pad=torch.arange(self.chunk_size) >= end - start)
             for name in self.camera_names:
