@@ -241,6 +241,13 @@ def evaluate_episode(
                         ),
                         "gripper_qpos_before": gripper_before,
                         "normalized_action": prediction[0].detach().cpu().numpy(),
+                        **({"chunk_offset": output["chunk_offset"],
+                            "chunk_queried": output["chunk_queried"],
+                            "predicted_chunk_normalized": (output["action_chunk"][0].detach().cpu().numpy()
+                                                           if output.get("action_chunk") is not None else None),
+                            "predicted_chunk_raw": (normalizer.denormalize_action(output["action_chunk"])[0].detach().cpu().numpy()
+                                                    if output.get("action_chunk") is not None else None)}
+                           if "chunk_offset" in output else {}),
                         "raw_action": raw_action,
                         "executed_action": action,
                         "action_clipped": clipped_mask,

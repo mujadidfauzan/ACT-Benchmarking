@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/huggingface/lerobot",
+  "commit": "cc2fbf08976c6edd14edb001616ae79f3121de96",
+  "source_sha256": "83d954f79ccd3eaa6774dbea92524939c8ac08359bb355ba7cd37b8601e1e3af",
+  "source_path": "src/lerobot/policies/act/modeling_act.py",
+  "license": "Apache-2.0",
+  "pretrained_url": "https://download.pytorch.org/models/resnet18-f37072fd.pth"
+}

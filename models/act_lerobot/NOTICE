@@ -1,0 +1,6 @@
+LeRobot ACT core
+Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team.
+Apache License 2.0, reproduced in LICENSE.
+Source: https://github.com/huggingface/lerobot/blob/cc2fbf08976c6edd14edb001616ae79f3121de96/src/lerobot/policies/act/modeling_act.py
+Changes: keep ACT neural-network core; replace three einops repeat/rearrange calls with equivalent Torch operations; supply lightweight config and native dataset/controller adapter outside the core. No automatic pretrained downloads.
+The unmodified source is retained in tests/fixtures/lerobot_act_modeling_upstream.py for numerical parity tests.

@@ -1,6 +1,7 @@
 """Train ACT on native HDF5 demos: masked L1 + KL, exact resume, rollout selection."""
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -47,7 +48,8 @@ DEFAULTS = dict(
 )
 
 
-def parse_args():
+def parse_args(defaults=None):
+    defaults = DEFAULTS if defaults is None else defaults
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--training-dir", type=Path)
@@ -60,6 +62,11 @@ def parse_args():
         help="Total optimizer updates, including updates before resume",
     )
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--train-episodes", type=int, help="Use the first N train-split episodes; 0 uses all")
+    parser.add_argument("--validation-source", choices=("val", "train"),
+                        help="train is an explicitly labelled memorization diagnostic, not held-out validation")
+    parser.add_argument("--allow-scratch", action="store_true",
+                        help="Explicit diagnostic override for a recipe that requires local pretrained weights")
     parser.add_argument("--log-every", type=int, default=50,
                         help="Print training progress every N updates (also the first); 0 disables")
     parser.add_argument(
@@ -73,7 +80,7 @@ def parse_args():
         default=None,
         help="Rollout mode saved in checkpoint; default disabled",
     )
-    for key, value in DEFAULTS.items():
+    for key, value in defaults.items():
         parser.add_argument(
             "--" + key.replace("_", "-"),
             type=float if isinstance(value, float) else int,
@@ -226,7 +233,8 @@ def run_batches(
                           f"L1={values['l1']:.6f} KL={values['kl']:.6f}", flush=True)
             else:
                 # Deployment diagnostic: no demonstration actions enter the model.
-                prior = action_losses(model(**batch)["action"], target, padding)
+                prior = (losses if model.policy_type == "act_lerobot" else
+                         action_losses(model(**batch)["action"], target, padding))
                 if not all(torch.isfinite(value) for value in prior.values()):
                     raise FloatingPointError("Nonfinite ACT validation loss with z=0")
                 values.update(
@@ -267,7 +275,7 @@ def run_rollout(args, updates, device):
     command = [
         sys.executable,
         "-m",
-        "scripts.evaluate_act",
+        getattr(args, "evaluation_module", "scripts.evaluate_act"),
         "--checkpoint",
         str(args.output_dir / "latest.pt"),
         "--output-dir",
@@ -313,19 +321,32 @@ def save_rollout(args, payload, device):
     print(f"Rollout={result['success_rate']:.1%}; best={payload['best_rollout_success_rate']:.1%}", flush=True)
 
 
-def main():
-    args = parse_args()
+def select_episodes(dataset, paths):
+    """Restrict in memory only: source HDF5 and prepared split stay unchanged."""
+    selected = set(paths)
+    dataset.episodes = [entry for entry in dataset.episodes if entry["path"] in selected]
+    if {entry["path"] for entry in dataset.episodes} != selected:
+        raise ValueError("Training subset does not belong to selected manifest")
+    dataset._sample_index = [(i, t) for i, entry in enumerate(dataset.episodes)
+                             for t in range(int(entry["steps"]))]
+
+
+def main(*, policy_class=ACTPolicy, default_overrides=None,
+         evaluation_module="scripts.evaluate_act", require_pretrained=False):
+    defaults = {**DEFAULTS, **(default_overrides or {})}
+    args = parse_args(defaults)
+    args.evaluation_module = evaluation_module
     checkpoint = (
         torch.load(args.resume, map_location="cpu", weights_only=False)
         if args.resume
         else None
     )
-    if checkpoint and checkpoint.get("policy_type") != "act":
-        raise ValueError("Resume requires an ACT checkpoint")
+    if checkpoint and checkpoint.get("policy_type") != policy_class.policy_type:
+        raise ValueError(f"Resume requires a {policy_class.policy_type} checkpoint; use a new directory for a new baseline")
     saved = checkpoint["training_config"] if checkpoint else {}
-    for key, default in {**DEFAULTS, "temporal_ensemble": False}.items():
+    for key, default in {**defaults, "temporal_ensemble": False, "train_episodes": 0, "validation_source": "val"}.items():
         value = getattr(args, key)
-        if checkpoint and value is not None and value != saved[key]:
+        if checkpoint and value is not None and value != saved.get(key, default):
             raise ValueError(
                 f"--{key.replace('_', '-')} differs from checkpoint; start a new run"
             )
@@ -348,6 +369,13 @@ def main():
     )
     if args.max_updates <= 0 or any(getattr(args, k) <= 0 for k in positive):
         raise ValueError("Update, network, batch, and rollout sizes must be positive")
+    if args.train_episodes < 0:
+        raise ValueError("--train-episodes must be nonnegative")
+    if require_pretrained and not args.resume and not args.backbone_weights and not args.allow_scratch:
+        raise ValueError("This baseline requires --backbone-weights /local/resnet18-f37072fd.pth; "
+                         "no automatic downloads. --allow-scratch is only an explicit diagnostic override.")
+    if args.backbone_weights and not args.backbone_weights.is_file():
+        raise FileNotFoundError(args.backbone_weights)
     for key in ("learning_rate", "backbone_learning_rate", "gradient_clip"):
         if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
             raise ValueError(f"{key} must be finite and positive")
@@ -408,14 +436,17 @@ def main():
         "ensemble_decay",
     )
     print(f"Building ACTPolicy on {device} ...", flush=True)
-    model = ACTPolicy(
+    model = policy_class(
         proprio_dim=normalizer.proprio_dim,
         camera_names=prepared["camera_names"],
         predict_orientation=prepared["predict_orientation"],
         **{k: getattr(args, k) for k in model_keys},
     ).to(device)
     if args.backbone_weights:
-        model.backbone.load_local_weights(args.backbone_weights)
+        if hasattr(model, "load_backbone_weights"):
+            model.load_backbone_weights(args.backbone_weights)
+        else:
+            model.backbone.load_local_weights(args.backbone_weights)
     backbone_ids = {id(p) for p in model.backbone.parameters()}
     optimizer = torch.optim.AdamW(
         [
@@ -436,12 +467,21 @@ def main():
     )
     val = ACTDataset(
         args.dataset,
-        directory / "val.jsonl",
+        directory / f"{args.validation_source}.jsonl",
         model.camera_names,
         normalizer.proprio_keys,
         model.chunk_size,
     )
     try:
+        if args.train_episodes and args.train_episodes > len(train.episodes):
+            raise ValueError("--train-episodes exceeds the original train split")
+        paths = [entry["path"] for entry in train.episodes[:args.train_episodes or None]]
+        select_episodes(train, paths)
+        if args.validation_source == "train":
+            select_episodes(val, paths)
+        training_subset = [dict(path=e["path"], episode=e.get("episode"), steps=e["steps"]) for e in train.episodes]
+        if checkpoint and checkpoint.get("training_subset", training_subset) != training_subset:
+            raise ValueError("Resume training subset differs")
         sampler = WindowSampler(len(train), args.batch_size, args.seed)
         updates, best, best_rollout, history, rollout_history = (
             0,
@@ -474,7 +514,7 @@ def main():
             raise ValueError("--max-updates must exceed checkpoint updates")
         args.output_dir.mkdir(parents=True, exist_ok=True)
         training_config = {
-            k: getattr(args, k) for k in (*DEFAULTS, "temporal_ensemble")
+            k: getattr(args, k) for k in (*defaults, "temporal_ensemble", "train_episodes", "validation_source")
         }
         preprocessing = dict(
             proprio_keys=list(normalizer.proprio_keys),
@@ -501,6 +541,21 @@ def main():
             best_checkpoint_metric="prior_l1",
             ensemble_weighting="exp(-decay*prediction_age)",
         )
+        if policy_class.policy_type == "act_lerobot":
+            from models.act_lerobot.audit import audit_inputs
+            reference_path = Path(__file__).resolve().parents[1] / "models/act_lerobot/reference.json"
+            preprocessing.update(reference=json.loads(reference_path.read_text()),
+                                 validation_posterior="not_used; eval follows LeRobot z=0",
+                                 transformer_initialization="Xavier_uniform_encoder_decoder",
+                                 ensemble_weighting="exp(-decay*prediction_rank_oldest_first)")
+            if args.backbone_weights:
+                preprocessing["backbone_sha256"] = hashlib.sha256(args.backbone_weights.read_bytes()).hexdigest()
+            elif checkpoint and "backbone_sha256" in checkpoint["preprocessing"]:
+                preprocessing["backbone_sha256"] = checkpoint["preprocessing"]["backbone_sha256"]
+            report, arrays = audit_inputs(model, normalizer, train, device)
+            save_json(args.output_dir / "input_audit.json", report)
+            np.savez_compressed(args.output_dir / "input_audit_chunks.npz", **arrays)
+        save_json(args.output_dir / "training_subset.json", training_subset)
         save_json(
             args.output_dir / "config.json",
             {
@@ -512,10 +567,12 @@ def main():
                 "data_config": prepared,
                 "preprocessing": preprocessing,
                 "updates_per_dataset_pass": len(train) // args.batch_size,
+                "training_subset": training_subset,
+                "validation_source": args.validation_source,
             },
         )
         print(
-            f"ACT; {device}; cameras={model.camera_names}; chunk={model.chunk_size}; batch={args.batch_size}; "
+            f"{model.policy_type}; {device}; cameras={model.camera_names}; chunk={model.chunk_size}; batch={args.batch_size}; "
             f"parameters={sum(p.numel() for p in model.parameters()):,}",
             flush=True,
         )
@@ -563,6 +620,10 @@ def main():
                 device,
                 kl_weight=args.kl_weight,
             )
+            if model.policy_type == "act_lerobot":
+                report, arrays = audit_inputs(model, normalizer, val, device)
+                save_json(args.output_dir / "prediction_diagnostics.json", dict(updates=updates, split=args.validation_source, **report))
+                np.savez_compressed(args.output_dir / "prediction_chunks.npz", **arrays)
             improved = va["prior_l1"] < best
             best = min(best, va["prior_l1"])
             history.append(dict(updates=updates, train=tr, val=va))
@@ -573,6 +634,7 @@ def main():
                 data_config=prepared,
                 preprocessing=preprocessing,
                 training_config=training_config,
+                training_subset=training_subset,
                 model_state=model.state_dict(),
                 optimizer_state=optimizer.state_dict(),
                 updates=updates,
@@ -601,7 +663,7 @@ def main():
                 best_rollout = payload["best_rollout_success_rate"]
             print(
                 f"Update {updates:07d}/{args.max_updates}: train L1={tr['l1']:.6f} KL={tr['kl']:.6f} "
-                f"val posterior L1={va['l1']:.6f} prior(z=0) L1={va['prior_l1']:.6f} "
+                f"{args.validation_source} reconstruction L1={va['l1']:.6f} prior(z=0) L1={va['prior_l1']:.6f} "
                 f"(xyz={va['prior_xyz_l1']:.6f}, rotation={va['prior_rotation_l1']:.6f}, "
                 f"gripper={va['prior_gripper_l1']:.6f})",
                 flush=True,

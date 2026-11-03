@@ -67,6 +67,8 @@ class WorkspaceLayoutTests(unittest.TestCase):
                           "train_robomimic_bc_rnn.py", "evaluate_robomimic_bc_rnn.py",
                           "train_low_dim_bc_rnn.py", "evaluate_low_dim_bc_rnn.py",
                           "train_act.py", "evaluate_act.py",
+                          "train_act_lerobot.py", "evaluate_act_lerobot.py",
+                          "inspect_act_lerobot.py",
                           "evaluate_visual_bc.py", "evaluation_utils.py", "audit_dataset.py",
                           "evaluate_visual_bc_validation.py",
                           "audit_pose_distribution.py"})

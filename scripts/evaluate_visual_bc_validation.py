@@ -44,6 +44,8 @@ def parse_args():
         help="Reuse completed models from a previous matching validation evaluation",
     )
     parser.add_argument("--split", choices=("train", "val"), default="val")
+    parser.add_argument("--checkpoint-training-subset", action="store_true",
+                        help="With --split train, evaluate exactly the stored training subset (memorization diagnostic)")
     parser.add_argument(
         "--episodes", type=int, help="First N split episodes; default all"
     )
@@ -145,8 +147,11 @@ def load_validation_policy(path, device, gru_reset_interval):
             checkpoint["data_config"]["fixed_target_color"],
             model.sequence_length,
         )
-    if policy_type == "act":
-        from scripts.evaluate_act import load_policy as load_act_policy
+    if policy_type in ("act", "act_lerobot"):
+        if policy_type == "act_lerobot":
+            from scripts.evaluate_act_lerobot import load_policy as load_act_policy
+        else:
+            from scripts.evaluate_act import load_policy as load_act_policy
 
         model, normalizer, checkpoint = load_act_policy(path, device)
         return (model, normalizer, checkpoint, model.observation_image_size,
@@ -538,7 +543,7 @@ def save_numeric(directory, episode):
         "raw_controller"
         if policy[0]["policy_type"] == "robomimic_bc_rnn"
         else "normalized_motion_continuous_gripper"
-        if policy[0]["policy_type"] == "act"
+        if policy[0]["policy_type"] in ("act", "act_lerobot")
         else "normalized_motion_binary_gripper"
     )
     for i, row in enumerate(policy[1:], 1):
@@ -582,7 +587,7 @@ def save_numeric(directory, episode):
         ),
         two_finger_contact=np.array([s["two_finger_contact"] for s in episode.states]),
     )
-    if policy[0]["policy_type"] in ("visual_bc", "act"):
+    if policy[0]["policy_type"] in ("visual_bc", "act", "act_lerobot"):
         data["normalized_actions"] = predictions
     np.savez_compressed(directory / "trajectory.npz", **data)
     events_by_step = {}
@@ -1026,9 +1031,10 @@ def main():
                 f"{name}: missing/incomplete checkpoint {path}; copy the complete PyTorch checkpoint first"
             )
     prepared, directory = load_bc_training(args.dataset, args.training_dir)
+    training_paths = None
     for name, path in specs.items():
         probe = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
-        if probe.get("policy_type") not in ("visual_bc", "robomimic_bc_rnn", "act"):
+        if probe.get("policy_type") not in ("visual_bc", "robomimic_bc_rnn", "act", "act_lerobot"):
             raise ValueError(
                 "This script accepts visual_bc, robomimic_bc_rnn, and ACT checkpoints"
             )
@@ -1036,10 +1042,23 @@ def main():
             raise ValueError(
                 f"{name}: dataset/split/normalization differs from checkpoint"
             )
+        if args.checkpoint_training_subset:
+            if args.split != "train":
+                raise ValueError("--checkpoint-training-subset requires --split train")
+            paths = {entry["path"] for entry in probe.get("training_subset", [])}
+            if not paths:
+                raise ValueError(f"{name}: checkpoint does not store a training subset")
+            if training_paths is not None and training_paths != paths:
+                raise ValueError("Checkpoints use different training subsets")
+            training_paths = paths
         del probe
     if prepared["tasks"] != ["place"] or prepared["scene_counts"] != [[1, 1]]:
         raise ValueError("Expected fixed-target Place with one cube and one tray")
     entries = read_split_manifest(directory / f"{args.split}.jsonl")
+    if training_paths is not None:
+        entries = [entry for entry in entries if entry["path"] in training_paths]
+        if {entry["path"] for entry in entries} != training_paths:
+            raise ValueError("Checkpoint training subset differs from manifest")
     if args.episode_ids:
         wanted = set(args.episode_ids)
         if len(wanted) != len(args.episode_ids) or not wanted <= {
@@ -1097,7 +1116,7 @@ def main():
             checkpoint_updates=checkpoint.get("updates"),
             rnn_reset_interval=reset_interval,
         )
-        if policy_type == "act":
+        if policy_type in ("act", "act_lerobot"):
             model_info.update(chunk_size=model.chunk_size, execution_steps=model.execution_steps,
                               temporal_ensemble=model.temporal_ensemble,
                               ensemble_decay=model.ensemble_decay, latent_at_inference="zero")

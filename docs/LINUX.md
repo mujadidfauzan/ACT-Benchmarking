@@ -708,6 +708,9 @@ eval dan resume tersedia melalui `--help` pada masing-masing script.
 
 ## 9. ACT pada dataset Place yang sama
 
+Bagian ini menyimpan resep ACT legacy untuk membandingkan eksperimen lama.
+Untuk baseline baru berbasis core LeRobot dan tes 8–16 demo, gunakan bagian 10.
+
 Implementasi [ACT](../models/act/policy.py) memakai ResNet18 bersama untuk kedua
 kamera, Transformer encoder/decoder, CVAE saat training, dan latent `z=0` saat
 rollout. Dataset HDF5 tetap digunakan langsung: satu observasi pada waktu `t`
@@ -817,3 +820,118 @@ MUJOCO_GL=egl python -u -m scripts.evaluate_visual_bc_validation \
 Mode inference pada evaluator validation mengikuti checkpoint; state chunk
 direset antar-episode, tanpa reset periodik RNN. NPZ menyimpan prediksi ACT dalam
 `normalized_actions`; gripper logit kosong karena head ACT kontinu.
+
+## 10. ACT LeRobot: pretrained backbone dan pemeriksaan input/chunk
+
+Baseline baru berada di [models/act_lerobot](../models/act_lerobot/policy.py),
+terpisah dari model legacy. Core neural network berasal dari LeRobot commit
+`cc2fbf08976c6edd14edb001616ae79f3121de96`, dengan lisensi dan perubahan tercatat
+di [NOTICE](../models/act_lerobot/NOTICE). Tidak perlu menginstal paket LeRobot
+atau mengonversi HDF5. Normalisasi tetap dari train split kita, input robot 16D,
+dua kamera sesuai dataset, dan target action controller OSC tujuh dimensi.
+
+Resep baru memakai ResNet18 pretrained + FrozenBatchNorm, Xavier initialization
+pada Transformer encoder/decoder, satu decoder layer, dan AdamW LR `1e-5` untuk
+backbone maupun Transformer. Chunk 32 / gambar 128 dipertahankan sebagai adaptasi
+task ini. Model menggunakan seluruh feature map dan positional encoding 2D dari
+referensi. Saat eval, latent selalu `z=0`, termasuk ketika target action tersedia
+untuk menghitung loss; tidak ada teacher forcing posterior dalam validation.
+
+File bobot resmi sudah disiapkan lokal di
+`checkpoints/pretrained/resnet18-f37072fd.pth` (sekitar 45 MiB). Salin file ini
+bersama kode ke path yang sama di remote. Folder `checkpoints/` diabaikan Git,
+sehingga bobot tidak ikut `git pull`. SHA256 resminya:
+
+```text
+f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec
+```
+
+Script menolak training baru tanpa `--backbone-weights`. `--allow-scratch`
+hanya override eksplisit untuk diagnosis, bukan resep baru yang direkomendasikan.
+Resume tidak memerlukan file pretrained asli karena semua bobot tersimpan dalam
+checkpoint. Checkpoint `act` lama ditolak oleh script `act_lerobot` agar run lama
+tidak dilanjutkan dengan arsitektur yang berbeda.
+
+Command berikut menjalankan tes memorisasi **16 episode dari train split** lalu
+rollout pada 16 scene yang sama. Ini bukan pengukuran generalisasi validation.
+HDF5, manifest split, dan statistik normalisasi asli tidak diubah.
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.train_act_lerobot \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --backbone-weights checkpoints/pretrained/resnet18-f37072fd.pth \
+  --output-dir results/act_lerobot/place_red_d20_overfit16_s123 \
+  --train-episodes 16 --validation-source train \
+  --batch-size 8 --chunk-size 32 --seed 123 \
+  --max-updates 10000 --checkpoint-every 500 --log-every 50 \
+  --rollout-eval-every 0 --device cuda \
+&& MUJOCO_GL=egl python -u -m scripts.evaluate_visual_bc_validation \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --split train --checkpoint-training-subset \
+  --checkpoints ACT_LR=results/act_lerobot/place_red_d20_overfit16_s123/best.pt \
+  --output-dir results/visual_bc_validation/place_red_d20_ACT_LR_overfit16 \
+  --max-steps 300 --device cuda
+```
+
+Untuk tes **8 episode** pada terminal/run berbeda:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.train_act_lerobot \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --backbone-weights checkpoints/pretrained/resnet18-f37072fd.pth \
+  --output-dir results/act_lerobot/place_red_d20_overfit8_s123 \
+  --train-episodes 8 --validation-source train \
+  --batch-size 8 --chunk-size 32 --seed 123 \
+  --max-updates 10000 --checkpoint-every 500 --log-every 50 \
+  --rollout-eval-every 0 --device cuda \
+&& MUJOCO_GL=egl python -u -m scripts.evaluate_visual_bc_validation \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --split train --checkpoint-training-subset \
+  --checkpoints ACT_LR=results/act_lerobot/place_red_d20_overfit8_s123/best.pt \
+  --output-dir results/visual_bc_validation/place_red_d20_ACT_LR_overfit8 \
+  --max-steps 300 --device cuda
+```
+
+`--train-episodes` memilih N episode pertama pada manifest train yang sudah
+diacak saat preparation. Daftar lengkap disimpan dalam `training_subset.json`
+dan checkpoint. `--validation-source train` mengukur prediksi pada subset itu;
+default tetap `val` yang terpisah. Statistik normalisasi tetap statistik train
+900 episode sebelumnya, bukan dihitung ulang dari subset kecil. Dengan demikian
+tes kecil ini merupakan pemeriksaan kemampuan belajar, bukan benchmark 8-demo.
+
+Pemeriksaan otomatis sebelum update pertama menulis:
+
+- `input_audit.json`: kecocokan RGB/proprio pada waktu t dengan HDF5, target
+  action t sampai t+K, padding akhir episode, dan roundtrip normalisasi.
+- `input_audit_chunks.npz`: gambar input, proprio raw/normalized, seluruh prediksi
+  chunk raw/normalized, target dan mask valid.
+- `prediction_diagnostics.json` dan `prediction_chunks.npz`: hasil pemeriksaan
+  sensitivitas/variasi prediksi pada setiap checkpoint. Pertukaran gambar/state
+  hanyalah diagnosis pengaruh input, bukan metrik keberhasilan task.
+
+Untuk melihat tiap offset chunk dan gambar input setelah training:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.inspect_act_lerobot \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --checkpoint results/act_lerobot/place_red_d20_overfit16_s123/best.pt \
+  --split train --samples 16 \
+  --output-dir results/act_lerobot_inspection/place_red_d20_overfit16 \
+  --device cuda
+```
+
+Output `sample_*_chunk.png` membandingkan 32 action prediksi dengan target expert
+untuk observasi awal yang sama; padding tidak dihitung. `sample_*_observation.png`
+menampilkan RGB yang diberikan ke policy. Ini prediksi chunk offline, bukan
+perbandingan action pada dua rollout yang sudah berbeda state/fase.
+
+Evaluasi scene validation menyimpan video/PNG/joint/gripper events seperti model
+sebelumnya. Log per-step juga memuat chunk lengkap saat model membuat prediksi
+baru (`predicted_chunk_normalized`, `predicted_chunk_raw`, `chunk_offset`).
+Untuk evaluasi random scene gunakan `scripts.evaluate_act_lerobot`, bukan
+`scripts.evaluate_act`. Semua hasil baru harus memakai direktori kosong.
