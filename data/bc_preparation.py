@@ -126,6 +126,18 @@ def prepare_bc_training(dataset, output=None, *, seed=123, val_fraction=.1):
                 if sum(v["color"] == color for v in metadata["objects"]) != 1 or sum(v["color"] == color for v in metadata["receptacles"]) != 1:
                     raise ValueError("Ambiguous fixed-color Place targets")
                 place_colors.add(color)
+            if entry["task"] == "stack":
+                metadata = entry.get("metadata", {})
+                stored = read_json(archive["metadata_json"], "metadata_json")
+                if stored != metadata:
+                    raise ValueError("Stack metadata differs between manifest and episode")
+                order = metadata.get("stack_order", [])
+                colors = [obj["color"] for obj in metadata.get("objects", [])]
+                if len(order) != len(colors) or len(set(order)) != len(order) or set(order) != set(colors):
+                    raise ValueError("Stack order must contain every cube color exactly once")
+                fixed = metadata.get("collection_config", {}).get("environment_kwargs", {}).get("fixed_stack_order")
+                if fixed is not None and order != fixed:
+                    raise ValueError("Stack episode order differs from fixed collection target")
             actions = archive["actions"][:]
             if actions.shape != (entry["steps"], 7) or not len(actions) or not np.isfinite(actions).all():
                 raise ValueError(f"Invalid actions: {entry['path']}")

@@ -123,7 +123,7 @@ def build_task(args, num_objects=None, num_receptacles=None, seed=None):
     else:
         common.update(stack_environment_kwargs(getattr(args, "stack_order", None),
                                                getattr(args, "stack_workspace_half_size", None)))
-        env = StackEnv(num_cubes=num_objects, horizon=6000, **common)
+        env = StackEnv(num_cubes=num_objects, horizon=getattr(args, "max_steps", 6000), **common)
 
     env.bc_controller_config = collection_controller_config
 

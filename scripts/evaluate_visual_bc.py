@@ -113,8 +113,10 @@ def evaluate_episode(
     observation = env.reset()
     metadata = env.get_task_metadata()
     task = metadata.get("task", "pick")
-    target_id = metadata["target_object"]
-    if metadata["target_color"] != target_color:
+    is_stack = task == "stack"
+    target_id = (env.resolve_object_id(metadata["stack_order"][-1]) if is_stack
+                 else metadata["target_object"])
+    if not is_stack and metadata["target_color"] != target_color:
         raise RuntimeError("Environment target color does not match checkpoint")
     if task == "place" and metadata.get("target_receptacle_color") != target_color:
         raise RuntimeError("Environment receptacle color does not match checkpoint")
@@ -123,6 +125,8 @@ def evaluate_episode(
     label = f"{'State' if state_inputs is not None else 'Vision-only'} target: {target_color} cube"
     if task == "place":
         label += f" into {target_color} tray"
+    if is_stack:
+        label = "Stack bottom to top: " + " -> ".join(metadata["stack_order"])
     video = None
     if video_path is not None:
         frame = compose_camera_frame(observation, video_cameras)
@@ -159,6 +163,10 @@ def evaluate_episode(
     hidden = None
     previous_gripper = -1.0
     placement = None
+    stack = None
+    maximum_stacked_cubes = 1 if is_stack else None
+    two_cube_stack_achieved = False
+    partial_streak = 0
     try:
         for step in range(1, max_steps + 1):
             # Match independent training windows when requested. Action history
@@ -215,6 +223,12 @@ def evaluate_episode(
                     - initial_positions["objects"][object_id][2]
                 )
                 maximum_lifts[object_id] = max(maximum_lifts[object_id], lift)
+            if is_stack:
+                stack = env.stack_status()
+                maximum_stacked_cubes = max(maximum_stacked_cubes, stack["stacked_cubes"])
+                partial = env.stack_status(metadata["stack_order"][:2])
+                partial_streak = partial_streak + 1 if partial["success"] else 0
+                two_cube_stack_achieved |= partial_streak >= success_hold_steps
             if rollout_handle is not None:
                 eef_after = np.asarray(
                     observation["robot0_eef_pos"], dtype=np.float32
@@ -225,6 +239,8 @@ def evaluate_episode(
                     rollout_handle,
                     {
                         "event": "step",
+                        **({"stack": stack, "object_positions_after": entity_positions(env)["objects"]}
+                           if is_stack else {}),
                         "step": step,
                         "hidden_state_reset": hidden_state_reset,
                         "previous_gripper_input": previous_gripper_input if getattr(model, "uses_previous_gripper", model.temporal) else None,
@@ -270,7 +286,11 @@ def evaluate_episode(
                         "done": bool(done),
                     },
                 )
-            if task == "place":
+            if is_stack:
+                # StackEnv tracks the same hold in parallel. Use instantaneous
+                # status here so the evaluator does not require a second hold.
+                achieved = stack["success"]
+            elif task == "place":
                 placement = env.placement_status(observation["robot0_eef_pos"], initial_positions["objects"])
                 placement["gripper_open"] = bool(action[6] < 0)
                 achieved = placement["success"] and placement["gripper_open"]
@@ -286,6 +306,8 @@ def evaluate_episode(
                         "steps": step,
                         "metadata": metadata,
                         "placement": placement,
+                        **({"stack": stack, "maximum_stacked_cubes": maximum_stacked_cubes,
+                            "two_cube_stack_achieved": bool(two_cube_stack_achieved)} if is_stack else {}),
                         "maximum_lifts": maximum_lifts,
                         "target_maximum_lift": maximum_lifts[target_id],
                         "action_clip_fraction": clipped_values / action_values,
@@ -310,7 +332,20 @@ def evaluate_episode(
         for object_id, lift in maximum_lifts.items()
         if object_id != target_id
     ]
-    if max(wrong_lifts, default=0.0) >= 0.08:
+    if is_stack:
+        movable_ids = [env.resolve_object_id(color) for color in metadata["stack_order"][1:]]
+        if stack and stack["stacked_cubes"] == len(metadata["stack_order"]) and (
+                not stack["released"] or not stack["gripper_open"]):
+            reason = "not_released"
+        elif maximum_stacked_cubes >= len(metadata["stack_order"]):
+            reason = "stack_instability"
+        elif max((maximum_lifts[key] for key in movable_ids), default=0.) < .02:
+            reason = "no_lift"
+        elif two_cube_stack_achieved:
+            reason = "incomplete_stack"
+        else:
+            reason = "stack_timeout"
+    elif max(wrong_lifts, default=0.0) >= 0.08:
         reason = "wrong_object"
     elif task == "place" and placement and placement["wrong_target"]:
         reason = "wrong_receptacle"
@@ -330,6 +365,8 @@ def evaluate_episode(
         "steps": step,
         "metadata": metadata,
         "placement": placement,
+        **({"stack": stack, "maximum_stacked_cubes": maximum_stacked_cubes,
+            "two_cube_stack_achieved": bool(two_cube_stack_achieved)} if is_stack else {}),
         "maximum_lifts": maximum_lifts,
         "target_maximum_lift": maximum_lifts[target_id],
         "action_clip_fraction": clipped_values / max(action_values, 1),
@@ -376,13 +413,16 @@ def evaluate_policy(args, model, normalizer, checkpoint, device):
     validate_rnn_reset_interval(model, rnn_reset_interval)
     prepared = checkpoint["data_config"]
     task = prepared.get("tasks", ["pick"])[0]
-    if task not in ("pick", "place"):
-        raise ValueError("Only Pick and Place checkpoints are supported")
+    if task not in ("pick", "place", "stack"):
+        raise ValueError("Only Pick, Place, and fixed-order Stack checkpoints are supported")
+    if task == "stack":
+        from environments.stack_config import validate_fixed_stack_prepared
+        validate_fixed_stack_prepared(prepared, args.num_cubes)
     if getattr(args, "num_receptacles", None) is not None:
         if task != "place":
             raise ValueError("--num-receptacles requires a Place checkpoint")
         prepared = {**prepared, "evaluation_num_receptacles": args.num_receptacles}
-    args.max_steps = (3000 if task == "place" else 500) if args.max_steps is None else args.max_steps
+    args.max_steps = (1000 if task == "stack" else 3000 if task == "place" else 500) if args.max_steps is None else args.max_steps
     args.success_hold_steps = 20 if args.success_hold_steps is None else args.success_hold_steps
     if args.success_hold_steps != 20:
         raise ValueError("Evaluation requires 20 consecutive success steps")
@@ -398,6 +438,7 @@ def evaluate_policy(args, model, normalizer, checkpoint, device):
     failures = Counter()
     global_episode = 0
     total_steps = 0
+    partial_successes = 0
     for seed in seeds:
         random.seed(seed)
         np.random.seed(seed)
@@ -424,6 +465,7 @@ def evaluate_policy(args, model, normalizer, checkpoint, device):
                     result["num_receptacles"] = env.num_receptacles
                 append_jsonl(attempts_path, result)
                 successful += int(result["success"])
+                partial_successes += int(result.get("two_cube_stack_achieved", False))
                 total_steps += result["steps"]
                 if result.get("failure_reason"):
                     failures[result["failure_reason"]] += 1
@@ -447,13 +489,21 @@ def evaluate_policy(args, model, normalizer, checkpoint, device):
                "max_steps": args.max_steps,
                "lift_threshold_m": .18 if task == "pick" else None, "success_hold_steps": 20,
                "num_receptacles": (prepared.get("evaluation_num_receptacles") or max(value[1] for value in prepared["scene_counts"])) if task == "place" else None,
-               "success_criterion": "lift_0.18m" if task == "pick" else "inside_tray_released_distractors_stable",
+               "success_criterion": ("ordered_supported_stable_stack_released_open" if task == "stack" else
+                                     "lift_0.18m" if task == "pick" else "inside_tray_released_distractors_stable"),
                "mean_seed_success_rate": float(rates.mean()),
                "std_seed_success_rate_sample": float(rates.std(ddof=1)) if len(rates) > 1 else 0.,
                "overall_success_rate": successes / global_episode,
                "tasks": [{"task": task, "successful": successes, "attempted": global_episode,
                           "failed": global_episode - successes, "success_rate": successes / global_episode,
                           "failure_counts": dict(failures), "mean_steps": total_steps / global_episode}]}
+    if task == "stack":
+        collection = prepared["environment_configs"]["stack"]
+        summary.update(stack_order=collection["environment_kwargs"]["fixed_stack_order"],
+                       two_cube_stack_successful=partial_successes,
+                       two_cube_stack_success_rate=partial_successes / global_episode,
+                       stack_success_version=collection["stack_success_version"],
+                       stack_expert_timing=collection.get("stack_expert_timing"))
     if task == "place":
         environment_kwargs = prepared.get("environment_configs", {}).get("place", {}).get("environment_kwargs", {})
         summary["placement_layout"] = environment_kwargs.get("placement_layout", "uniform")

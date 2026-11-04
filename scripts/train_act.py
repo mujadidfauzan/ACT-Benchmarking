@@ -411,11 +411,11 @@ def main(*, policy_class=ACTPolicy, default_overrides=None,
         prepare_bc_training(args.dataset, args.training_dir)
         prepared, directory = load_bc_training(args.dataset, args.training_dir)
     print(f"Dataset loaded: {prepared['tasks']} | {prepared.get('train_episodes', '?')} train / {prepared.get('val_episodes', '?')} val episodes", flush=True)
-    if (
-        prepared["tasks"] not in (["pick"], ["place"])
-        or prepared["fixed_target_color"] is None
-    ):
-        raise ValueError("ACT supports fixed-target Pick or Place datasets")
+    if prepared["tasks"] == ["stack"]:
+        from environments.stack_config import validate_fixed_stack_prepared
+        validate_fixed_stack_prepared(prepared)
+    elif prepared["tasks"] not in (["pick"], ["place"]) or prepared["fixed_target_color"] is None:
+        raise ValueError("ACT supports fixed-target Pick/Place or fixed-order Stack datasets")
     if checkpoint and checkpoint["data_config"] != prepared:
         raise ValueError(
             "Resume dataset, normalization, or train/validation split differs"

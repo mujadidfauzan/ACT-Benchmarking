@@ -1,16 +1,22 @@
 """Fixed semantic targets and physical stack success, without simulator startup."""
 
+import copy
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
 
 import numpy as np
+import torch
 
 from environments.stack_env import StackEnv
-from environments.stack_config import stack_environment_kwargs, validate_stack_arguments
+from environments.stack_config import stack_environment_kwargs, validate_stack_arguments, validate_fixed_stack_prepared
 from experts.stack_expert import StackExpert
 from experts.primitives.release import release_object
 from scripts.record_demonstrations import parse_args, build_task
+from scripts.evaluate_visual_bc import evaluate_episode, build_environment
 
 
 BASE = 'robosuite.environments.manipulation.manipulation_env.ManipulationEnv'
@@ -178,6 +184,87 @@ class StackProtocolTests(unittest.TestCase):
         expert._settle({}, False, ['red', 'green'])
         self.assertEqual(env.step.call_count, 60)
         self.assertEqual(expert._stable_steps, 0)
+
+    def test_fixed_stack_checkpoint_contract_and_environment_restore(self):
+        prepared = dict(tasks=['stack'], fixed_target_color=None, scene_counts=[[3, 0]],
+            camera_sizes=[[128, 128]], environment_configs={'stack': dict(stack_success_version=2,
+                environment_kwargs=dict(fixed_stack_order=['red', 'green', 'blue'],
+                                        x_range=[-.16, .16], y_range=[-.16, .16]))})
+        self.assertEqual(validate_fixed_stack_prepared(prepared), ['red', 'green', 'blue'])
+        for mutate in ('random_order', 'wrong_count', 'old_criterion'):
+            bad = copy.deepcopy(prepared)
+            if mutate == 'random_order':
+                bad['environment_configs']['stack']['environment_kwargs'].pop('fixed_stack_order')
+            elif mutate == 'wrong_count':
+                bad['scene_counts'] = [[2, 0]]
+            else:
+                bad['environment_configs']['stack']['stack_success_version'] = 1
+            with self.assertRaises(ValueError):
+                validate_fixed_stack_prepared(bad)
+        with self.assertRaises(ValueError):
+            validate_fixed_stack_prepared(prepared, 2)
+        model = SimpleNamespace(camera_names=('agentview',))
+        with patch('scripts.record_demonstrations.build_task', return_value=('env', None)) as factory:
+            self.assertEqual(build_environment(321, 3, False, model, prepared, 1000), 'env')
+        args = factory.call_args.args[0]
+        self.assertEqual(args.max_steps, 1000)
+        self.assertEqual(args.environment_kwargs['fixed_stack_order'], ['red', 'green', 'blue'])
+        with patch('scripts.record_demonstrations.StackEnv') as constructor, patch(
+                'scripts.record_demonstrations.PandaController'), patch(
+                'scripts.record_demonstrations.GraspExpert'), patch('scripts.record_demonstrations.StackExpert'):
+            build_task(args, 3)
+        self.assertEqual(constructor.call_args.kwargs['horizon'], 1000)
+        self.assertEqual(constructor.call_args.kwargs['fixed_stack_order'], ['red', 'green', 'blue'])
+
+    def test_stack_rollout_single_hold_partial_progress_and_logs(self):
+        # Exercise task dispatch and temporal bookkeeping, independently of physics.
+        class Env:
+            object_ids = ['cube_0', 'cube_1', 'cube_2']
+            action_spec = (-np.ones(7), np.ones(7))
+            full_at = 3
+            def reset(self):
+                self.t = 0
+                return self.obs()
+            def obs(self):
+                return dict(agentview_image=np.zeros((32, 32, 3), dtype=np.uint8),
+                            robot0_eef_pos=np.array([0, 0, 1.2]), robot0_gripper_qpos=[.04, -.04])
+            def step(self, action):
+                self.t += 1
+                return self.obs(), 0., False, {}
+            def get_task_metadata(self):
+                return dict(task='stack', stack_order=['red', 'green', 'blue'])
+            def resolve_object_id(self, color):
+                return self.object_ids[['red', 'green', 'blue'].index(color)]
+            def get_object_position(self, identifier):
+                index = self.object_ids.index(identifier)
+                return np.array([0, 0, .82 + (.04 if index == 1 and self.t else 0)
+                                 + (.08 if index == 2 and self.t >= self.full_at else 0)])
+            def stack_status(self, order=None):
+                partial = order is not None and len(order) == 2
+                ready = self.t >= (1 if partial else self.full_at)
+                return dict(success=ready, stacked_cubes=3 if self.t >= self.full_at else 2,
+                            released=True, gripper_open=True, stable=True, upright=True)
+        model = SimpleNamespace(camera_names=('agentview',), temporal=True, uses_previous_gripper=False,
+            step=lambda **kw: {'action': torch.tensor([[0., 0., 0., 0., 0., 0., -1.]])})
+        normalizer = SimpleNamespace(proprio_keys=('obs__robot0_eef_pos',),
+            normalize_proprio=lambda x: x, denormalize_action=lambda x: x)
+        env = Env()
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / 'rollout.jsonl'
+            result = evaluate_episode(env, model, normalizer, 32, torch.device('cpu'),
+                                      30, 20, False, 0, None, 20., None, log)
+            self.assertTrue(result['success'])
+            self.assertEqual(result['steps'], 22)  # ready at 3 + 19, not a double hold.
+            self.assertTrue(result['two_cube_stack_achieved'])
+            rows = [json.loads(x) for x in log.read_text().splitlines()]
+            self.assertEqual(set(rows[-1]['object_positions_after']), set(env.object_ids))
+            self.assertIn('stack', rows[-1])
+        env.full_at = 1000
+        result = evaluate_episode(env, model, normalizer, 32, torch.device('cpu'),
+                                  30, 20, False, 0, None, 20., None)
+        self.assertFalse(result['success'])
+        self.assertTrue(result['two_cube_stack_achieved'])
+        self.assertEqual(result['failure_reason'], 'incomplete_stack')
 
 
 if __name__ == '__main__':

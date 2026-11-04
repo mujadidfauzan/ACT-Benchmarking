@@ -35,3 +35,22 @@ def validate_stack_arguments(args, object_counts):
     if order is not None and any(n != len(order) for n in object_counts):
         raise ValueError('--stack-order length must match every requested object count')
     return settings
+
+
+def validate_fixed_stack_prepared(prepared, num_objects=None):
+    """Check that a language-free policy has exactly one unambiguous stack target."""
+    if prepared.get('tasks') != ['stack']:
+        raise ValueError('Expected a Stack-only dataset')
+    collection = prepared.get('environment_configs', {}).get('stack', {})
+    order = collection.get('environment_kwargs', {}).get('fixed_stack_order')
+    if order is None:
+        raise ValueError('Stack policies require a fixed --stack-order; random language targets are unsupported')
+    stack_environment_kwargs(order)
+    if any(int(count[0]) != len(order) or int(count[1]) != 0
+           for count in prepared.get('scene_counts', [])) or not prepared.get('scene_counts'):
+        raise ValueError('Stack scene counts must match the fixed color order')
+    if num_objects is not None and num_objects != len(order):
+        raise ValueError('Evaluation cube count must match the fixed Stack order')
+    if collection.get('stack_success_version') != 2:
+        raise ValueError('Stack requires the recorded physical success protocol (version 2)')
+    return list(order)
