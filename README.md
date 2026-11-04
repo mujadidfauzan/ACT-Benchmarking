@@ -2,11 +2,19 @@
 
 **Scene 1 — All Models Succeed**
 
-<!-- Upload assets/media/scene_1.mp4 in GitHub's README editor and place the generated user-attachments URL here on its own line. -->
+
+
+https://github.com/user-attachments/assets/1dff3e0a-3334-4f0c-9ce5-751efd00504f
+
+
 
 **Scene 2 — Contrasting Outcomes**
 
-<!-- Upload assets/media/scene_2.mp4 in GitHub's README editor and place the generated user-attachments URL here on its own line. -->
+
+
+https://github.com/user-attachments/assets/1bf43f87-f7f1-411c-8a0d-22e479f00f16
+
+
 
 This project provides a simulation benchmark comparing several behavior cloning models for Franka Panda manipulation in MuJoCo/robosuite. Five policy configurations are trained on a shared expert demonstration dataset and evaluated on matched scenes to examine task success, completion time, and failure modes. The project provides an integrated workflow for demonstration collection, policy training, closed-loop evaluation, and trajectory analysis.
 
