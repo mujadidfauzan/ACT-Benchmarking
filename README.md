@@ -52,11 +52,9 @@ Reported policies use **training seed 123** and checkpoints selected by periodic
 
 SD is the sample standard deviation of success rates across five evaluation seeds. It describes scene-dependent variation for these checkpoints, not variability across independently trained policies. Completion steps are conditional on success and should be interpreted together with success rate.
 
-**Key Takeaways.** ACT achieves the highest final success rate at 800 steps (88%). ResNet18-GRU nearly matches it (86%) and completes substantially more episodes within 300 steps (85 versus 64). Most failures involve failure to lift the object, identifying grasp and lift as the main stages requiring further investigation.
+**Key Takeaways.** Under the shared 800-step evaluation horizon, ACT achieves the highest observed success rate (88%), closely followed by ResNet18-GRU (86%). BC-RNN has the lowest median completion time among successful episodes. Failure to lift the object is the dominant failure mode across all five models.
 
 **Success and completion time.** ACT achieves the highest observed success rate, while C provides a strong balance between success and completion time. D has the lowest median completion time among its successful episodes. The two-episode difference between C and ACT is insufficient to establish general superiority: both succeed on 76 scenes, C alone on 10, and ACT alone on 12.
-
-**Dependence on the time budget.** Within the same 800-step runs, the numbers of episodes completed by step 300 are A: **31**, B: **53**, C: **85**, D: **74**, and E: **64**. ACT gains 24 additional successes after step 300, whereas C gains one. The longer horizon therefore reveals ACT's eventual task completion while also exposing long-duration trajectories. These counts are derived from the final runs, rather than separate 300-step evaluations.
 
 **Failure modes.** Failure to lift the object dominates across configurations. This category indicates that the object did not reach the lift threshold; it does not identify whether alignment, grasp timing, or contact mechanics caused the failure.
 
