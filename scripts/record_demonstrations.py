@@ -16,6 +16,7 @@ from environments.pick_env import PickEnv
 from environments.pick_config import add_pick_arguments, validate_pick_arguments, validate_pick_settings, yaw_range_degrees
 from environments.place_env import PlaceEnv
 from environments.stack_env import StackEnv
+from environments.stack_config import add_stack_arguments, stack_environment_kwargs, validate_stack_arguments
 from environments.scene_counts import (
     add_count_arguments, balanced_count_plan, count_distribution, count_options,
 )
@@ -36,6 +37,7 @@ def parse_args():
     parser.add_argument("--output", type=Path, default=Path("data/demos"))
     parser.add_argument("--seed", type=int, default=7)
     add_count_arguments(parser)
+    add_stack_arguments(parser)
     parser.add_argument("--placement-layout", choices=PlaceEnv.PLACEMENT_LAYOUTS, default="uniform",
                         help="Place initial layout: uniform, or objects/trays on opposite robot Y sides")
     parser.add_argument("--max-object-receptacle-distance", dest="maximum_object_receptacle_distance", type=float,
@@ -119,6 +121,8 @@ def build_task(args, num_objects=None, num_receptacles=None, seed=None):
                        fixed_target_color=getattr(args, "fixed_target_color", None),
                        horizon=getattr(args, "max_steps", 3000), **common)
     else:
+        common.update(stack_environment_kwargs(getattr(args, "stack_order", None),
+                                               getattr(args, "stack_workspace_half_size", None)))
         env = StackEnv(num_cubes=num_objects, horizon=6000, **common)
 
     env.bc_controller_config = collection_controller_config
@@ -179,6 +183,8 @@ def failure_reason(info):
         return f"pick_{detail.get('stage', 'verification')}"
     if stage in {"approach", "pre_place", "place_pose"}:
         return f"transport_{stage}"
+    if stage == "release":
+        return "release_timeout"
     if stage == "retreat":
         return "release_retreat"
     if stage == "verify_place":
@@ -218,6 +224,7 @@ def main():
     if args.fixed_target_color is not None and args.task not in ("pick", "place"):
         raise ValueError("--fixed-target-color requires Pick or Place")
     object_counts, receptacle_counts = count_options(args.task, args)
+    stack_settings = validate_stack_arguments(args, object_counts)
     task_dir = args.output / args.task
     task_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = task_dir / "manifest.jsonl"
@@ -228,6 +235,18 @@ def main():
         config = entry.get("metadata", {}).get("collection_config")
         if config is None or config["camera_names"] != (args.camera_names if args.camera_obs else []) or config["image_size"] != args.image_size:
             raise ValueError("Existing collection uses another/unknown camera or control setup; choose a new dataset directory")
+        if args.task == "stack":
+            stored = config.get("environment_kwargs", {})
+            if stored.get("fixed_stack_order") != stack_settings.get("fixed_stack_order"):
+                raise ValueError("Existing collection uses another/unknown stack order; choose a new dataset directory")
+            for axis in ("x_range", "y_range"):
+                expected = stack_settings.get(axis, (-.13, .13) if axis == "x_range" else (-.24, .24))
+                if axis not in stored or not np.allclose(stored[axis], expected, rtol=0, atol=1e-10):
+                    raise ValueError("Existing collection uses another/unknown stack workspace")
+            if config.get("stack_expert_timing", {}).get("recipe") != StackExpert.TIMING_RECIPE:
+                raise ValueError("Existing collection uses another stack expert timing recipe; choose a new dataset directory")
+            if config.get("stack_success_version") != 2:
+                raise ValueError("Existing collection uses old stack verification; choose a new dataset directory")
         if config.get("fixed_target_color") != args.fixed_target_color:
             raise ValueError("Existing collection uses another target configuration; choose a new dataset directory")
         if config.get("environment_kwargs", {}).get("placement_layout", "uniform") != args.placement_layout:
@@ -332,6 +351,11 @@ def main():
                     ("x_range", "y_range", "yaw_range", "minimum_object_distance", "minimum_object_receptacle_distance", "minimum_receptacle_distance", "maximum_object_receptacle_distance", "cube_half_size", "table_full_size", "table_friction", "placement_layout")
                     if hasattr(env, key) and (key != "placement_layout" or env.placement_layout != "uniform")
                     and (key != "maximum_object_receptacle_distance" or env.maximum_object_receptacle_distance is not None)}}
+            if args.task == "stack":
+                metadata["collection_config"]["stack_success_version"] = 2
+                metadata["collection_config"]["stack_expert_timing"] = expert.timing_config()
+                metadata["collection_config"]["environment_kwargs"].update(
+                    fixed_stack_order=None if env.fixed_stack_order is None else list(env.fixed_stack_order))
             initial_scene = snapshot_scene(observation)
             recorder = TrajectoryRecorder(
                 env,

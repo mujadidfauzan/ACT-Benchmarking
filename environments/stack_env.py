@@ -36,6 +36,7 @@ class StackEnv(ManipulationEnv):
         initialization_noise="default",
         num_cubes=3,
         instruction_split="train",
+        fixed_stack_order=None,
         table_full_size=(0.8, 0.8, 0.05),
         table_friction=(1.0, 0.005, 0.0001),
         cube_half_size=0.02,
@@ -72,6 +73,17 @@ class StackEnv(ManipulationEnv):
         if minimum_object_distance < 0.0:
             raise ValueError("minimum_object_distance must be non-negative")
 
+        if fixed_stack_order is not None:
+            if (len(fixed_stack_order) != num_cubes or len(set(fixed_stack_order)) != num_cubes
+                    or not set(fixed_stack_order) <= set(self.COLOR_PALETTE)):
+                raise ValueError("fixed_stack_order must contain one distinct valid color per cube")
+        self.fixed_stack_order = None if fixed_stack_order is None else tuple(fixed_stack_order)
+        self.success_hold_steps = 20
+        self.release_distance = .08
+        self.stable_linear_speed = .02
+        self.stable_angular_speed = .2
+        self._stack_hold_steps = 0
+        self._last_gripper_action = 0.
         self.num_cubes = int(num_cubes)
         self.object_ids = [f"cube_{index}" for index in range(self.num_cubes)]
         self.table_full_size = np.asarray(table_full_size, dtype=np.float32)
@@ -225,6 +237,8 @@ class StackEnv(ManipulationEnv):
         ]
 
     def _reset_internal(self):
+        self._stack_hold_steps = 0
+        self._last_gripper_action = 0.
         super()._reset_internal()
 
         if self.deterministic_reset:
@@ -248,18 +262,17 @@ class StackEnv(ManipulationEnv):
 
     def _sample_task_metadata(self):
         color_names = np.asarray(list(self.COLOR_PALETTE.keys()), dtype=object)
-        sampled_colors = self.rng.choice(
-            color_names,
-            size=self.num_cubes,
-            replace=False,
-        ).tolist()
+        sampled_colors = (self.rng.permutation(self.fixed_stack_order).tolist()
+                          if self.fixed_stack_order is not None else
+                          self.rng.choice(color_names, size=self.num_cubes, replace=False).tolist())
 
         self.object_id_to_color = dict(zip(self.object_ids, sampled_colors))
         self.color_to_object_id = {
             color: object_id
             for object_id, color in self.object_id_to_color.items()
         }
-        self.stack_order = self.rng.permutation(sampled_colors).tolist()
+        self.stack_order = (list(self.fixed_stack_order) if self.fixed_stack_order is not None
+                            else self.rng.permutation(sampled_colors).tolist())
         self.instruction_metadata = generate_instruction(
             "stack",
             self.rng,
@@ -322,6 +335,12 @@ class StackEnv(ManipulationEnv):
                 for object_id in self.object_ids
             ],
             "stack_order": self.stack_order.copy(),
+            "fixed_stack_order": None if self.fixed_stack_order is None else list(self.fixed_stack_order),
+            "stack_order_direction": "bottom_to_top",
+            "success_hold_steps": self.success_hold_steps,
+            "release_distance": self.release_distance,
+            "stable_linear_speed": self.stable_linear_speed,
+            "stable_angular_speed": self.stable_angular_speed,
             "semantic_split": semantic_split_for(
                 "stack", colors=self.stack_order
             ),
@@ -353,18 +372,63 @@ class StackEnv(ManipulationEnv):
             )
         return errors
 
+    def stack_status(self, order=None):
+        """Instantaneous physical checks, also usable for a completed tower prefix."""
+        order = list(self.stack_order if order is None else order)
+        if len(order) < 2:
+            return {"success": False, "stacked_cubes": 0, "level_errors": []}
+        robot = self.robots[0]
+        arm = robot.arms[0]
+        gripper = robot.gripper[arm]
+        eef = self.sim.data.site_xpos[robot.eef_site_id[arm]]
+        cubes = {self.object_id_to_color[c.name]: c for c in self.cubes}
+        bottom_z_error = float(abs(self.get_object_position(order[0])[2]
+                                  - self.table_offset[2] - self.cube_half_size))
+        bottom_on_table = bottom_z_error <= self.stack_z_tolerance
+        errors = []
+        for support, top in zip(order[:-1], order[1:]):
+            delta = self.get_object_position(top) - self.get_object_position(support)
+            xy_error = float(np.linalg.norm(delta[:2]))
+            z_error = float(abs(delta[2] - self.cube_height))
+            contact = bool(self.check_contact(cubes[support], cubes[top]))
+            errors.append(dict(support=support, top=top, xy_error=xy_error,
+                               z_error=z_error, support_contact=contact,
+                               success=bool(xy_error <= self.stack_xy_tolerance
+                                            and z_error <= self.stack_z_tolerance and contact)))
+        stable = True
+        released = True
+        upright = True
+        for color in order:
+            cube = cubes[color]
+            velocity = self.sim.data.get_joint_qvel(cube.joints[0])
+            stable &= bool(np.linalg.norm(velocity[:3]) <= self.stable_linear_speed
+                           and np.linalg.norm(velocity[3:]) <= self.stable_angular_speed)
+            upright &= bool(self.sim.data.body_xmat[self.object_body_ids[cube.name]].reshape(3, 3)[2, 2]
+                            >= np.cos(np.deg2rad(15)))
+            released &= bool(np.linalg.norm(self.get_object_position(color) - eef) > self.release_distance
+                             and not self.check_contact(gripper, cube))
+        open_command = self._last_gripper_action < 0
+        # Count contiguous supported levels, independently from robot release.
+        stacked = 1 if bottom_on_table else 0
+        for error in errors:
+            if not stacked or not error["success"]:
+                break
+            stacked += 1
+        success = bool(bottom_on_table and all(e["success"] for e in errors)
+                       and stable and upright and released and open_command)
+        return dict(success=success, stack_order=order, bottom_z_error=bottom_z_error,
+                    level_errors=errors, stacked_cubes=stacked, stable=stable,
+                    upright=upright, released=released, gripper_open=bool(open_command))
+
+    def _post_action(self, action):
+        self._last_gripper_action = float(action[-1])
+        status = self.stack_status()
+        self._stack_hold_steps = self._stack_hold_steps + 1 if status["success"] else 0
+        _, done, info = super()._post_action(action)
+        info["stack"] = {**status, "stable_success_steps": self._stack_hold_steps,
+                         "success": self._check_success()}
+        return float(self._check_success()), done, info
+
     def _check_success(self):
-        if len(self.stack_order) != self.num_cubes:
-            return False
-
-        bottom_position = self.get_object_position(self.stack_order[0])
-        expected_bottom_z = self.table_offset[2] + self.cube_half_size
-        bottom_on_table = (
-            abs(bottom_position[2] - expected_bottom_z) <= self.stack_z_tolerance
-        )
-
-        return bottom_on_table and all(
-            error["xy_error"] <= self.stack_xy_tolerance
-            and error["z_error"] <= self.stack_z_tolerance
-            for error in self.get_stack_errors()
-        )
+        return bool(self._stack_hold_steps >= self.success_hold_steps
+                    and self.stack_status()["success"])

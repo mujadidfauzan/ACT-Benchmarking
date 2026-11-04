@@ -6,6 +6,8 @@ from experts.primitives import release_object, transport_object
 class StackExpert:
     """Build a color-ordered cube tower from bottom to top."""
 
+    TIMING_RECIPE = "adaptive_release_settle_v1"
+
     def __init__(
         self,
         controller,
@@ -24,7 +26,11 @@ class StackExpert:
         self.approach_height = approach_height
         self.pre_place_height = pre_place_height
         self.retreat_height = retreat_height
-        self.settle_steps = settle_steps
+        self.settle_steps = settle_steps  # Upper bound; stop after stable success hold.
+        self.release_min_steps = 5
+        self.release_max_steps = 50
+        self.release_ready_steps = 3
+        self.release_min_aperture = .06
         self.xy_tolerance = (
             self.env.stack_xy_tolerance
             if xy_tolerance is None
@@ -36,6 +42,12 @@ class StackExpert:
             else float(z_tolerance)
         )
         self.release_distance = release_distance
+        if (not np.isclose(self.xy_tolerance, self.env.stack_xy_tolerance)
+                or not np.isclose(self.z_tolerance, self.env.stack_z_tolerance)
+                or not np.isclose(self.release_distance, self.env.release_distance)):
+            raise ValueError("Expert verification tolerances must match StackEnv")
+        if self.settle_steps < self.env.success_hold_steps:
+            raise ValueError("settle_steps must cover the environment's stable success hold")
 
     def _position_getter(self, identifier):
         object_id = self.env.resolve_object_id(identifier)
@@ -51,15 +63,38 @@ class StackExpert:
             dtype=np.float32,
         )
 
-    def _settle(self, obs, render):
+    def timing_config(self):
+        return dict(recipe=self.TIMING_RECIPE, release_min_steps=self.release_min_steps,
+                    release_max_steps=self.release_max_steps,
+                    release_ready_steps=self.release_ready_steps,
+                    release_min_aperture_m=self.release_min_aperture,
+                    settle_max_steps=self.settle_steps,
+                    stable_success_steps=self.env.success_hold_steps)
+
+    def _release_ready(self, obs):
+        qpos = np.asarray(obs[self.controller.gripper_qpos_key])
+        if qpos.shape != (2,) or not np.isfinite(qpos).all():
+            return False
+        aperture = abs(float(qpos[0] - qpos[1]))
+        robot = self.env.robots[0]
+        gripper = robot.gripper[robot.arms[0]]
+        return bool(aperture >= self.release_min_aperture and not any(
+            self.env.check_contact(gripper, cube) for cube in self.env.cubes))
+
+    def _settle(self, obs, render, order):
         self.controller.set_phase("settle")
         action = self.controller.create_action(
             gripper=self.controller.GRIPPER_OPEN,
         )
+        self._stable_steps = 0
         for _ in range(self.settle_steps):
-            obs, _, _, _ = self.env.step(action)
+            obs, _, done, _ = self.env.step(action)
+            self._stable_steps = (self._stable_steps + 1
+                                  if self.env.stack_status(order)["success"] else 0)
             if render:
                 self.env.render()
+            if self._stable_steps >= self.env.success_hold_steps or done:
+                break
         return obs
 
     def run(self, obs, render=False):
@@ -137,16 +172,21 @@ class StackExpert:
                 target_orientation=transport_orientation,
                 retreat_height=self.retreat_height,
                 render=render,
+                release_ready=self._release_ready,
+                min_open_steps=self.release_min_steps,
+                open_steps=self.release_max_steps,
+                ready_hold_steps=self.release_ready_steps,
             )
-            obs = self._settle(release_result.obs, render=render)
+            obs = release_result.obs
             if not release_result.success:
                 return obs, self._failure_info(
-                    stage="retreat",
+                    stage=release_result.stage,
                     completed_order=completed_order,
                     support=support,
                     top=top,
                 )
 
+            obs = self._settle(obs, render=render, order=completed_order + [top])
             completed_order.append(top)
             verification = self.verify_stack(obs, completed_order)
             if not verification["success"]:
@@ -164,64 +204,14 @@ class StackExpert:
         return obs, result
 
     def verify_stack(self, obs, stack_order=None):
-        order = list(stack_order or self.env.stack_order)
-        eef_position = self.controller.get_eef_position(obs).copy()
-        errors = []
-
-        bottom_position = self.env.get_object_position(order[0])
-        expected_bottom_z = self.env.table_offset[2] + self.env.cube_half_size
-        bottom_z_error = float(abs(bottom_position[2] - expected_bottom_z))
-
-        for support, top in zip(order[:-1], order[1:]):
-            support_position = self.env.get_object_position(support)
-            top_position = self.env.get_object_position(top)
-            xy_error = float(
-                np.linalg.norm(top_position[:2] - support_position[:2])
-            )
-            z_error = float(
-                abs(
-                    (top_position[2] - support_position[2])
-                    - self.env.cube_height
-                )
-            )
-            gripper_distance = float(np.linalg.norm(top_position - eef_position))
-            errors.append(
-                {
-                    "support": support,
-                    "top": top,
-                    "xy_error": xy_error,
-                    "z_error": z_error,
-                    "gripper_distance": gripper_distance,
-                    "success": bool(
-                        xy_error <= self.xy_tolerance
-                        and z_error <= self.z_tolerance
-                        and gripper_distance > self.release_distance
-                    ),
-                }
-            )
-
-        success = bottom_z_error <= self.z_tolerance and all(
-            item["success"] for item in errors
-        )
-
-        print("Stack verification:")
-        print("  bottom Z error:", bottom_z_error)
-        for item in errors:
-            print(
-                f"  {item['top']} on {item['support']}:",
-                f"xy={item['xy_error']:.4f}",
-                f"z={item['z_error']:.4f}",
-                f"released={item['gripper_distance'] > self.release_distance}",
-            )
-        print("  success:", success)
-
-        return {
-            "success": bool(success),
-            "stage": "complete",
-            "stack_order": order,
-            "bottom_z_error": bottom_z_error,
-            "level_errors": errors,
-        }
+        order = list(self.env.stack_order if stack_order is None else stack_order)
+        status = self.env.stack_status(order)
+        held = getattr(self, "_stable_steps", 0)
+        success = status["success"] and held >= self.env.success_hold_steps
+        if len(order) == self.env.num_cubes:
+            success = success and self.env._check_success()
+        return {**status, "success": bool(success), "stage": "complete",
+                "stable_success_steps": held, "required_stable_steps": self.env.success_hold_steps}
 
     def _failure_info(
         self,

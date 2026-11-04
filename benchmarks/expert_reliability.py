@@ -12,6 +12,7 @@ from environments.pick_env import PickEnv
 from environments.pick_config import DEFAULT_YAW_RANGE_DEG, add_pick_arguments, validate_pick_arguments, validate_pick_settings
 from environments.place_env import PlaceEnv
 from environments.stack_env import StackEnv
+from environments.stack_config import add_stack_arguments, stack_environment_kwargs, validate_stack_arguments
 from environments.scene_counts import (
     add_count_arguments, balanced_count_plan, count_label, count_options,
 )
@@ -54,6 +55,7 @@ def parse_args():
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--enforce-gates", action="store_true")
     add_count_arguments(parser)
+    add_stack_arguments(parser)
     add_pick_arguments(parser)
     parser.add_argument("--fixed-target-color", choices=tuple(PickEnv.COLOR_PALETTE))
     return parser.parse_args()
@@ -61,7 +63,7 @@ def parse_args():
 
 def build_task(task, seed, instruction_split, render, num_objects=3,
                num_receptacles=3, fixed_target_color=None, rotation_mode="align_yaw",
-               yaw_range_deg=DEFAULT_YAW_RANGE_DEG):
+               yaw_range_deg=DEFAULT_YAW_RANGE_DEG, stack_order=None, stack_workspace_half_size=None):
     config = load_composite_controller_config(controller="BASIC")
     config["body_parts"]["right"].update(type="OSC_POSE", input_type="delta", input_ref_frame="world", impedance_mode="fixed")
     config["body_parts"] = {"right": config["body_parts"]["right"]}
@@ -86,7 +88,8 @@ def build_task(task, seed, instruction_split, render, num_objects=3,
         env = PlaceEnv(num_objects=num_objects, num_receptacles=num_receptacles,
                        horizon=3000, **common)
     else:
-        env = StackEnv(num_cubes=num_objects, horizon=6000, **common)
+        env = StackEnv(num_cubes=num_objects, horizon=6000,
+                       **stack_environment_kwargs(stack_order, stack_workspace_half_size), **common)
 
     controller = PandaController(env)
     grasp_expert = GraspExpert(controller)
@@ -160,6 +163,8 @@ def classify_failure(task, info):
         return f"pick_{'verification' if stage == 'complete' else stage}"
     if stage in {"approach", "pre_place", "place_pose"}:
         return f"transport_{stage}"
+    if stage == "release":
+        return "release_timeout"
     if stage == "retreat":
         return "release_retreat"
     if stage == "verify_place":
@@ -185,6 +190,8 @@ def benchmark_task(
     fixed_target_color=None,
     rotation_mode="align_yaw",
     yaw_range_deg=DEFAULT_YAW_RANGE_DEG,
+    stack_order=None,
+    stack_workspace_half_size=None,
 ):
     attempts_path = run_dir / f"{task}_attempts.jsonl"
     successes = 0
@@ -212,11 +219,13 @@ def benchmark_task(
             try:
                 env, expert = build_task(task, seed, instruction_split, render,
                                          num_objects, num_receptacles, fixed_target_color,
-                                         rotation_mode, yaw_range_deg)
+                                         rotation_mode, yaw_range_deg, stack_order, stack_workspace_half_size)
                 observation = env.reset()
                 metadata = env.get_task_metadata()
                 metadata = {**metadata, "rotation_mode": rotation_mode, "control_orientation": rotation_mode != "none",
                             "yaw_range_deg": list(yaw_range_deg)}
+                if task == "stack":
+                    metadata["expert_timing"] = expert.timing_config()
                 initial_scene = snapshot_scene(observation)
                 target_state = target_snapshot(task, env, metadata)
                 observation, info = run_expert(
@@ -310,6 +319,10 @@ def main():
         raise ValueError("--fixed-target-color requires --task pick")
     tasks = ("pick", "place", "stack") if args.task == "all" else (args.task,)
     configurations = {task: count_options(task, args) for task in tasks}
+    if args.task == "stack":
+        validate_stack_arguments(args, configurations["stack"][0])
+    elif args.stack_order is not None or args.stack_workspace_half_size is not None:
+        raise ValueError("Stack options require --task stack")
     for task, (objects, receptacles) in configurations.items():
         balanced_count_plan(args.episodes, objects, receptacles)
     run_name = args.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -328,6 +341,8 @@ def main():
             args.fixed_target_color,
             args.rotation_mode,
             args.yaw_range_deg,
+            args.stack_order,
+            args.stack_workspace_half_size,
         )
         for task in tasks
     ]
