@@ -2,19 +2,11 @@
 
 **Scene 1 — All Models Succeed**
 
-
-
 https://github.com/user-attachments/assets/1dff3e0a-3334-4f0c-9ce5-751efd00504f
-
-
 
 **Scene 2 — Contrasting Outcomes**
 
-
-
 https://github.com/user-attachments/assets/1bf43f87-f7f1-411c-8a0d-22e479f00f16
-
-
 
 This project provides a simulation benchmark comparing several behavior cloning models for Franka Panda manipulation in MuJoCo/robosuite. Five policy configurations are trained on a shared expert demonstration dataset and evaluated on matched scenes to examine task success, completion time, and failure modes. The project provides an integrated workflow for demonstration collection, policy training, closed-loop evaluation, and trajectory analysis.
 
@@ -217,10 +209,6 @@ git diff --check
 ```
 
 Datasets, pretrained weights, checkpoints, and evaluation artifacts are excluded from Git and must be generated or obtained separately.
-
-## License
-
-A top-level license for the original project code has not yet been specified. The ACT core adapted from LeRobot retains its Apache-2.0 attribution and upstream notices; see [LICENSE](models/act_lerobot/LICENSE), [NOTICE](models/act_lerobot/NOTICE), and [source provenance](models/act_lerobot/reference.json). Third-party components remain subject to their respective licenses.
 
 ## References and Citation
 
