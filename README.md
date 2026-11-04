@@ -8,8 +8,6 @@
 
 <!-- Upload assets/media/scene_2.mp4 in GitHub's README editor and place the generated user-attachments URL here on its own line. -->
 
-*Selected qualitative examples: all models succeed in Scene 1; only ResNet18-GRU and ACT succeed in Scene 2. Aggregate results are reported below.*
-
 This project provides a simulation benchmark comparing several behavior cloning models for Franka Panda manipulation in MuJoCo/robosuite. Five policy configurations are trained on a shared expert demonstration dataset and evaluated on matched scenes to examine task success, completion time, and failure modes. The project provides an integrated workflow for demonstration collection, policy training, closed-loop evaluation, and trajectory analysis.
 
 The intended tasks are **Pick-and-Place** and **Cube Stacking**. The results reported here concern Pick-and-Place. Stacking environments and scripted experts are available, while integration into the training benchmark remains future work. **Language-conditioned manipulation** is also planned; instructions are currently stored as metadata and are not policy inputs.
