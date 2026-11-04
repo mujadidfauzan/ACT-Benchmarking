@@ -935,3 +935,87 @@ sebelumnya. Log per-step juga memuat chunk lengkap saat model membuat prediksi
 baru (`predicted_chunk_normalized`, `predicted_chunk_raw`, `chunk_offset`).
 Untuk evaluasi random scene gunakan `scripts.evaluate_act_lerobot`, bukan
 `scripts.evaluate_act`. Semua hasil baru harus memakai direktori kosong.
+
+## 11. Video dokumentasi resolusi tinggi dan overlay chunk ACT
+
+[record_policy_evaluation.py](../scripts/record_policy_evaluation.py) merekam
+**satu episode evaluasi** berdasarkan seed dan indeks episode. Render dokumentasi
+langsung pada resolusi yang dipilih; input RGB policy tetap pada resolusi
+checkpoint. Script menjalankan seluruh episode sebelumnya dengan policy dan
+horizon yang sama agar urutan reset environment sesuai evaluator biasa.
+`--episode 1` berarti episode kedua, yaitu `episode001` pada nama rollout JSONL.
+
+Contoh ACT LeRobot 1080p, seed 2000, episode indeks 1:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.record_policy_evaluation \
+  --checkpoint results/act_lerobot/place_red_1000_d20_ACT_LR_s123/best_rollout.pt \
+  --seed 2000 --episode 1 --max-steps 300 \
+  --width 1920 --height 1080 --fps 20 \
+  --cameras agentview robot0_eye_in_hand frontview \
+  --reference-evaluation results/act_lerobot_evaluation/place_red_1000_d20_ACT_LR_s123_h300 \
+  --output-dir results/documentation/ACT_LR_seed2000_episode001_1080p_video_only \
+  --device cuda
+```
+
+Untuk merekam scene dari evaluasi v02 (horizon 800), gunakan horizon yang sama:
+
+```bash
+MUJOCO_GL=egl python -u -m scripts.record_policy_evaluation \
+  --checkpoint results/act_lerobot/place_red_1000_d20_ACT_LR_s123/best_rollout.pt \
+  --seed 2004 --episode 1 --max-steps 800 \
+  --width 1920 --height 1080 --fps 20 \
+  --reference-evaluation results/act_lerobot_evaluation/place_red_1000_d20_ACT_LR_s123_h300_v02 \
+  --output-dir results/documentation/ACT_LR_seed2004_episode001_h800_1080p \
+  --device cuda
+```
+
+Ganti `--seed`, `--episode`, dan `--output-dir` sesuai kasus yang dibutuhkan.
+`--reference-evaluation` opsional; jika diberikan, script memeriksa seed/index,
+horizon, update checkpoint, execution mode, dan posisi awal scene terhadap
+evaluasi tersebut. Ini menjalankan ulang policy, bukan replay action yang
+direkam sebelumnya; trajectory numerik/success mungkin berbeda antar-run.
+
+Output hanya file video `.mp4`. Kamera default:
+
+- `agentview.mp4`: sudut pandang agentview, tanpa overlay.
+- `robot0_eye_in_hand.mp4`: wrist camera, tanpa overlay.
+- `frontview.mp4`: kamera eksternal dari depan yang menampilkan robot dan meja.
+
+Untuk ACT, setiap kamera juga mendapat versi `_annotated.mp4` berisi
+jejak EEF dan titik prediksi, tanpa teks atau panel informasi. Jadi ACT
+menghasilkan enam video; BC biasa menghasilkan tiga video bersih saja.
+Hasil sukses/failure dan pemeriksaan reference ditampilkan pada terminal.
+Tidak ada output JSON, JSONL, PNG atau CSV dari script dokumentasi ini.
+
+Pilih sudut lain dengan `--cameras`, misalnya
+`--cameras agentview robot0_eye_in_hand frontview sideview`. `sideview` adalah
+kamera eksternal dari samping; `birdview` adalah kamera dari atas. Semua kamera
+tambahan hanya untuk dokumentasi dan tidak menjadi input policy.
+
+**Makna titik ACT:** model memprediksi delta action OSC, bukan posisi XYZ
+mendatang. Script men-denormalisasi chunk sekali, melakukan clipping sesuai
+controller, mengubah translasi menjadi meter menggunakan skala OSC, lalu
+menjumlahkan delta dari posisi EEF saat ini. Titik oranye adalah **estimasi jalur
+perintah dengan asumsi robot mengikuti seluruh delta**. Ini bukan simulasi
+fisika masa depan; tracking error, kontak, rotasi dan dinamika dapat membuat
+gerakan aktual berbeda. Jejak sian adalah posisi EEF aktual yang sudah terjadi.
+Titik diproyeksikan memakai pose kamera pada frame tersebut, termasuk kamera
+wrist yang bergerak. Overlay 2D tidak memperhitungkan occlusion objek.
+
+Overlay menggunakan chunk yang sudah dikeluarkan policy, tanpa inference
+tambahan. Dengan `execution_steps > 1`, offset yang sudah terpakai dibuang dan
+bagian chunk tersisa ditampilkan. Dalam mode temporal ensemble, titik tetap
+menampilkan chunk terbaru, sementara action eksekusi merupakan hasil ensemble.
+`--trajectory-points 16` membatasi jumlah titik; `--no-trajectory-overlay`
+menonaktifkan jalur. Default mode eksekusi mengikuti checkpoint.
+
+Script juga mendukung checkpoint A/B/C (`visual_bc`), D (`robomimic_bc_rnn`),
+dan ACT legacy. Untuk A/B/C/D, hanya video bersih yang dibuat. Reset RNN
+mengikuti evaluator masing-masing.
+
+Jika FFmpeg tersedia, default `--encoder auto` menulis H264 dengan CRF 18.
+Jika tidak, digunakan OpenCV `mp4v`. `--encoder ffmpeg --crf 16` memilih H264
+secara eksplisit, sedangkan `--encoder opencv` tidak memerlukan FFmpeg.
+`--width 3840 --height 2160` memilih 4K dengan biaya render/encoding lebih besar.
+FPS hanya menentukan playback; control frequency simulator tetap 20 Hz.
