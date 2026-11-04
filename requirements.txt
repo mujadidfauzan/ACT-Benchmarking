@@ -1,4 +1,4 @@
-# Install the CPU or CUDA build of torch first; see docs/.
+# Install the CPU or CUDA build of torch first; see README.md.
 # These simulation pins match the existing dataset-generation environment.
 numpy==1.26.4
 h5py>=3.10,<4

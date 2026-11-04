@@ -16,17 +16,16 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class WorkspaceLayoutTests(unittest.TestCase):
-    def test_two_platform_guides_and_local_links(self):
-        docs = ROOT / "docs"
-        self.assertEqual({path.name for path in docs.iterdir()}, {"WINDOWS.md", "LINUX.md"})
-        for path in (ROOT / "README.md", *docs.glob("*.md")):
+    def test_readme_local_links_and_ignored_docs(self):
+        self.assertIn("docs/", (ROOT / ".gitignore").read_text().splitlines())
+        for path in (ROOT / "README.md",):
             for target in re.findall(r"\]\(([^)]+)\)", path.read_text(encoding="utf-8")):
                 if "://" not in target:
                     self.assertTrue((path.parent / target.split("#")[0]).exists(), (path, target))
 
     def test_documented_python_commands_parse_without_running_jobs(self):
         parsed = 0
-        for path in (ROOT / "docs").glob("*.md"):
+        for path in (ROOT / "README.md",):
             blocks = re.findall(r"```(?:bash|bat)\n(.*?)```", path.read_text(encoding="utf-8"), re.S)
             for block in blocks:
                 block = block.replace("\\\n", " ").replace("^\n", " ")
@@ -50,7 +49,7 @@ class WorkspaceLayoutTests(unittest.TestCase):
                         except SystemExit as result:
                             self.assertEqual(result.code, 0, line)
                     parsed += 1
-        self.assertGreaterEqual(parsed, 12)
+        self.assertGreaterEqual(parsed, 5)
 
     def test_only_maintained_models_are_exported(self):
         import models

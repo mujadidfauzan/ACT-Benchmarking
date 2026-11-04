@@ -1,152 +1,252 @@
-# SimMT-ACT
+# Benchmarking Visuomotor Models for Robotic Manipulation
 
-Panda manipulation in MuJoCo/robosuite: scripted demonstrations, behavior cloning,
-and evaluation for Pick, Pick-and-Place, and Stack with variable object counts.
+**Scene 1 — All Models Succeed**
 
-## Current BC Workflow
+<!-- Upload assets/media/scene_1.mp4 in GitHub's README editor and place the generated user-attachments URL here on its own line. -->
 
-The current model maps RGB and robot proprioception to one action per timestep:
+**Scene 2 — Contrasting Outcomes**
 
-1. Collect successful demonstrations and reject corrupted camera frames.
-2. Automatically prepare a seeded 90/10 episode split, train-only statistics,
-   and camera/state/controller configuration when collection finishes.
-3. Train complete globally shuffled epochs, without task/phase balancing.
-4. Evaluate held-out simulator seeds and report per-seed success rates and failures.
+<!-- Upload assets/media/scene_2.mp4 in GitHub's README editor and place the generated user-attachments URL here on its own line. -->
 
-```bash
-python -m scripts.record_demonstrations --task pick --num-demos 100 \
-  --output data/demos/pick_red_v01 --fixed-target-color red \
-  --camera-names agentview robot0_eye_in_hand
-python -m scripts.train_visual_bc --dataset data/demos/pick_red_v01 \
-  --epochs 100 --batch-size 128 --learning-rate 0.0001 \
-  --output-dir results/visual_bc/pick_red_v01
-python -m scripts.evaluate_visual_bc \
-  --checkpoint results/visual_bc/pick_red_v01/best.pt \
-  --episodes 20 --num-seeds 5 --device cpu \
-  --output-dir results/visual_bc_evaluation/pick_red_v01
-```
+*Selected qualitative examples: all models succeed in Scene 1; only ResNet18-GRU and ACT succeed in Scene 2. Aggregate results are reported below.*
 
-No separate split/normalization command is required. Training artifacts go to
-`data/splits/<dataset-name>_bc/`; checkpoints embed normalization and input config.
-`--num-demos` targets the total successful episodes for a task. The legacy
-`--episodes` recorder flag still means additional episodes.
+This project provides a simulation benchmark comparing several behavior cloning models for Franka Panda manipulation in MuJoCo/robosuite. Five policy configurations are trained on a shared expert demonstration dataset and evaluated on matched scenes to examine task success, completion time, and failure modes. The project provides an integrated workflow for demonstration collection, policy training, closed-loop evaluation, and trajectory analysis.
 
-## HDF5 Storage
+The intended tasks are **Pick-and-Place** and **Cube Stacking**. The results reported here concern Pick-and-Place. Stacking environments and scripted experts are available, while integration into the training benchmark remains future work. **Language-conditioned manipulation** is also planned; instructions are currently stored as metadata and are not policy inputs.
 
-Each successful episode is written atomically as `episode_000000.hdf5` before
-its manifest entry. Array names remain `actions`, `phases`, `obs__...`,
-`metadata_json`, and `result_json`. Numeric observations have T+1 frames for T
-actions; strings use UTF-8. RGB is losslessly compressed with gzip level 4 and
-one frame per chunk. Frame and GRU loaders read only the requested timestep or
-window, with up to 16 cached file handles per dataset instance/process.
+## Policy Architectures
 
-Old NPZ datasets are not mixed with HDF5 recordings. Optional migration creates
-a new dataset and automatically prepares its split/statistics, without changing
-the source:
+All policies receive RGB observations and robot proprioception and produce seven-dimensional operational-space delta commands: XYZ translation, rotation, and gripper control, executed at **20 Hz**.
 
-```bash
-python -m data.episode_io --source data/demos/pick_red_v01 \
-  --output data/demos/pick_red_v01_hdf5
-```
+| Model | Visual representation                                       | Temporal model / output                        | Training objective                        |
+| ----- | ----------------------------------------------------------- | ---------------------------------------------- | ----------------------------------------- |
+| **A** | Four-layer CNN + 4×4 average pooling                        | GRU-256; single-step action                    | Normalized motion MSE + 0.2 × gripper BCE |
+| **B** | Four-layer CNN + Spatial Softmax                            | GRU-256; single-step action                    | Same as A                                 |
+| **C** | ResNet18 + Spatial Softmax                                  | GRU-256; single-step action                    | Same as A                                 |
+| **D** | robomimic-style ResNet18 + 32 learned spatial keypoints     | Two-layer LSTM-1000; deterministic action head | Continuous 7D action MSE                  |
+| **E** | ImageNet-initialized ResNet18 + Transformer encoder–decoder | CVAE; 32-action chunks                         | Masked action L1 + 10 × KL divergence     |
 
-Use the new dataset path for training and a new run directory. Migration changes
-dataset fingerprints, so an old training checkpoint cannot resume on the
-converted dataset. Existing self-contained checkpoints remain usable for
-evaluation because the model architecture and normalization are unchanged.
+**A–C** use independent camera encoders, 256-dimensional features per camera, 16-dimensional proprioception, and the previous gripper action. Training uses 16-step windows with stride 8. The visual backbones are trained from scratch.
 
-## Architecture And Objective
+**D** implements a deterministic image BC-RNN recipe inspired by [robomimic](https://github.com/ARISE-Initiative/robomimic). Images are resized to 84×84 and cropped to 76×76, with random crops during training and center crops during evaluation. Each camera uses a separately trained ResNet18 and a 64-dimensional keypoint representation. The policy receives 9-dimensional EEF/gripper proprioception and uses a continuous `tanh` action head. Training sequences and the evaluation recurrent-state reset interval are both 10 steps.
 
-- Independent trainable CNNs for agentview and optional eye-in-hand RGB.
-- Four Conv/ReLU layers, adaptive pooling 4x4, projection to 256D per camera.
-- Direct normalized robot joint positions, EEF position, and gripper state;
-  EEF quaternion stays included in all new experiments (16D total proprio).
-- Frame policy: concatenation -> MLP 256 -> 128 -> motion and gripper logit.
-- Optional `--temporal`: RGB/proprio/previous gripper -> GRU 256 -> MLP 128
-  -> motion and gripper logit, trained on masked episode-local windows.
-- Loss: XYZ MSE + optional rotation MSE + 0.2 x binary gripper BCEWithLogits.
-- AdamW, LR 0.0001, batch size 128, no scheduler/clipping/dropout/LayerNorm.
+**E** adapts the [LeRobot ACT core](https://github.com/huggingface/lerobot/blob/cc2fbf08976c6edd14edb001616ae79f3121de96/src/lerobot/policies/act/modeling_act.py), pinned to commit `cc2fbf08976c6edd14edb001616ae79f3121de96`. It uses a shared ResNet18 with frozen BatchNorm statistics, 16-dimensional proprioception, hidden dimension 512, eight attention heads, four encoder layers, one decoder layer, and a 32-dimensional latent. The reported evaluation uses a zero latent and replans every step, executing the first predicted action without temporal ensembling. ACT is adapted to the project's end-effector controller rather than the original ALOHA joint-control interface.
 
-Widths/depth live in `models/visual_bc.py`, not CLI. `VisualBCPolicy` uses
-`VisualEncoder` from `models/visual_encoder.py`. `--visual-pooling spatial_softmax`
-selects experimental per-channel spatial coordinates instead of the default
-4x4 average pool; both project to 256D per camera. `--rollout-eval-max-steps 300`
-sets a shared rollout budget for checkpoint selection; final evaluation must use
-the same `--max-steps 300`. `--visual-backbone resnet18` selects a torchvision
-ResNet18 feature backbone trained from scratch, with 256D output per camera.
-`--gradient-accumulation-steps 8 --batch-size 8` processes 64 windows per full
-optimizer update with temporal models; gradients are weighted by valid timesteps.
-ResNet BatchNorm uses each physical batch, so accumulation does not reproduce
-the BatchNorm statistics of a physical batch of 64.
-Backbone, pooling, accumulation and rollout horizon are restored on resume.
-Training deliberately requires
-fixed-target Pick or matching-color Place, so each scene has one unambiguous target.
-For Place, collection uses a fixed object/tray color (default red to red), with
-randomized IDs and positions. Training, frame/GRU evaluation, and periodic
-rollouts select the task from the checkpoint. See section 7 of either platform guide.
+## Experimental Protocol
 
-The scene geometry, variable counts, stable object IDs, and instruction metadata
-remain project-specific. Pick collection uses a state machine and world-frame
-orientation commands. `--random-yaw` enables initial cube yaw within +/-45
-degrees (default); `--no-random-yaw` fixes initial yaw at zero.
-`--rotation-mode none` disables rotational commands and orientation gates,
-while `align_yaw` retains yaw-following control. Position ranges are unchanged.
-These settings are saved and automatically restored during evaluation. GRU
-evaluation carries recurrent state within each episode and resets it on reset.
-Evaluation requires a 0.18 m target lift held for 20 steps
-plus the environment success predicate. Place/Stack keep their task experts.
+The dataset contains **1,000 successful scripted demonstrations**, split by episode into **900 training and 100 validation episodes**. Scenes contain one red cube and one red tray on opposite sides of the workspace. Their positions and orientations are randomized, with an initial XY center-distance limit of **0.20 m**. Observations include `agentview` and wrist-camera RGB at 128×128. Normalization statistics, where used, are computed exclusively from the training split. All policies read the native HDF5 episodes without conversion to external dataset formats.
 
-## Layout
+Final evaluation comprises **100 episodes per model**, using five environment seeds (2000–2004) and 20 episodes per seed. All models use an **800-step horizon**, equivalent to 40 seconds of simulated control. Recorded initial cube, tray, and EEF positions match across models for each seed–episode pair. These are randomized evaluation scenes, distinct from rollouts reconstructed from the validation dataset.
+
+Success requires valid placement in the target tray, the evaluator's release condition, an open-gripper command, and stable success for **20 consecutive steps**. Release is approximated by an EEF–object distance greater than 8 cm. Thus, visible placement alone may not satisfy the benchmark criterion.
+
+Reported policies use **training seed 123** and checkpoints selected by periodic rollout success during training. Selected checkpoints occur at different training stages. The comparison evaluates complete policy configurations, including preprocessing, proprioception, loss, and pretraining, rather than isolating architecture alone.
+
+## Results and Analysis
+
+| Model                      | Successful episodes | Success rate | Across-seed SD (percentage points) | Median steps, successful episodes |
+| -------------------------- | ------------------: | -----------: | ---------------------------------: | --------------------------------: |
+| A — CNN Average + GRU      |              61/100 |          61% |                               10.8 |                               300 |
+| B — CNN Spatial + GRU      |              56/100 |          56% |                               10.8 |                               249 |
+| C — ResNet18 Spatial + GRU |              86/100 |          86% |                               12.4 |                               228 |
+| D — BC-RNN                 |              80/100 |          80% |                                9.4 |                             190.5 |
+| E — ACT                    |              88/100 |          88% |                                5.7 |                             235.5 |
+
+SD is the sample standard deviation of success rates across five evaluation seeds. It describes scene-dependent variation for these checkpoints, not variability across independently trained policies. Completion steps are conditional on success and should be interpreted together with success rate.
+
+**Key Takeaways.** ACT achieves the highest final success rate at 800 steps (88%). ResNet18-GRU nearly matches it (86%) and completes substantially more episodes within 300 steps (85 versus 64). Most failures involve failure to lift the object, identifying grasp and lift as the main stages requiring further investigation.
+
+**Success and completion time.** ACT achieves the highest observed success rate, while C provides a strong balance between success and completion time. D has the lowest median completion time among its successful episodes. The two-episode difference between C and ACT is insufficient to establish general superiority: both succeed on 76 scenes, C alone on 10, and ACT alone on 12.
+
+**Dependence on the time budget.** Within the same 800-step runs, the numbers of episodes completed by step 300 are A: **31**, B: **53**, C: **85**, D: **74**, and E: **64**. ACT gains 24 additional successes after step 300, whereas C gains one. The longer horizon therefore reveals ACT's eventual task completion while also exposing long-duration trajectories. These counts are derived from the final runs, rather than separate 300-step evaluations.
+
+**Failure modes.** Failure to lift the object dominates across configurations. This category indicates that the object did not reach the lift threshold; it does not identify whether alignment, grasp timing, or contact mechanics caused the failure.
+
+| Model | No lift | Placement timeout | Not released / open-command criterion unmet |
+| ----- | ------: | ----------------: | ------------------------------------------: |
+| A     |      31 |                 8 |                                           0 |
+| B     |      34 |                10 |                                           0 |
+| C     |      11 |                 2 |                                           1 |
+| D     |      14 |                 6 |                                           0 |
+| E     |      10 |                 2 |                                           0 |
+
+**Interpretation and limitations.** The stronger performance of C relative to A/B supports the ResNet-based configuration in this setting, without establishing a causal explanation for the gain. Validation loss remains a diagnostic measure: prediction error on expert observations does not directly measure closed-loop task completion, and losses with different objectives or normalization are not numerically comparable. Results are limited to one training seed, one scene distribution, and scripted demonstrations. They do not establish robustness across training runs, stacking tasks, language instructions, or physical robots.
+
+## Project Structure
 
 ```text
-benchmarks/            Expert reliability gates
-configs/               Semantic split definitions
-controllers/           Panda controller
-data/                  Recorder, preparation, dataset, normalization
-  demos/               Generated trajectories (ignored)
-  splits/              Automatically generated BC artifacts (ignored)
-diagnostics/           Camera checks
-docs/                  WINDOWS.md and LINUX.md
-environments/          Tasks, scene configuration, and metadata descriptions
-experts/               Task experts and primitives
-models/                VisualBCPolicy and VisualEncoder
-scripts/               Collection, training, evaluation and audits
-tests/                 Regression, artifact-dependent smoke, simulation checks
-results/               Reports, checkpoints and videos (ignored)
+benchmarks/                 Expert reliability checks
+configs/                    Scene and semantic configuration
+controllers/                Panda control interface
+environments/               Pick, Place, and Stack tasks
+experts/                    Scripted demonstration policies
+data/                       HDF5 I/O, recording, splits, and normalization
+models/
+  visual_encoder.py         CNN / ResNet18 and spatial pooling
+  visual_bc.py              Models A–C
+  robomimic_bc_rnn/          Model D
+  act_lerobot/              Model E and attributed reference core
+  act/                      Earlier ACT implementation and chunk utilities
+  low_dim_bc_rnn/            Diagnostic low-dimensional baseline
+scripts/                    Collection, training, evaluation, and visualization
+diagnostics/                Camera checks
+tests/                      Regression and simulation checks
 ```
 
-## Supported Paths
+## Usage
 
-The maintained entry points are `scripts.record_demonstrations`,
-`scripts.train_visual_bc`, and `scripts.evaluate_visual_bc`. Splits and statistics
-are generated automatically during collection; audit tools remain optional.
+Run from the repository root with Python 3.10 and a compatible `torch` / `torchvision` GPU build. Install dependencies and enable headless rendering:
 
-Language-conditioned models, embedding caches,
-legacy history models, custom training samplers, and manual split/statistics commands have been
-removed. Environment task descriptions remain metadata only; they are not model
-inputs. Pick/Place/Stack environments and collection experts are still available,
-but the current model trainer supports only fixed-target Pick and matching-color Place, not Stack.
+```bash
+python -m pip install -r requirements.txt
+export MUJOCO_GL=egl
+```
 
-Generated demos, splits, reports, and checkpoints are local artifacts ignored by
-Git. Start by collecting a new dataset; no historical pilot data is needed by
-code or offline tests. Checkpoints from removed models require their original
-code version and cannot be resumed with this model.
+MuJoCo rendering requires EGL / OpenGL system libraries. On Ubuntu, install `libegl1 libgl1 libglfw3`; FFmpeg is optional for H.264 documentation videos.
 
-## Guides
+### 1. Record Demonstrations
 
-- [Windows CMD workflow and six camera/orientation experiments](docs/WINDOWS.md)
-- [Linux Bash workflow and six camera/orientation experiments](docs/LINUX.md)
+```bash
+python -m scripts.record_demonstrations \
+  --task place --num-demos 1000 \
+  --num-objects 1 --num-receptacles 1 --fixed-target-color red \
+  --placement-layout opposite_sides --max-object-receptacle-distance 0.20 \
+  --camera-names agentview robot0_eye_in_hand --image-size 128 \
+  --seed 42 --max-attempts 5000 \
+  --output data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray
+```
 
-Both guides include frame and temporal-GRU training commands. A collected dataset
-supports both; use separate output directories rather than switching architecture
-on resume. Collection rejects appending different or missing yaw/rotation metadata.
+Collection automatically prepares the 90/10 episode split, train-only statistics, and camera/controller configuration. All models read the native HDF5 dataset directly. Repeat the same command to complete interrupted collection with unchanged settings.
 
-## Verification
+### 2. Train A–C
+
+Example for A; change the backbone, pooling, and output name using the table for B or C.
+
+| Model | Backbone   | Pooling           | Output run name                          |
+| ----- | ---------- | ----------------- | ---------------------------------------- |
+| A     | `cnn`      | `avg`             | `place_red_1000_d20_A_avg_gru_s123`      |
+| B     | `cnn`      | `spatial_softmax` | `place_red_1000_d20_B_spatial_gru_s123`  |
+| C     | `resnet18` | `spatial_softmax` | `place_red_1000_d20_C_resnet18_gru_s123` |
+
+```bash
+python -m scripts.train_visual_bc \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --output-dir results/visual_bc/place_red_1000_d20_A_avg_gru_s123 \
+  --temporal --visual-backbone cnn --visual-pooling avg \
+  --sequence-length 16 --sequence-stride 8 \
+  --epochs 100 --batch-size 8 --seed 123 --early-stopping-patience 0 \
+  --rollout-eval-every 10 --rollout-eval-episodes 10 \
+  --rollout-eval-num-seeds 1 --rollout-eval-seed 1000 \
+  --rollout-eval-max-steps 300 --device cuda
+```
+
+### 3. Train D: BC-RNN
+
+```bash
+python -m scripts.train_robomimic_bc_rnn \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --output-dir results/robomimic_bc_rnn/place_red_1000_d20_D_bcrnn_s123 \
+  --max-updates 324700 --batch-size 8 --seed 123 \
+  --rollout-eval-every 32470 --rollout-eval-episodes 10 \
+  --rollout-eval-num-seeds 1 --rollout-eval-seed 1000 \
+  --rollout-eval-max-steps 300 --device cuda
+```
+
+### 4. Train E: ACT
+
+Download and verify the pretrained backbone once:
+
+```bash
+mkdir -p checkpoints/pretrained
+curl -fL --retry 3 https://download.pytorch.org/models/resnet18-f37072fd.pth \
+  -o checkpoints/pretrained/resnet18-f37072fd.pth
+echo "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec  checkpoints/pretrained/resnet18-f37072fd.pth" | sha256sum -c -
+```
+
+```bash
+python -m scripts.train_act_lerobot \
+  --dataset data/demos/place_red_1cube_1tray \
+  --training-dir data/splits/place_red_1cube_1tray \
+  --output-dir results/act_lerobot/place_red_1000_d20_ACT_LR_s123 \
+  --backbone-weights checkpoints/pretrained/resnet18-f37072fd.pth \
+  --batch-size 8 --chunk-size 32 --seed 123 \
+  --max-updates 324700 --checkpoint-every 500 --log-every 50 \
+  --rollout-eval-every 32470 --rollout-eval-episodes 10 \
+  --rollout-eval-num-seeds 1 --rollout-eval-seed 1000 \
+  --rollout-eval-max-steps 300 --device cuda
+```
+
+These commands illustrate a 100-epoch A–C schedule and a nominally matched 324,700-update budget for D/E (3,247 A–C updates per epoch on this dataset). They do not imply equal dataset passes, computation, or identical training histories for the reported checkpoints. Training rollout intervals use epochs for A–C and updates for D/E.
+
+### 5. Evaluate
+
+Example for E: **5 seeds × 20 episodes, 800 steps maximum**. For A–D, replace the evaluator and checkpoint using the table and choose a separate output directory.
+
+| Model     | Evaluator module                    | Checkpoint directory              |
+| --------- | ----------------------------------- | --------------------------------- |
+| A / B / C | `scripts.evaluate_visual_bc`        | `results/visual_bc/<run>/`        |
+| D         | `scripts.evaluate_robomimic_bc_rnn` | `results/robomimic_bc_rnn/<run>/` |
+| E         | `scripts.evaluate_act_lerobot`      | `results/act_lerobot/<run>/`      |
+
+```bash
+python -m scripts.evaluate_act_lerobot \
+  --checkpoint results/act_lerobot/place_red_1000_d20_ACT_LR_s123/best_rollout.pt \
+  --output-dir results/act_lerobot_evaluation/place_red_1000_d20_ACT_LR_s123_h800 \
+  --episodes 20 --num-seeds 5 --seed 2000 --max-steps 800 \
+  --device cuda --record-video --log-rollout
+```
+
+Use `latest.pt` to resume training, `best.pt` for the best validation-loss checkpoint, and `best_rollout.pt` for the best training-rollout checkpoint. Evaluation checkpoints embed the policy weights and input configuration. Use a new output directory for each evaluation.
+
+Additional tools: [validation-scene comparison](scripts/evaluate_visual_bc_validation.py) and [high-resolution video recording](scripts/record_policy_evaluation.py). Run `python -m <module> --help` for options.
+
+### Verification
 
 ```bash
 python -m tests
 git diff --check
 ```
 
-Offline regression tests use synthetic data and mocked simulation. Production
-collection, full training, simulator expert gates, and Windows GPU execution are
-separate, explicitly run workflows in the platform guides.
+Datasets, pretrained weights, checkpoints, and evaluation artifacts are excluded from Git and must be generated or obtained separately.
+
+## License
+
+A top-level license for the original project code has not yet been specified. The ACT core adapted from LeRobot retains its Apache-2.0 attribution and upstream notices; see [LICENSE](models/act_lerobot/LICENSE), [NOTICE](models/act_lerobot/NOTICE), and [source provenance](models/act_lerobot/reference.json). Third-party components remain subject to their respective licenses.
+
+## References and Citation
+
+### robomimic / BC-RNN
+
+Model D is inspired by:
+
+- [robomimic](https://github.com/ARISE-Initiative/robomimic)
+- _What Matters in Learning from Offline Human Demonstrations for Robot Manipulation_
+
+```bibtex
+@inproceedings{robomimic2021,
+  title     = {What Matters in Learning from Offline Human Demonstrations for Robot Manipulation},
+  author    = {Mandlekar, Ajay and Xu, Danfei and Wong, Josiah and Nasiriany, Soroush and Wang, Chen and Kulkarni, Rohun and Fei-Fei, Li and Savarese, Silvio and Zhu, Yuke and Mart{\'i}n-Mart{\'i}n, Roberto},
+  booktitle = {Conference on Robot Learning},
+  year      = {2021}
+}
+```
+
+### Action Chunking Transformer
+
+Model E builds on:
+
+- [ACT](https://github.com/tonyzhaozh/act)
+- _Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware_
+- [LeRobot ACT implementation used by this project](https://github.com/huggingface/lerobot/blob/cc2fbf08976c6edd14edb001616ae79f3121de96/src/lerobot/policies/act/modeling_act.py)
+
+```bibtex
+@article{zhao2023learning,
+  title   = {Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware},
+  author  = {Zhao, Tony Z. and Kumar, Vikash and Levine, Sergey and Finn, Chelsea},
+  journal = {arXiv preprint arXiv:2304.13705},
+  year    = {2023}
+}
+```
